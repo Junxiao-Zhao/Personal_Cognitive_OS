@@ -359,8 +359,8 @@ def _index_scores(
     manifest: dict[str, Any],
     query: str,
     docs: list[dict[str, Any]],
+    candidate_limit: int,
 ) -> tuple[dict[str, float], dict[str, float]]:
-    keys = [f"{doc['stream']}:{doc['id']}@{doc['revision']}" for doc in docs]
     dense: dict[str, float] = {}
     lexical: dict[str, float] = {}
     if manifest.get("lexical_backend") == "tantivy" and query.strip():
@@ -371,7 +371,7 @@ def _index_scores(
             terms = tokenize(query)
             parsed = index.parse_query(" OR ".join(terms), ["text"])
             searcher = index.searcher()
-            for score, address in searcher.search(parsed, limit=max(1, len(docs))).hits:
+            for score, address in searcher.search(parsed, limit=max(1, candidate_limit)).hits:
                 key = searcher.doc(address).get_first("key")
                 lexical[str(key)] = float(score)
         except Exception:
@@ -388,7 +388,7 @@ def _index_scores(
                 response = client.search(
                     "memory",
                     data=[[float(vector.get(index, 0.0)) for index in range(256)]],
-                    limit=max(1, len(docs)),
+                    limit=max(1, candidate_limit),
                     output_fields=["key"],
                 )
                 for hit in response[0]:
@@ -489,15 +489,13 @@ def search(
     profile = Profile.load(profile_path if profile_path.exists() else bundled_profile(), default_registry())
     repository = MemoryRepository(repo_root, profile)
     docs = _documents(repository)
+    retrieval_config = profile.raw.get("retrieval", {})
+    candidate_limit = max(limit, int(retrieval_config.get("candidate_count", 200)))
+    rrf_k = float(retrieval_config.get("rrf_k", 60))
+    recency_half_life_days = max(0.000001, float(retrieval_config.get("recency_half_life_days", 180)))
     indexes_root = Path(indexes_root) if indexes_root is not None else repo_root.parent / "indexes"
     index_result = build_index(repo_root=repo_root, indexes_root=indexes_root)
     generation = Path(index_result["generation_path"])
-    backend_dense, backend_lexical = _index_scores(
-        generation=generation,
-        manifest=index_result,
-        query=query,
-        docs=docs,
-    )
     start_at, end_at = _parse_time(start), _parse_time(end)
     filtered: list[dict[str, Any]] = []
     for doc in docs:
@@ -520,6 +518,30 @@ def search(
             continue
         filtered.append(doc)
 
+    backend_dense, backend_lexical = _index_scores(
+        generation=generation,
+        manifest=index_result,
+        query=query,
+        docs=filtered,
+        candidate_limit=candidate_limit,
+    )
+    backend_candidates = set(backend_dense) | set(backend_lexical)
+    if backend_candidates:
+        filtered = [
+            doc
+            for doc in filtered
+            if f"{doc['stream']}:{doc['id']}@{doc['revision']}" in backend_candidates
+        ]
+    elif len(filtered) > candidate_limit:
+        # Replaceable local indexes may be unavailable. Keep a bounded,
+        # deterministic recent pool so Python reranking never expands to the
+        # entire canonical corpus.
+        filtered = sorted(
+            filtered,
+            key=lambda doc: doc.get("occurred_at") or doc.get("recorded_at") or "",
+            reverse=True,
+        )[:candidate_limit]
+
     query_tokens = tokenize(query)
     query_counts = Counter(query_tokens)
     query_vector = _vector(query_tokens)
@@ -540,8 +562,8 @@ def search(
     for index, doc in enumerate(filtered):
         when = _parse_time(doc.get("occurred_at") or doc.get("recorded_at"))
         age_days = max(0.0, (now - when).total_seconds() / 86400) if when else 3650.0
-        time_score = math.exp(-math.log(2) * age_days / 180.0)
-        rrf = 1 / (60 + dense_rank[index]) + 1 / (60 + lexical_rank[index])
+        time_score = math.exp(-math.log(2) * age_days / recency_half_life_days)
+        rrf = 1 / (rrf_k + dense_rank[index]) + 1 / (rrf_k + lexical_rank[index])
         if mode == "continuity":
             rrf += time_score * 0.02
         if mode == "pattern" and doc["stream"] in {"events", "hypotheses"}:
@@ -576,6 +598,11 @@ def search(
         "mode": mode,
         "memory_commit": repository.head(),
         "backends": {"dense": index_result["dense_backend"], "lexical": index_result["lexical_backend"]},
+        "retrieval_policy": {
+            "candidate_count": candidate_limit,
+            "rrf_k": rrf_k,
+            "recency_half_life_days": recency_half_life_days,
+        },
         "results": scored[:limit],
     }
     if mode == "change":

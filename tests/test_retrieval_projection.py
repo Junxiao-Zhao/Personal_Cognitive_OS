@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import pytest
 
+from mem_core.errors import MemError
 from mem_core.models import Operation
 from mem_core.transaction import TransactionManager
 from pco.checkpoint import CheckpointEngine
 from pco.context import render
 from pco.harness import FakeHarnessAdapter, WorkerResult
-from pco.projections import project_affine, project_markdown
+from pco.projections import _page, _projection_path, project_affine, project_markdown
 from pco.retrieval import _chunks, build_index, search, tokenize
 
 from conftest import NOW, continuation, envelope, event, hypothesis, meta, visible_messages
@@ -51,6 +53,22 @@ def test_five_retrieval_modes_return_evidence_time_and_qualification(workspace) 
             assert {"id", "revision", "text", "recorded_at", "occurred_at", "dense_score", "lexical_score", "rrf_score", "time_score", "evidence_refs", "links", "current", "assistant_context", "user_evidence_eligible"} <= item.keys()
     change = search(repo_root=workspace.config.memory_root, query="评价", mode="change", limit=10)
     assert change["change_windows"]["caution"].startswith("Missing records")
+
+
+def test_retrieval_reads_profile_ranking_and_candidate_policy(workspace) -> None:
+    _seed(workspace)
+    profile_file = workspace.config.memory_root / "profiles" / "pco" / "profile.yaml"
+    content = profile_file.read_text(encoding="utf-8")
+    content = content.replace("rrf_k: 60", "rrf_k: 17")
+    content = content.replace("candidate_count: 200", "candidate_count: 7")
+    content = content.replace("recency_half_life_days: 180", "recency_half_life_days: 30")
+    profile_file.write_text(content, encoding="utf-8")
+    result = search(repo_root=workspace.config.memory_root, query="拖延", limit=2)
+    assert result["retrieval_policy"] == {
+        "candidate_count": 7,
+        "rrf_k": 17.0,
+        "recency_half_life_days": 30.0,
+    }
 
 
 def test_turn_chunker_splits_oversized_messages_without_indexing_reasoning(workspace) -> None:
@@ -158,6 +176,8 @@ def test_backlinks_and_replaceable_projections_are_idempotent(workspace) -> None
     home = workspace.config.projection_root / "markdown" / "home" / "pco_home.md"
     assert "pco://" not in home.read_text(encoding="utf-8")
     assert (workspace.config.projection_root / "markdown" / "indexes" / "index_events.md").is_file()
+    checkpoint_pages = list((workspace.config.projection_root / "markdown" / "checkpoints").glob("*.md"))
+    assert "## Continuation" in checkpoint_pages[0].read_text(encoding="utf-8")
     assert project_markdown(repo_root=workspace.config.memory_root, output_root=workspace.config.projection_root / "markdown")["idempotent"]
 
     bridge = Path(__file__).parent / "fixtures" / "affine_bridge.py"
@@ -169,6 +189,23 @@ def test_backlinks_and_replaceable_projections_are_idempotent(workspace) -> None
     assert affine["ok"] and affine["pages"] == markdown["pages"]
     assert project_affine(repo_root=workspace.config.memory_root, state_root=workspace.config.state_root, command=f"python {bridge}")["idempotent"]
     assert workspace.repository.head() == canonical_before
+
+
+def test_projection_relations_are_clickable_and_paths_cannot_escape(tmp_path: Path) -> None:
+    linked = event()
+    linked["payload"]["links"]["psychologies"] = ["psy_evaluation"]
+    page = _page(
+        "events",
+        linked["id"],
+        [linked],
+        {linked["id"]: [{"source_stream": "hypotheses", "source_id": "hyp_evaluation", "relation": "evidence"}]},
+        {},
+    )
+    assert "[psy_evaluation](pco://psy_evaluation)" in page["content"]
+    assert "[hypotheses:hyp_evaluation](pco://hyp_evaluation)" in page["content"]
+    with pytest.raises(MemError) as error:
+        _projection_path(tmp_path, "events", "../../state/context/current")
+    assert error.value.detail.code == "PROJECTION_ENTITY_ID_UNSAFE"
 
 
 def test_clone_rebuilds_all_replaceable_derivations(workspace, tmp_path: Path) -> None:
@@ -207,14 +244,17 @@ def test_affine_failure_is_reported_after_commit_and_retry_is_idempotent(workspa
     committed = workspace.repository.head()
     assert result["status"] == "COMMITTED_WITH_PENDING_DERIVATIONS"
     assert result["receipt"]["derivations"]["projection"]["error"]["code"] == "AFFINE_BRIDGE_NOT_CONFIGURED"
-    assert adapter.receipts[-1]["status"] == "COMMITTED_WITH_PENDING_DERIVATIONS"
+    assert adapter.receipts[-1]["status"] == "RECEIPT_INSERTED"
+    assert len(adapter.receipts) == 1
 
     bridge = Path(__file__).parent / "fixtures" / "affine_bridge.py"
     monkeypatch.setenv("PCO_AFFINE_COMMAND", f"python {bridge}")
     retried = CheckpointEngine(workspace, adapter).retry_derivations()
     assert retried["status"] == "DONE"
     assert workspace.repository.head() == committed
-    assert adapter.receipts[-1]["status"] == "DONE"
+    assert len(adapter.receipts) == 1
+    persisted = workspace.load_json(f"checkpoints/{result['checkpoint_id']}/receipt.json")
+    assert persisted["status"] == "DONE"
 
 
 def test_concept_requires_external_search_receipt(workspace) -> None:
@@ -239,10 +279,34 @@ def test_concept_requires_external_search_receipt(workspace) -> None:
     )
     transaction = manager.begin(transaction_id="txn_bad_concept", fingerprint_context={"kind": "concept"})
     manager.append(transaction.id, Operation(op="append", stream="psychologies", record=invalid))
-    from mem_core.errors import MemError
-    import pytest
-
     with pytest.raises(MemError) as error:
         manager.validate(transaction.id)
     assert error.value.detail.code == "SCHEMA_VALIDATION_FAILED"
     assert error.value.detail.path.endswith("/search_receipt")
+
+
+def test_concept_rejects_forged_nonempty_search_receipt(workspace) -> None:
+    forged = envelope(
+        "psy_forged",
+        "pco/psychology/v1",
+        {
+            "name": "伪造引用",
+            "description": "测试",
+            "aliases": [],
+            "external_refs": [
+                {
+                    "url": "https://example.org/reference",
+                    "title": "Reference",
+                    "accessed_at": NOW,
+                    "search_receipt": "looks_truthy_but_does_not_exist",
+                }
+            ],
+            "status": "active",
+        },
+    )
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    transaction = manager.begin(transaction_id="txn_forged_receipt", fingerprint_context={"kind": "concept"})
+    manager.append(transaction.id, Operation(op="append", stream="psychologies", record=forged))
+    with pytest.raises(MemError) as error:
+        manager.validate(transaction.id)
+    assert error.value.detail.code == "EXTERNAL_REFERENCE_INVALID"

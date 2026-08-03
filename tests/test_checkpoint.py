@@ -36,7 +36,9 @@ def test_manual_and_auto_share_checkpoint_path(workspace, trigger: str) -> None:
     assert len(adapter.published) == 1
     assert any(action.startswith("lock:") for action in adapter.actions)
     assert adapter.actions.index("publish_context") < adapter.actions.index("compact")
-    assert adapter.actions.index("compact") < adapter.actions.index("unlock")
+    assert adapter.actions.index("compact") < adapter.actions.index("insert_receipt")
+    assert adapter.actions.index("insert_receipt") < adapter.actions.index("unlock")
+    assert adapter.actions.index("unlock") < adapter.actions.index("close_worker")
     assert workspace.thread().last_consolidated_message_id == "msg_assistant_1"
     assert workspace.repository.current_records("events")["evt_publish_delay"]
     frozen = workspace.load_json(f"checkpoints/{result['checkpoint_id']}/frozen.json")
@@ -123,6 +125,72 @@ def test_no_requires_reason_and_reuses_worker_once(workspace) -> None:
     assert current_hypothesis["payload"]["status"] == "rejected"
     decisions = [record for record in workspace.repository.iter_records("messages") if record["payload"]["kind"] == "checkpoint_decision"]
     assert len(decisions) == 1
+
+
+def test_rejection_requires_disputed_hypothesis_with_decision_evidence(workspace) -> None:
+    def worker(payload) -> WorkerResult:
+        if payload["kind"] == "consolidate":
+            return WorkerResult(
+                operations=[
+                    Operation(op="append", stream="hypotheses", record=hypothesis()),
+                    Operation(op="append", stream="meta_revisions", record=meta()),
+                    Operation(op="append", stream="continuations", record=continuation()),
+                ]
+            )
+        return WorkerResult(
+            operations=[
+                Operation(
+                    op="append",
+                    stream="continuations",
+                    record=continuation(through=payload["decision_message_id"]),
+                )
+            ]
+        )
+
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=worker)
+    engine = CheckpointEngine(workspace, adapter)
+    engine.request("manual")
+    with pytest.raises(MemError) as error:
+        engine.decide("no", reason="这个解释不准确。")
+    assert error.value.detail.code == "REJECTION_HYPOTHESIS_REVISION_REQUIRED"
+    assert not workspace.repository.current_records("meta_revisions")
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        Operation(op="append", stream="messages", record={"id": "forged"}),
+        Operation(op="append", stream="sources", record={"id": "forged"}),
+        Operation(op="append", stream="checkpoints", record={"id": "forged"}),
+        Operation(op="write_artifact", path="sources/snapshots/forged.txt", content="forged"),
+    ],
+)
+def test_worker_cannot_write_wrapper_managed_operations(workspace, operation: Operation) -> None:
+    adapter = FakeHarnessAdapter(
+        workspace.config.state_root,
+        messages=visible_messages(),
+        worker=lambda _payload: WorkerResult(
+            operations=[operation, Operation(op="append", stream="continuations", record=continuation())]
+        ),
+    )
+    with pytest.raises(MemError) as error:
+        CheckpointEngine(workspace, adapter).request("manual")
+    assert error.value.detail.code == "WORKER_OPERATION_NOT_ALLOWED"
+
+
+def test_continuation_profile_token_limit_is_enforced(workspace) -> None:
+    oversized = continuation()
+    oversized["payload"]["current_topics"] = ["界" * 1300]
+    adapter = FakeHarnessAdapter(
+        workspace.config.state_root,
+        messages=visible_messages(),
+        worker=lambda _payload: WorkerResult(
+            operations=[Operation(op="append", stream="continuations", record=oversized)]
+        ),
+    )
+    with pytest.raises(MemError) as error:
+        CheckpointEngine(workspace, adapter).request("manual")
+    assert error.value.detail.code == "CONTINUATION_TOO_LONG"
 
 
 def test_validate_failure_blocks_compact_and_retry_keeps_boundary(workspace) -> None:

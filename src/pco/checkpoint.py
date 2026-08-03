@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 import difflib
+import math
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,7 @@ CheckpointStatus = Literal[
     "CONTEXT_PUBLISHED",
     "CONTEXT_COMPACTED",
     "RECEIPT_INSERTED",
+    "INPUT_UNLOCKED",
     "DERIVATIONS_RUNNING",
     "DONE",
     "COMMITTED_WITH_PENDING_DERIVATIONS",
@@ -77,6 +79,7 @@ class CheckpointState(BaseModel):
     context_published: bool = False
     compacted: bool = False
     receipt_inserted: bool = False
+    input_unlocked: bool = False
     retries: int = 0
     failure_phase: str | None = None
     error: dict[str, Any] | None = None
@@ -113,7 +116,7 @@ class CheckpointEngine:
         self.workspace.save_json(
             f"checkpoints/{state.id}/state.json", state.model_dump(mode="json")
         )
-        if state.status not in {"DONE", "COMMITTED_WITH_PENDING_DERIVATIONS", "ABORTED"}:
+        if not state.input_unlocked and state.status not in {"DONE", "COMMITTED_WITH_PENDING_DERIVATIONS", "ABORTED"}:
             self.adapter.lock_input(state.id, state.status)
 
     def _load(self) -> CheckpointState:
@@ -135,7 +138,7 @@ class CheckpointEngine:
 
     def _worker_profile_contract(self) -> dict[str, Any]:
         profile = self.workspace.profile
-        system_managed = {"messages", "sources", "checkpoints"}
+        system_managed = {"messages", "sources", "checkpoints", "search_receipts"}
         streams: dict[str, Any] = {}
         for name, stream in profile.config.streams.items():
             if name in system_managed or stream.write_policy == "read_only":
@@ -260,6 +263,16 @@ class CheckpointEngine:
     ) -> Operation:
         continuation = [op.record for op in operations if op.op == "append" and op.stream == "continuations"]
         ensure(len(continuation) == 1, "CONTINUATION_REQUIRED", "worker_validation", "A checkpoint must append exactly one continuation revision")
+        continuation_limit = int(self.workspace.profile.raw.get("continuation", {}).get("max_tokens", 1200))
+        continuation_text = json.dumps(continuation[0]["payload"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        estimated_tokens = math.ceil(sum(1.0 if ord(char) > 127 else 0.25 for char in continuation_text))
+        ensure(
+            estimated_tokens <= continuation_limit,
+            "CONTINUATION_TOO_LONG",
+            "worker_validation",
+            f"Continuation exceeds Profile limit of {continuation_limit} tokens",
+            value={"estimated_tokens": estimated_tokens, "max_tokens": continuation_limit},
+        )
         meta = [op.record for op in operations if op.op == "append" and op.stream == "meta_revisions"]
         counts = Counter(op.stream or "artifacts" for op in operations)
         binding = self.workspace.binding()
@@ -304,6 +317,7 @@ class CheckpointEngine:
     def _prepare_candidate(self, state: CheckpointState, frozen: dict[str, Any], result: WorkerResult) -> dict[str, Any]:
         persisted_result = {
             "operations": [operation.normalized() for operation in result.operations],
+            "search_receipts": result.search_receipts,
             "diagnostics": result.diagnostics,
             "skill_versions": result.skill_versions,
             "runtime_info": result.runtime_info,
@@ -313,8 +327,37 @@ class CheckpointEngine:
             self.workspace.save_json(f"checkpoints/{state.id}/worker-result-initial.json", persisted_result)
         if state.decision == "no":
             self.workspace.save_json(f"checkpoints/{state.id}/worker-result-revised.json", persisted_result)
+        allowed_worker_streams = set(frozen.get("profile_contract", {}).get("allowed_streams", {}))
+        for operation in result.operations:
+            ensure(
+                operation.op == "append" and operation.stream in allowed_worker_streams,
+                "WORKER_OPERATION_NOT_ALLOWED",
+                "worker_validation",
+                "Worker returned an operation owned by the wrapper or outside its Profile allowlist",
+                stream=operation.stream,
+                value=operation.normalized(),
+                recovery=["Retry the same frozen boundary with only profile_contract.allowed_streams append operations"],
+            )
+        receipt_operations = [
+            Operation(op="append", stream="search_receipts", record=receipt)
+            for receipt in result.search_receipts
+        ]
+        for operation in result.operations:
+            if operation.op != "append" or operation.stream not in {"psychologies", "philosophies"} or operation.record is None:
+                continue
+            for external_ref in operation.record.get("payload", {}).get("external_refs", []):
+                url = external_ref.get("url", "")
+                matches = [
+                    receipt
+                    for receipt in result.search_receipts
+                    if url and url in json.dumps(receipt.get("payload", {}), ensure_ascii=False, sort_keys=True, default=str)
+                ]
+                if matches:
+                    # The wrapper, not worker-authored free text, binds the
+                    # canonical concept to a completed captured tool call.
+                    external_ref["search_receipt"] = matches[-1]["id"]
         source_operations = [Operation.model_validate(item) for item in frozen.get("source_operations", [])]
-        operations = [*source_operations, *result.operations]
+        operations = [*source_operations, *receipt_operations, *result.operations]
         state.harness_runtime.update(result.runtime_info)
         state.skill_versions = dict(result.skill_versions)
         state.operation_counts = dict(Counter(operation.stream or "artifacts" for operation in operations))
@@ -472,6 +515,7 @@ class CheckpointEngine:
                 frozen,
                 WorkerResult(
                     operations=[Operation.model_validate(item) for item in persisted_result["operations"]],
+                    search_receipts=persisted_result.get("search_receipts", []),
                     diagnostics=persisted_result.get("diagnostics", []),
                     skill_versions=persisted_result.get("skill_versions", {}),
                     runtime_info=persisted_result.get("runtime_info", {}),
@@ -534,6 +578,38 @@ class CheckpointEngine:
                 "REJECTION_REPROPOSED_META",
                 "worker_validation",
                 "A rejection revision cannot propose Meta-memory again in the same checkpoint",
+            )
+            initial = self.workspace.load_json(f"checkpoints/{state.id}/proposal-initial.json")
+            promoted_hypotheses = {
+                hypothesis_id
+                for operation in initial.get("operations", [])
+                if operation.get("op") == "append" and operation.get("stream") == "meta_revisions"
+                for hypothesis_id in operation.get("record", {}).get("payload", {}).get("promotion_refs", [])
+            }
+            if not promoted_hypotheses:
+                promoted_hypotheses = {
+                    operation.get("record", {}).get("id")
+                    for operation in initial.get("operations", [])
+                    if operation.get("op") == "append" and operation.get("stream") == "hypotheses"
+                }
+                promoted_hypotheses.discard(None)
+            decision_ref = f"message:{state.decision_message_id}"
+            rejection_revisions = {
+                operation.record["id"]: operation.record
+                for operation in revised.operations
+                if operation.op == "append"
+                and operation.stream == "hypotheses"
+                and operation.record is not None
+                and operation.record.get("payload", {}).get("status") in {"disputed", "rejected"}
+                and decision_ref in operation.record.get("payload", {}).get("counter_evidence_refs", [])
+                and str(operation.record.get("payload", {}).get("revision_reason", "")).strip()
+            }
+            ensure(
+                promoted_hypotheses and promoted_hypotheses.issubset(rejection_revisions),
+                "REJECTION_HYPOTHESIS_REVISION_REQUIRED",
+                "worker_validation",
+                "A rejection must append disputed/rejected revisions for the promoted hypotheses and cite the archived decision",
+                value={"required": sorted(promoted_hypotheses), "received": sorted(rejection_revisions), "decision_ref": decision_ref},
             )
             return self._prepare_candidate(state, frozen, revised)
         except Exception as exc:
@@ -633,6 +709,23 @@ class CheckpointEngine:
             state.status = "COMMITTED_CONTEXT_PENDING"
             self._recover(state, exc, preserve_status=True)
             raise
+        try:
+            if not state.receipt_inserted:
+                state.status = "RECEIPT_INSERTED"
+                receipt = self._receipt(state)
+                self.adapter.insert_receipt(receipt)
+                state.receipt_inserted = True
+                self._save(state)
+                self.workspace.save_json(f"checkpoints/{state.id}/receipt.json", receipt)
+            if not state.input_unlocked:
+                self.adapter.unlock_input()
+                state.input_unlocked = True
+                state.status = "INPUT_UNLOCKED"
+                self._save(state)
+        except Exception as exc:
+            state.status = "COMMITTED_CONTEXT_PENDING"
+            self._recover(state, exc, preserve_status=True)
+            raise
         state.status = "DERIVATIONS_RUNNING"
         self._save(state)
         self._run_derivations(state)
@@ -642,17 +735,7 @@ class CheckpointEngine:
         state.completed_at = utc_now()
         self._save(state)
         receipt = self._receipt(state)
-        try:
-            if not state.receipt_inserted:
-                self.adapter.insert_receipt(receipt)
-                state.receipt_inserted = True
-                self._save(state)
-            self.workspace.save_json(f"checkpoints/{state.id}/receipt.json", receipt)
-            self.adapter.unlock_input()
-        except Exception as exc:
-            state.status = "COMMITTED_CONTEXT_PENDING"
-            self._recover(state, exc, preserve_status=True)
-            raise
+        self.workspace.save_json(f"checkpoints/{state.id}/receipt.json", receipt)
         return {"ok": True, "checkpoint_id": state.id, "status": state.status, "receipt": receipt}
 
     def _cleanup_worker(self, state: CheckpointState) -> None:
@@ -702,7 +785,12 @@ class CheckpointEngine:
 
     def retry(self) -> dict[str, Any]:
         state = self._load()
-        ensure(state.status in {"RECOVERY", "COMMITTED_CONTEXT_PENDING"}, "CHECKPOINT_NOT_RETRYABLE", "checkpoint", f"Checkpoint is {state.status}")
+        ensure(
+            state.status in {"RECOVERY", "COMMITTED_CONTEXT_PENDING", "RECEIPT_INSERTED", "INPUT_UNLOCKED", "DERIVATIONS_RUNNING"},
+            "CHECKPOINT_NOT_RETRYABLE",
+            "checkpoint",
+            f"Checkpoint is {state.status}",
+        )
         state.retries += 1
         state.error = None
         state.failure_phase = None
@@ -750,6 +838,9 @@ class CheckpointEngine:
     def retry_derivations(self) -> dict[str, Any]:
         state = self._load()
         ensure(state.commit is not None, "CHECKPOINT_NOT_COMMITTED", "derivations", "Checkpoint has no canonical commit")
+        if not state.input_unlocked:
+            self.adapter.unlock_input()
+            state.input_unlocked = True
         self._run_derivations(state)
         self._cleanup_worker(state)
         pending = any(not item.get("ok", False) for item in state.derivations.values())
@@ -757,9 +848,7 @@ class CheckpointEngine:
         state.completed_at = utc_now()
         self._save(state)
         receipt = self._receipt(state)
-        self.adapter.insert_receipt(receipt)
         self.workspace.save_json(f"checkpoints/{state.id}/receipt.json", receipt)
-        self.adapter.unlock_input()
         return {"ok": True, "checkpoint_id": state.id, "status": state.status, "derivations": state.derivations, "receipt": receipt}
 
     def abort(self) -> dict[str, Any]:
@@ -771,8 +860,9 @@ class CheckpointEngine:
                 self.manager.abort(state.transaction_id)
         self._cleanup_worker(state)
         state.status = "ABORTED"
-        self._save(state)
         self.adapter.unlock_input()
+        state.input_unlocked = True
+        self._save(state)
         return {"ok": True, "checkpoint_id": state.id, "status": state.status}
 
     def _recover(self, state: CheckpointState, exc: Exception, *, preserve_status: bool = False) -> None:

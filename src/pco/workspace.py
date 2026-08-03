@@ -116,7 +116,9 @@ class Workspace:
         return Profile.load(path, default_registry())
 
     def refresh_repository_profile(self) -> MemoryRepository:
-        self.repository = MemoryRepository(self.config.memory_root, self.canonical_profile())
+        self.profile = self.canonical_profile()
+        self.profile_path = self.config.memory_root / "profiles" / self.profile.name
+        self.repository = MemoryRepository(self.config.memory_root, self.profile)
         return self.repository
 
     def doctor(self) -> dict[str, Any]:

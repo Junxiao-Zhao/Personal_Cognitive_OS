@@ -308,6 +308,7 @@ class TransactionManager:
             "profile": f"{state.profile_name}@{state.profile_version}",
             "fingerprint_context": state.fingerprint_context,
             "operation_count": len(state.operations),
+            "operations": [operation.normalized() for operation in state.operations],
             "approval_receipt": state.approval_receipt.model_dump(mode="json") if state.approval_receipt else None,
             "committed_at": utc_now(),
         }

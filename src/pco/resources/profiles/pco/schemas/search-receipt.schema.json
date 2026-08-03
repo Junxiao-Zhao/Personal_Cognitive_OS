@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "properties": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "revision": {"type": "integer", "const": 1},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "schema_version": {"const": "pco/search-receipt/v1"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_session_id", "call_id", "tool", "input", "output_excerpt", "status"],
+      "properties": {
+        "worker_session_id": {"type": "string", "minLength": 1},
+        "call_id": {"type": "string"},
+        "tool": {"enum": ["websearch", "webfetch"]},
+        "input": {"type": "object"},
+        "output_excerpt": {"type": "string", "maxLength": 4000},
+        "status": {"const": "completed"}
+      }
+    }
+  }
+}

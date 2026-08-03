@@ -11,6 +11,11 @@ streams:
     schema: schemas/source.schema.json
     schema_version: pco/source/v1
     write_policy: auto
+  search_receipts:
+    path: sources/search-receipts.jsonl
+    schema: schemas/search-receipt.schema.json
+    schema_version: pco/search-receipt/v1
+    write_policy: auto
   events:
     path: structured/events.jsonl
     schema: schemas/event.schema.json
@@ -80,6 +85,7 @@ continuation:
   max_tokens: 1200
 retrieval:
   rrf_k: 60
+  candidate_count: 200
   chunk_turns: 2
   overlap_turns: 1
   chunk_token_budget: 800

@@ -23,6 +23,22 @@ def test_turn_archive_is_incremental_and_omits_non_public_messages(workspace) ->
     assert stored[1]["payload"]["reasoning"] == "exposed reasoning"
 
 
+def test_deduplicated_retry_recovers_archive_cursor(workspace) -> None:
+    archive = ConversationArchive(workspace)
+    messages = visible_messages()
+    archive.archive(messages)
+    thread = workspace.thread()
+    thread.archive_cursor = None
+    thread.last_archived_message_id = None
+    workspace.save_thread(thread)
+
+    retried = archive.archive(messages)
+    recovered = workspace.thread()
+    assert retried["archived"] == 0
+    assert recovered.archive_cursor == "native_assistant_1"
+    assert recovered.last_archived_message_id == "msg_assistant_1"
+
+
 def test_reasoning_is_not_fabricated_or_saved_when_disabled(workspace) -> None:
     workspace.config.archive_reasoning = False
     ConversationArchive(workspace).archive(visible_messages())

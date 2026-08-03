@@ -27,6 +27,18 @@ STREAM_TITLES = {
     "checkpoints": "Checkpoint 更新记录",
 }
 
+ENTITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _projection_path(target_root: Path, stream: str, entity_id: str) -> Path:
+    if not ENTITY_ID_PATTERN.fullmatch(entity_id) or not ENTITY_ID_PATTERN.fullmatch(stream):
+        raise MemError("PROJECTION_ENTITY_ID_UNSAFE", "projection", entity_id)
+    root = target_root.resolve()
+    candidate = (root / stream / f"{entity_id}.md").resolve()
+    if root not in candidate.parents:
+        raise MemError("PROJECTION_PATH_ESCAPE", "projection", str(candidate))
+    return candidate
+
 
 def _repository(repo_root: Path) -> MemoryRepository:
     profile_path = repo_root / "profiles" / "pco"
@@ -45,7 +57,13 @@ def _record_title(stream: str, record: dict[str, Any]) -> str:
     return payload.get("name") or payload.get("description") or payload.get("statement") or record["id"]
 
 
-def _page(stream: str, record_id: str, history: list[dict[str, Any]], backlinks: dict[str, Any]) -> dict[str, Any]:
+def _page(
+    stream: str,
+    record_id: str,
+    history: list[dict[str, Any]],
+    backlinks: dict[str, Any],
+    continuations: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
     latest = history[-1]
     title = _record_title(stream, latest)
     lines = [f"# {title}", "", f"PCO entity ID: `{record_id}`", f"Stream: `{stream}`", ""]
@@ -62,14 +80,36 @@ def _page(stream: str, record_id: str, history: list[dict[str, Any]], backlinks:
                 lines.extend([f"### {key}", ""])
                 lines.extend([f"- {json.dumps(entry, ensure_ascii=False) if isinstance(entry, dict) else entry}" for entry in value] or ["- 无"])
                 lines.append("")
+            elif key == "links" and isinstance(value, dict):
+                lines.extend(["### links", ""])
+                for relation, targets in value.items():
+                    for target in targets:
+                        lines.append(f"- {relation}: [{target}](pco://{target})")
+                if not any(value.values()):
+                    lines.append("- 无")
+                lines.append("")
             elif isinstance(value, dict):
                 lines.extend([f"### {key}", "", "```json", json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), "```", ""])
             else:
                 lines.extend([f"- **{key}**: {value}", ""])
+    if stream == "checkpoints":
+        continuation_revision = latest["payload"].get("continuation_revision")
+        continuation = continuations.get(continuation_revision)
+        if continuation is not None:
+            lines.extend([f"## Continuation · revision {continuation_revision}", ""])
+            for key, value in continuation["payload"].items():
+                if isinstance(value, list):
+                    lines.extend([f"### {key}", ""])
+                    lines.extend([f"- {entry}" for entry in value] or ["- 无"])
+                    lines.append("")
+                else:
+                    lines.extend([f"- **{key}**: {json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value}", ""])
     related = backlinks.get(record_id, [])
     if related:
         lines.extend(["## Backlinks", ""])
-        lines.extend([f"- `{item['source_stream']}:{item['source_id']}` · {item['relation']}" for item in related])
+        lines.extend(
+            [f"- [{item['source_stream']}:{item['source_id']}](pco://{item['source_id']}) · {item['relation']}" for item in related]
+        )
         lines.append("")
     return {"entity_id": record_id, "stream": stream, "title": title, "content": "\n".join(lines).rstrip() + "\n"}
 
@@ -79,13 +119,18 @@ def _pages(repository: MemoryRepository) -> list[dict[str, Any]]:
     backlink_map = build_backlinks(repo_root=repository.root)["backlinks"]
     pages: list[dict[str, Any]] = []
     indexes: dict[str, list[tuple[str, str]]] = {}
+    continuations = {
+        record["revision"]: record
+        for record in records.get("continuations", [])
+        if record["id"] == "continuation_current"
+    }
     for stream in STREAM_TITLES:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for record in records.get(stream, []):
             grouped.setdefault(record["id"], []).append(record)
         indexes[stream] = []
         for record_id, history in grouped.items():
-            page = _page(stream, record_id, history, backlink_map)
+            page = _page(stream, record_id, history, backlink_map, continuations)
             pages.append(page)
             indexes[stream].append((page["title"], record_id))
     for stream, label in STREAM_TITLES.items():
@@ -129,12 +174,9 @@ def project_markdown(*, repo_root: Path, output_root: str | Path, **_: Any) -> d
     if mapping.get("commits", {}).get(commit) == "complete":
         return {"ok": True, "idempotent": True, "target": "markdown", "memory_commit": commit, "pages": 0}
     pages = _pages(repository)
-    paths = {
-        page["entity_id"]: target_root / page["stream"] / f"{page['entity_id']}.md"
-        for page in pages
-    }
+    paths = {page["entity_id"]: _projection_path(target_root, page["stream"], page["entity_id"]) for page in pages}
     for page in pages:
-        directory = target_root / page["stream"]
+        directory = paths[page["entity_id"]].parent
         directory.mkdir(parents=True, exist_ok=True)
         path = paths[page["entity_id"]]
         content = re.sub(

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
@@ -64,6 +66,7 @@ class WorkerHandle:
 @dataclass(slots=True)
 class WorkerResult:
     operations: list[Operation]
+    search_receipts: list[dict[str, Any]] = field(default_factory=list)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     skill_versions: dict[str, str] = field(default_factory=dict)
     runtime_info: dict[str, Any] = field(default_factory=dict)
@@ -256,6 +259,8 @@ class OpenCodeAdapter:
         refs: list[str] = []
         for part in item.get("parts", []):
             kind = part.get("type")
+            if part.get("metadata", {}).get("pco_control") is True:
+                continue
             if kind == "text" and not part.get("synthetic", False):
                 text.append(part.get("text", ""))
             elif kind == "reasoning":
@@ -263,14 +268,10 @@ class OpenCodeAdapter:
             elif kind == "file" and part.get("url"):
                 refs.append(part["url"])
         content = "\n".join(text)
-        if role == "user" and content.lstrip().startswith("[PCO_CONTROL]"):
-            return None
         if not content and not refs:
             return None
         created = info.get("time", {}).get("created") or info.get("createdAt")
         if isinstance(created, (int, float)):
-            from datetime import datetime, timezone
-
             created = datetime.fromtimestamp(created / 1000, timezone.utc).isoformat()
         return {
             "native_message_id": info["id"],
@@ -284,7 +285,31 @@ class OpenCodeAdapter:
 
     def archive_messages_since(self, cursor: str | None) -> list[dict[str, Any]]:
         ensure(self.session_id is not None, "HARNESS_NOT_ATTACHED", "harness", "OpenCode session is not attached")
-        items = self._request("GET", f"/session/{self.session_id}/message", params={"limit": 10000})
+        page_size = 1000
+        items: list[dict[str, Any]] = []
+        before: str | None = None
+        seen_boundaries: set[str] = set()
+        cursor_found = cursor is None
+        while True:
+            params: dict[str, Any] = {"limit": page_size}
+            if before is not None:
+                params["before"] = before
+            page = self._request("GET", f"/session/{self.session_id}/message", params=params)
+            ensure(isinstance(page, list), "HARNESS_RESPONSE_INVALID", "harness", "OpenCode messages response is not a list")
+            if not page:
+                break
+            items = page + items
+            if cursor is not None and any(item.get("info", {}).get("id") == cursor for item in page):
+                cursor_found = True
+                break
+            if len(page) < page_size:
+                break
+            boundary = page[0].get("info", {}).get("id")
+            ensure(boundary, "HARNESS_RESPONSE_INVALID", "harness", "OpenCode message page has no boundary ID")
+            ensure(boundary not in seen_boundaries, "HARNESS_PAGINATION_STALLED", "harness", "OpenCode message pagination did not advance")
+            seen_boundaries.add(boundary)
+            before = boundary
+        ensure(cursor_found, "ARCHIVE_CURSOR_NOT_FOUND", "harness", "The archive cursor is no longer present in the complete OpenCode history", value=cursor)
         for item in reversed(items):
             info = item.get("info", {})
             if info.get("role") != "assistant":
@@ -443,8 +468,42 @@ class OpenCodeAdapter:
                 else "not_exposed"
             ),
         }
+        search_receipts: list[dict[str, Any]] = []
+        for part in response.get("parts", []):
+            state = part.get("state", {})
+            tool_name = part.get("tool")
+            if part.get("type") != "tool" or tool_name not in {"websearch", "webfetch"} or state.get("status") != "completed":
+                continue
+            call_id = str(part.get("callID") or part.get("id") or "")
+            tool_input = state.get("input", {})
+            tool_output = state.get("output", "")
+            digest = hashlib.sha256(
+                json.dumps(
+                    {"call_id": call_id, "tool": tool_name, "input": tool_input, "output": tool_output},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()[:24]
+            search_receipts.append(
+                {
+                    "id": f"search_{digest}",
+                    "revision": 1,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                    "schema_version": "pco/search-receipt/v1",
+                    "payload": {
+                        "worker_session_id": handle.native_session_id,
+                        "call_id": call_id,
+                        "tool": tool_name,
+                        "input": tool_input,
+                        "output_excerpt": str(tool_output)[:4000],
+                        "status": "completed",
+                    },
+                }
+            )
         return WorkerResult(
             operations=operations,
+            search_receipts=search_receipts,
             diagnostics=proposal.get("diagnostics", []),
             skill_versions=proposal.get("skill_versions", {}),
             runtime_info=runtime_info,

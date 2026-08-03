@@ -44,10 +44,27 @@ def validate_profile(
     current = {stream: _current(items) for stream, items in records.items()}
     messages = current.get("messages", {})
     sources = current.get("sources", {})
+    search_receipts = current.get("search_receipts", {})
     link_targets = {
         "psychologies": current.get("psychologies", {}),
         "philosophies": current.get("philosophies", {}),
         "archetypes": current.get("archetypes", {}),
+    }
+    structured_evidence = {
+        stream: current.get(stream, {})
+        for stream in ("events", "psychologies", "philosophies", "archetypes", "hypotheses")
+    }
+    evidence_prefixes = {
+        "event": "events",
+        "events": "events",
+        "psychology": "psychologies",
+        "psychologies": "psychologies",
+        "philosophy": "philosophies",
+        "philosophies": "philosophies",
+        "archetype": "archetypes",
+        "archetypes": "archetypes",
+        "hypothesis": "hypotheses",
+        "hypotheses": "hypotheses",
     }
 
     for concept_stream in ("psychologies", "philosophies"):
@@ -64,10 +81,19 @@ def validate_profile(
                 )
             for index, ref in enumerate(refs):
                 parsed = urlparse(ref.get("url", ""))
-                if parsed.scheme not in {"http", "https"} or not parsed.netloc or not ref.get("search_receipt"):
+                receipt_id = ref.get("search_receipt")
+                receipt = search_receipts.get(receipt_id) if isinstance(receipt_id, str) else None
+                receipt_text = str(receipt.get("payload", {})) if receipt else ""
+                if (
+                    parsed.scheme not in {"http", "https"}
+                    or not parsed.netloc
+                    or receipt is None
+                    or receipt["payload"].get("status") != "completed"
+                    or ref.get("url", "") not in receipt_text
+                ):
                     yield _problem(
                         "EXTERNAL_REFERENCE_INVALID",
-                        "External references require an HTTP(S) URL and search receipt",
+                        "External references require an HTTP(S) URL bound to a completed wrapper-captured search receipt",
                         stream=concept_stream,
                         record_id=record["id"],
                         path=f"/payload/external_refs/{index}",
@@ -129,6 +155,25 @@ def validate_profile(
                                 record_id=record["id"],
                                 path=f"/payload/{field}/{index}",
                                 value=ref,
+                            )
+                    else:
+                        prefix, separator, candidate_id = ref.partition(":")
+                        if separator:
+                            target_stream = evidence_prefixes.get(prefix)
+                            matches = [target_stream] if target_stream and candidate_id in structured_evidence[target_stream] else []
+                        else:
+                            candidate_id = ref
+                            matches = [name for name, items in structured_evidence.items() if candidate_id in items]
+                        if len(matches) != 1:
+                            code = "EVIDENCE_REFERENCE_INVALID" if not matches else "EVIDENCE_REFERENCE_AMBIGUOUS"
+                            yield _problem(
+                                code,
+                                f"Structured evidence reference must resolve to exactly one record: {ref}",
+                                stream=stream,
+                                record_id=record["id"],
+                                path=f"/payload/{field}/{index}",
+                                value=ref,
+                                recovery=["Use an existing entity ID or a supported qualified reference"],
                             )
 
     for record in records.get("meta_revisions", []):

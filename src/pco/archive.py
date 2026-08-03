@@ -66,6 +66,23 @@ class ConversationArchive:
             existing_keys.add(key)
             records.append(record)
         if not records:
+            # A previous attempt may have committed the canonical records and
+            # crashed before updating replaceable runtime state.  Recover the
+            # cursor from the newest already-canonical input message.
+            canonical_by_native_id = {
+                record["payload"]["native_message_id"]: record
+                for record in self.workspace.repository.iter_records("messages")
+                if record["payload"]["harness"] == self.workspace.binding().harness
+                and record["payload"]["native_session_id"]
+                == (self.workspace.binding().native_session_id or "unbound")
+            }
+            archived_allowed = [message for message in allowed if message.get("native_message_id") in canonical_by_native_id]
+            if archived_allowed:
+                recovered = canonical_by_native_id[archived_allowed[-1]["native_message_id"]]
+                thread = self.workspace.thread()
+                thread.last_archived_message_id = recovered["id"]
+                thread.archive_cursor = recovered["payload"]["native_message_id"]
+                self.workspace.save_thread(thread)
             return {"ok": True, "archived": 0, "commit": None}
         manager = TransactionManager(self.workspace.repository, self.workspace.config.state_root)
         state = manager.begin(

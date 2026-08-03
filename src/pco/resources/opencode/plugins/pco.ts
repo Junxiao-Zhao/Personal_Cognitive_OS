@@ -14,6 +14,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   const pcoCommand = process.env.PCO_COMMAND ?? "pco"
   let currentContext = existsSync(contextPath) ? readFileSync(contextPath, "utf8") : ""
   let idleTask: Promise<void> | undefined
+  const controlCommands = new Set(["compact", "pco-abort", "pco-no", "pco-retry", "pco-status", "pco-yes"])
 
   const binding = (): Json | undefined => {
     if (!existsSync(bindingPath)) return undefined
@@ -128,6 +129,15 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       }),
     },
 
+    "command.execute.before": async (input, output) => {
+      if (!mainSession(input.sessionID) || !controlCommands.has(input.command)) return
+      for (const part of output.parts) {
+        if (part.type !== "text") continue
+        const jsonPart = part as unknown as Json
+        jsonPart.metadata = { ...((jsonPart.metadata as Json | undefined) ?? {}), pco_control: true }
+      }
+    },
+
     event: async ({ event }) => {
       if (event.type === "file.watcher.updated") {
         const changed = resolve(directory, event.properties.file)
@@ -152,8 +162,12 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
 
     "chat.message": async (input, output) => {
       if (!mainSession(input.sessionID) || !existsSync(lockPath)) return
-      const visible = output.parts.filter((part) => part.type === "text").map((part) => ("text" in part ? part.text : "")).join("\n")
-      if (visible.includes("[PCO_CONTROL]")) return
+      const authorized = output.parts.some((part) => {
+        if (part.type !== "text") return false
+        const metadata = (part as unknown as Json).metadata as Json | undefined
+        return metadata?.pco_control === true
+      })
+      if (authorized) return
       throw new Error("PCO checkpoint 正在进行，普通输入已锁定。请使用 /pco-status、/pco-yes、/pco-no <理由>、/pco-retry 或 /pco-abort。")
     },
 

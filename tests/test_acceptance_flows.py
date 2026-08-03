@@ -24,10 +24,25 @@ def _concept(record_id: str, schema_version: str, name: str) -> dict:
                     "url": "https://example.org/reference",
                     "title": "Reference definition",
                     "accessed_at": NOW,
-                    "search_receipt": "search:test-fixture:reference-definition",
+                    "search_receipt": "worker_value_is_replaced",
                 }
             ],
             "status": "active",
+        },
+    )
+
+
+def _search_receipt() -> dict:
+    return envelope(
+        "search_fixture_reference",
+        "pco/search-receipt/v1",
+        {
+            "worker_session_id": "ses_fake_worker",
+            "call_id": "call_fixture",
+            "tool": "websearch",
+            "input": {"query": "reference definition"},
+            "output_excerpt": "Result: https://example.org/reference",
+            "status": "completed",
         },
     )
 
@@ -81,7 +96,11 @@ def test_ac01_source_cold_start_commits_four_classes_meta_and_continuation(works
     adapter = FakeHarnessAdapter(
         workspace.config.state_root,
         messages=visible_messages(),
-        worker=lambda _payload: WorkerResult(operations, skill_versions={"pco-memory": "0.1.0"}),
+        worker=lambda _payload: WorkerResult(
+            operations,
+            search_receipts=[_search_receipt()],
+            skill_versions={"pco-memory": "0.1.0"},
+        ),
     )
     engine = CheckpointEngine(workspace, adapter)
     proposal = engine.request("manual")

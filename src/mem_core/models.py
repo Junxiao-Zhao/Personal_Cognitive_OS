@@ -23,7 +23,7 @@ def sha256_json(value: Any) -> str:
 class RecordEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(min_length=1)
+    id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
     revision: int = Field(ge=1)
     recorded_at: str
     schema_version: str = Field(min_length=1)
