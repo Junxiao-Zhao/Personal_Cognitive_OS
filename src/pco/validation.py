@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
@@ -37,6 +38,35 @@ def _current(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _legacy_external_refs(repo_root: Path) -> set[tuple[str, str, int, int, str, str]]:
+    audit_path = repo_root / "transactions" / "profile-migrations.jsonl"
+    if not audit_path.is_file():
+        return set()
+    result: set[tuple[str, str, int, int, str, str]] = set()
+    for line in audit_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        audit = json.loads(line)
+        if (
+            audit.get("kind") != "profile_migration"
+            or audit.get("profile_before") != "pco@0.3.1"
+            or audit.get("profile_after") != "pco@0.3.2"
+        ):
+            continue
+        for item in audit.get("legacy_external_refs", []):
+            result.add(
+                (
+                    str(item.get("stream", "")),
+                    str(item.get("record_id", "")),
+                    int(item.get("revision", 0)),
+                    int(item.get("external_ref_index", -1)),
+                    str(item.get("url", "")),
+                    str(item.get("search_receipt", "")),
+                )
+            )
+    return result
+
+
 def validate_profile(
     _repo_root: Path,
     records: dict[str, list[dict[str, Any]]],
@@ -45,6 +75,7 @@ def validate_profile(
     messages = current.get("messages", {})
     sources = current.get("sources", {})
     search_receipts = current.get("search_receipts", {})
+    legacy_external_refs = _legacy_external_refs(_repo_root)
     link_targets = {
         "psychologies": current.get("psychologies", {}),
         "philosophies": current.get("philosophies", {}),
@@ -84,16 +115,29 @@ def validate_profile(
                 receipt_id = ref.get("search_receipt")
                 receipt = search_receipts.get(receipt_id) if isinstance(receipt_id, str) else None
                 receipt_text = str(receipt.get("payload", {})) if receipt else ""
+                legacy_key = (
+                    concept_stream,
+                    str(record.get("id", "")),
+                    int(record.get("revision", 0)),
+                    index,
+                    str(ref.get("url", "")),
+                    str(receipt_id or ""),
+                )
                 if (
                     parsed.scheme not in {"http", "https"}
                     or not parsed.netloc
-                    or receipt is None
-                    or receipt["payload"].get("status") != "completed"
-                    or ref.get("url", "") not in receipt_text
+                    or (
+                        legacy_key not in legacy_external_refs
+                        and (
+                            receipt is None
+                            or receipt["payload"].get("status") != "completed"
+                            or ref.get("url", "") not in receipt_text
+                        )
+                    )
                 ):
                     yield _problem(
                         "EXTERNAL_REFERENCE_INVALID",
-                        "External references require an HTTP(S) URL bound to a completed wrapper-captured search receipt",
+                        "External references require an HTTP(S) URL bound to a completed wrapper-captured search receipt or an audited legacy migration entry",
                         stream=concept_stream,
                         record_id=record["id"],
                         path=f"/payload/external_refs/{index}",

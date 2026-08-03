@@ -359,17 +359,19 @@ def _eligible_backend_hits(
     eligible_keys: set[str],
     candidate_limit: int,
     total_documents: int,
+    max_fetch_limit: int,
 ) -> dict[str, float]:
     if not eligible_keys or total_documents <= 0:
         return {}
     target = min(candidate_limit, len(eligible_keys))
-    fetch_limit = min(total_documents, max(1, candidate_limit))
+    fetch_ceiling = min(total_documents, max(candidate_limit, max_fetch_limit))
+    fetch_limit = min(fetch_ceiling, max(1, candidate_limit))
     while True:
         raw = search_once(fetch_limit)
         eligible = {key: score for key, score in raw.items() if key in eligible_keys}
-        if len(eligible) >= target or fetch_limit >= total_documents or len(raw) < fetch_limit:
+        if len(eligible) >= target or fetch_limit >= fetch_ceiling or len(raw) < fetch_limit:
             return dict(list(eligible.items())[:target])
-        expanded = min(total_documents, max(fetch_limit + 1, fetch_limit * 2))
+        expanded = min(fetch_ceiling, max(fetch_limit + 1, fetch_limit * 2))
         if expanded == fetch_limit:
             return dict(list(eligible.items())[:target])
         fetch_limit = expanded
@@ -382,6 +384,7 @@ def _index_scores(
     query: str,
     eligible_keys: set[str],
     candidate_limit: int,
+    max_fetch_limit: int,
 ) -> tuple[dict[str, float], dict[str, float]]:
     dense: dict[str, float] = {}
     lexical: dict[str, float] = {}
@@ -407,6 +410,7 @@ def _index_scores(
                 eligible_keys=eligible_keys,
                 candidate_limit=candidate_limit,
                 total_documents=total_documents,
+                max_fetch_limit=max_fetch_limit,
             )
         except Exception:
             lexical = {}
@@ -438,6 +442,7 @@ def _index_scores(
                     eligible_keys=eligible_keys,
                     candidate_limit=candidate_limit,
                     total_documents=total_documents,
+                    max_fetch_limit=max_fetch_limit,
                 )
             finally:
                 client.close()
@@ -536,6 +541,8 @@ def search(
     docs = _documents(repository)
     retrieval_config = profile.raw.get("retrieval", {})
     candidate_limit = max(limit, int(retrieval_config.get("candidate_count", 200)))
+    candidate_overfetch_factor = max(1, int(retrieval_config.get("candidate_overfetch_factor", 4)))
+    max_fetch_limit = candidate_limit * candidate_overfetch_factor
     rrf_k = float(retrieval_config.get("rrf_k", 60))
     recency_half_life_days = max(0.000001, float(retrieval_config.get("recency_half_life_days", 180)))
     indexes_root = Path(indexes_root) if indexes_root is not None else repo_root.parent / "indexes"
@@ -573,6 +580,7 @@ def search(
         query=query,
         eligible_keys=eligible_keys,
         candidate_limit=candidate_limit,
+        max_fetch_limit=max_fetch_limit,
     )
     backend_candidates = set(backend_dense) | set(backend_lexical)
     if backend_candidates:
@@ -582,7 +590,17 @@ def search(
             if f"{doc['stream']}:{doc['id']}@{doc['revision']}" in backend_candidates
         ]
         if backend_filtered:
-            filtered = backend_filtered
+            remaining = [
+                doc
+                for doc in filtered
+                if f"{doc['stream']}:{doc['id']}@{doc['revision']}" not in backend_candidates
+            ]
+            remaining = sorted(
+                remaining,
+                key=lambda doc: doc.get("occurred_at") or doc.get("recorded_at") or "",
+                reverse=True,
+            )
+            filtered = [*backend_filtered, *remaining[: max(0, candidate_limit - len(backend_filtered))]]
         else:
             backend_candidates = set()
     if not backend_candidates and len(filtered) > candidate_limit:
@@ -653,6 +671,8 @@ def search(
         "backends": {"dense": index_result["dense_backend"], "lexical": index_result["lexical_backend"]},
         "retrieval_policy": {
             "candidate_count": candidate_limit,
+            "candidate_overfetch_factor": candidate_overfetch_factor,
+            "max_backend_candidates": max_fetch_limit,
             "rrf_k": rrf_k,
             "recency_half_life_days": recency_half_life_days,
         },

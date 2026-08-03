@@ -86,6 +86,7 @@ continuation:
 retrieval:
   rrf_k: 60
   candidate_count: 200
+  candidate_overfetch_factor: 4
   chunk_turns: 2
   overlap_turns: 1
   chunk_token_budget: 800

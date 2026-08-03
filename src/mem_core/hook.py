@@ -26,6 +26,40 @@ PCO_SEARCH_RECEIPT_STREAM = {
 }
 
 
+def _legacy_external_refs(root: Path, profile: Profile) -> list[dict[str, object]]:
+    legacy: list[dict[str, object]] = []
+    for stream in ("psychologies", "philosophies"):
+        if stream not in profile.config.streams:
+            continue
+        path = profile.stream_path(root, stream)
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            for index, reference in enumerate(record.get("payload", {}).get("external_refs", [])):
+                legacy.append(
+                    {
+                        "stream": stream,
+                        "record_id": record.get("id"),
+                        "revision": record.get("revision"),
+                        "external_ref_index": index,
+                        "url": reference.get("url"),
+                        "search_receipt": reference.get("search_receipt"),
+                    }
+                )
+    return sorted(
+        legacy,
+        key=lambda item: (
+            str(item["stream"]),
+            str(item["record_id"]),
+            int(item["revision"]),
+            int(item["external_ref_index"]),
+        ),
+    )
+
+
 def _git(root: Path, *args: str, text: bool = True) -> str | bytes:
     result = subprocess.run(
         ["git", "-C", str(root), *args],
@@ -176,6 +210,7 @@ def _verify_profile_migration(root: Path, old_root: Path, staged_root: Path, pro
     expected_raw["version"] = "0.3.2"
     expected_raw.setdefault("streams", {})["search_receipts"] = dict(PCO_SEARCH_RECEIPT_STREAM)
     expected_raw.setdefault("retrieval", {}).setdefault("candidate_count", 200)
+    expected_raw.setdefault("retrieval", {}).setdefault("candidate_overfetch_factor", 4)
     ensure(profile.raw == expected_raw, "PROFILE_MIGRATION_INVALID", "pre_commit", "Canonical Profile contains changes outside the supported migration")
 
     schema_path = Path("profiles/pco/schemas/search-receipt.schema.json")
@@ -196,6 +231,12 @@ def _verify_profile_migration(root: Path, old_root: Path, staged_root: Path, pro
     ensure(str(record.get("id", "")).startswith("profile_pco_0_3_2_"), "PROFILE_MIGRATION_RECEIPT_INVALID", "pre_commit", "Invalid migration receipt id")
     ensure(record.get("base_commit") == head, "BASE_COMMIT_CHANGED", "pre_commit", "Profile migration base is not HEAD")
     ensure(record.get("profile_before") == "pco@0.3.1" and record.get("profile_after") == "pco@0.3.2", "PROFILE_MIGRATION_RECEIPT_INVALID", "pre_commit", "Migration receipt versions do not match")
+    ensure(
+        record.get("legacy_external_refs") == _legacy_external_refs(old_root, old_profile),
+        "PROFILE_MIGRATION_RECEIPT_INVALID",
+        "pre_commit",
+        "Migration receipt does not exactly account for legacy external references",
+    )
     audited_paths = [marker_path, profile_path, schema_path, stream_path]
     expected_hashes = {
         path.as_posix(): "sha256:" + hashlib.sha256((staged_root / path).read_bytes()).hexdigest()

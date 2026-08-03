@@ -66,12 +66,14 @@ def test_retrieval_reads_profile_ranking_and_candidate_policy(workspace) -> None
     result = search(repo_root=workspace.config.memory_root, query="拖延", limit=2)
     assert result["retrieval_policy"] == {
         "candidate_count": 7,
+        "candidate_overfetch_factor": 4,
+        "max_backend_candidates": 28,
         "rrf_k": 17.0,
         "recency_half_life_days": 30.0,
     }
 
 
-def test_backend_candidates_expand_until_filtered_documents_are_found() -> None:
+def test_backend_candidate_expansion_stops_at_overfetch_limit() -> None:
     ranked = [
         ("events:outside_1@1", 1.0),
         ("events:outside_2@1", 0.9),
@@ -90,9 +92,10 @@ def test_backend_candidates_expand_until_filtered_documents_are_found() -> None:
         eligible_keys={"continuations:wanted_1@1", "continuations:wanted_2@1"},
         candidate_limit=2,
         total_documents=len(ranked),
+        max_fetch_limit=4,
     )
-    assert list(result) == ["continuations:wanted_1@1", "continuations:wanted_2@1"]
-    assert calls == [2, 4, 5]
+    assert list(result) == ["continuations:wanted_1@1"]
+    assert calls == [2, 4]
 
 
 def test_search_does_not_drop_filtered_results_for_disjoint_backend_hits(workspace, monkeypatch) -> None:

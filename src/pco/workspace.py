@@ -117,6 +117,41 @@ class Workspace:
         path = self.config.memory_root / "profiles" / self.profile.name
         return Profile.load(path, default_registry())
 
+    @staticmethod
+    def _legacy_external_refs(repo_root: Path, profile_raw: dict[str, Any]) -> list[dict[str, Any]]:
+        legacy: list[dict[str, Any]] = []
+        for stream in ("psychologies", "philosophies"):
+            relative = profile_raw.get("streams", {}).get(stream, {}).get("path")
+            if not relative:
+                continue
+            path = repo_root / relative
+            if not path.is_file():
+                continue
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                for index, reference in enumerate(record.get("payload", {}).get("external_refs", [])):
+                    legacy.append(
+                        {
+                            "stream": stream,
+                            "record_id": record.get("id"),
+                            "revision": record.get("revision"),
+                            "external_ref_index": index,
+                            "url": reference.get("url"),
+                            "search_receipt": reference.get("search_receipt"),
+                        }
+                    )
+        return sorted(
+            legacy,
+            key=lambda item: (
+                str(item["stream"]),
+                str(item["record_id"]),
+                int(item["revision"]),
+                int(item["external_ref_index"]),
+            ),
+        )
+
     def _migrate_canonical_profile(self) -> str | None:
         if self.profile.name != "pco":
             return None
@@ -163,6 +198,10 @@ class Workspace:
                 "candidate_count",
                 self.profile.raw.get("retrieval", {}).get("candidate_count", 200),
             )
+            migrated_raw.setdefault("retrieval", {}).setdefault(
+                "candidate_overfetch_factor",
+                self.profile.raw.get("retrieval", {}).get("candidate_overfetch_factor", 4),
+            )
             migrated_profile_file.write_text(
                 yaml.safe_dump(migrated_raw, allow_unicode=True, sort_keys=False),
                 encoding="utf-8",
@@ -182,8 +221,6 @@ class Workspace:
                 encoding="utf-8",
             )
 
-            migrated_profile = Profile.load(worktree / "profiles" / "pco", default_registry())
-            MemoryRepository(worktree, migrated_profile).validate_all(root=worktree)
             changed_files = [
                 Path(".mem-profile.json"),
                 Path("profiles/pco/profile.yaml"),
@@ -200,11 +237,14 @@ class Workspace:
                     path.as_posix(): "sha256:" + hashlib.sha256((worktree / path).read_bytes()).hexdigest()
                     for path in changed_files
                 },
+                "legacy_external_refs": self._legacy_external_refs(worktree, migrated_raw),
                 "applied_at": utc_now(),
             }
             audit_path = worktree / "transactions" / "profile-migrations.jsonl"
             with audit_path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(json.dumps(audit, ensure_ascii=False, sort_keys=True) + "\n")
+            migrated_profile = Profile.load(worktree / "profiles" / "pco", default_registry())
+            MemoryRepository(worktree, migrated_profile).validate_all(root=worktree)
             self.repository._git("add", "--", *(path.as_posix() for path in [*changed_files, Path("transactions/profile-migrations.jsonl")]), cwd=worktree)
             self.repository._git(
                 "commit",
