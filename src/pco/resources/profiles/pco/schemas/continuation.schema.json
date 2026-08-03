@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object", "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "properties": {
+    "id": {"const": "continuation_current"}, "revision": {"type": "integer", "minimum": 1}, "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/continuation/v1"},
+    "payload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["current_topics", "open_questions", "active_tensions", "recent_decisions", "next_possible_directions", "message_range", "status"],
+      "properties": {
+        "current_topics": {"type": "array", "items": {"type": "string"}}, "open_questions": {"type": "array", "items": {"type": "string"}},
+        "active_tensions": {"type": "array", "items": {"type": "string"}}, "recent_decisions": {"type": "array", "items": {"type": "string"}},
+        "next_possible_directions": {"type": "array", "items": {"type": "string"}},
+        "message_range": {"type": "object", "additionalProperties": false, "required": ["after", "through"], "properties": {"after": {"type": ["string", "null"]}, "through": {"type": "string", "minLength": 1}}},
+        "status": {"const": "active"}
+      }
+    }
+  }
+}

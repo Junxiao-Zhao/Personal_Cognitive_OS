@@ -1,0 +1,19 @@
+workspace_root: .pco
+memory_dir: memory
+state_dir: state
+indexes_dir: indexes
+projection_dir: projection
+profile: pco
+checkpoint:
+  trigger_ratio: 0.50
+  derivations:
+    index: true
+    backlinks: true
+    projection: affine
+harness:
+  kind: opencode
+  base_url: http://127.0.0.1:4096
+  main_session_id: null
+  model_context_tokens: 128000
+  request_timeout_seconds: 120.0
+archive_reasoning: true

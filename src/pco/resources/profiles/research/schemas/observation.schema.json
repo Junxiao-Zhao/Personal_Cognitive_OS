@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "properties": {"id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1}, "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "research/observation/v1"}, "payload": {"type": "object", "additionalProperties": false, "required": ["text", "source"], "properties": {"text": {"type": "string", "minLength": 1}, "source": {"type": "string", "minLength": 1}}}}
+}

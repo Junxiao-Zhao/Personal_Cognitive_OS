@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object", "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1},
+    "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"enum": ["pco/psychology/v1", "pco/philosophy/v1"]},
+    "payload": {
+      "type": "object", "additionalProperties": false, "required": ["name", "description", "aliases", "external_refs", "status"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1},
+        "aliases": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "external_refs": {
+          "type": "array", "minItems": 1, "items": {
+            "type": "object", "additionalProperties": false, "required": ["url", "title", "accessed_at", "search_receipt"],
+            "properties": {"url": {"type": "string", "format": "uri"}, "title": {"type": "string", "minLength": 1}, "accessed_at": {"type": "string", "format": "date-time"}, "search_receipt": {"type": "string", "minLength": 1}}
+          }
+        },
+        "status": {"enum": ["active", "superseded", "tombstone"]}
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+name: research
+version: 1.0.0
+streams:
+  observations:
+    path: research/observations.jsonl
+    schema: schemas/observation.schema.json
+    schema_version: research/observation/v1
+    write_policy: auto
+  claims:
+    path: research/claims.jsonl
+    schema: schemas/claim.schema.json
+    schema_version: research/claim/v1
+    write_policy: user_approval
+  papers:
+    path: research/papers.jsonl
+    schema: schemas/paper.schema.json
+    schema_version: research/paper/v1
+    write_policy: read_only
+artifact_roots:
+  - artifacts
+validators:
+  - research.validate
+capabilities:
+  retrieval:
+    search: research.retrieval.search
+  projections:
+    markdown: research.projection.markdown

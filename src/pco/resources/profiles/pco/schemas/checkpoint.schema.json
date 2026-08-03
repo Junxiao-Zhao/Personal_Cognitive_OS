@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "revision": {"type": "integer", "minimum": 1},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "schema_version": {"const": "pco/checkpoint/v1"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "thread_id", "harness_binding_id", "parent_session_id", "archive_cursor",
+        "source_hashes", "worker", "runtime", "trigger", "status", "message_range",
+        "transaction_id", "git_commit", "operation_counts", "proposal_hash",
+        "promotion_proposal_hash", "approval_decision", "protected_streams",
+        "promotion_protected_streams", "meta_revision",
+        "continuation_revision", "derivations", "versions", "warnings",
+        "started_at", "ended_at", "retry_count"
+      ],
+      "properties": {
+        "thread_id": {"type": "string", "minLength": 1},
+        "harness_binding_id": {"type": "string", "minLength": 1},
+        "parent_session_id": {"type": "string", "minLength": 1},
+        "archive_cursor": {"type": ["string", "null"]},
+        "source_hashes": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^sha256:"}},
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "backend", "native_session_id"],
+          "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "backend": {"type": "string", "minLength": 1},
+            "native_session_id": {"type": "string", "minLength": 1}
+          }
+        },
+        "runtime": {"type": "object"},
+        "trigger": {"enum": ["manual", "auto"]},
+        "status": {"enum": ["committed", "committed_with_pending_derivations"]},
+        "message_range": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["after", "through"],
+          "properties": {
+            "after": {"type": ["string", "null"]},
+            "through": {"type": "string", "minLength": 1}
+          }
+        },
+        "transaction_id": {"type": "string", "minLength": 1},
+        "git_commit": {"type": ["string", "null"]},
+        "operation_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+        "proposal_hash": {"type": "string", "pattern": "^sha256:"},
+        "promotion_proposal_hash": {"type": ["string", "null"], "pattern": "^sha256:"},
+        "approval_decision": {"enum": ["yes", "no", "not_required"]},
+        "protected_streams": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "promotion_protected_streams": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "meta_revision": {"type": ["integer", "null"], "minimum": 1},
+        "continuation_revision": {"type": "integer", "minimum": 1},
+        "derivations": {"type": "object"},
+        "versions": {"type": "object"},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "started_at": {"type": "string", "format": "date-time"},
+        "ended_at": {"type": "string", "format": "date-time"},
+        "retry_count": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

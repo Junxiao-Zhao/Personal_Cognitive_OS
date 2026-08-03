@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "revision": {"type": "integer", "minimum": 1},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "schema_version": {"const": "conversation-message/v1"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["thread_id", "epoch_id", "harness", "native_session_id", "native_message_id", "role", "kind", "content", "refs", "created_at"],
+      "properties": {
+        "thread_id": {"type": "string", "minLength": 1},
+        "epoch_id": {"type": "string", "minLength": 1},
+        "harness": {"type": "string", "minLength": 1},
+        "native_session_id": {"type": "string", "minLength": 1},
+        "native_message_id": {"type": "string", "minLength": 1},
+        "role": {"enum": ["user", "assistant"]},
+        "kind": {"enum": ["conversation", "checkpoint_decision"]},
+        "content": {"type": "string"},
+        "reasoning": {"type": ["string", "null"]},
+        "refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "created_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}

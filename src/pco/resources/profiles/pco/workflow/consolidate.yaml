@@ -1,0 +1,14 @@
+version: consolidate@0.3.1
+steps:
+  - freeze_transcript
+  - spawn_worker
+  - validate_proposal
+  - request_meta_approval
+  - resume_after_rejection
+  - validate_final
+  - commit
+  - render_context
+  - publish_context
+  - compact_parent
+  - insert_receipt
+  - close_worker

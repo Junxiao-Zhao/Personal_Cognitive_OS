@@ -1,0 +1,88 @@
+name: pco
+version: 0.3.1
+streams:
+  messages:
+    path: raw/conversations/messages.jsonl
+    schema: schemas/conversation-message.schema.json
+    schema_version: conversation-message/v1
+    write_policy: auto
+  sources:
+    path: sources/registry.jsonl
+    schema: schemas/source.schema.json
+    schema_version: pco/source/v1
+    write_policy: auto
+  events:
+    path: structured/events.jsonl
+    schema: schemas/event.schema.json
+    schema_version: pco/event/v1
+    write_policy: auto
+  psychologies:
+    path: structured/psychologies.jsonl
+    schema: schemas/concept.schema.json
+    schema_version: pco/psychology/v1
+    write_policy: auto
+  philosophies:
+    path: structured/philosophies.jsonl
+    schema: schemas/concept.schema.json
+    schema_version: pco/philosophy/v1
+    write_policy: auto
+  archetypes:
+    path: structured/archetypes.jsonl
+    schema: schemas/archetype.schema.json
+    schema_version: pco/archetype/v1
+    write_policy: auto
+  hypotheses:
+    path: structured/hypotheses.jsonl
+    schema: schemas/hypothesis.schema.json
+    schema_version: pco/hypothesis/v1
+    write_policy: auto
+  meta_revisions:
+    path: meta/revisions.jsonl
+    schema: schemas/meta-revision.schema.json
+    schema_version: pco/meta-revision/v1
+    write_policy: user_approval
+    approval_ref_pointer: /payload/approval_ref
+  continuations:
+    path: checkpoints/continuations.jsonl
+    schema: schemas/continuation.schema.json
+    schema_version: pco/continuation/v1
+    write_policy: auto
+  checkpoints:
+    path: checkpoints/checkpoints.jsonl
+    schema: schemas/checkpoint.schema.json
+    schema_version: pco/checkpoint/v1
+    write_policy: auto
+artifact_roots:
+  - sources/snapshots
+validators:
+  - pco.validate
+capabilities:
+  retrieval:
+    search: pco.retrieval.search
+  index:
+    build: pco.index.build
+  backlinks:
+    build: pco.backlinks.build
+  context_renderer:
+    render: pco.context.render
+  projections:
+    affine: pco.projection.affine
+    markdown: pco.projection.markdown
+checkpoint:
+  trigger_ratio: 0.50
+conversation_archive:
+  reasoning:
+    archive_if_available: true
+    index: false
+    inject_on_recall: false
+    use_as_user_evidence: false
+continuation:
+  max_tokens: 1200
+retrieval:
+  rrf_k: 60
+  chunk_turns: 2
+  overlap_turns: 1
+  chunk_token_budget: 800
+  recency_half_life_days: 180
+projection:
+  target: affine

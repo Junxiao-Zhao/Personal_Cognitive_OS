@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object", "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1},
+    "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/source/v1"},
+    "payload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_id", "role", "provider", "locator", "display_name", "reader_skill", "snapshot_path", "registered_at", "status"],
+      "properties": {
+        "source_id": {"type": "string", "minLength": 1}, "role": {"const": "input"},
+        "provider": {"type": "string", "minLength": 1}, "locator": {"type": "string", "minLength": 1},
+        "display_name": {"type": "string", "minLength": 1}, "reader_skill": {"type": "string", "minLength": 1},
+        "snapshot_path": {"type": "string", "pattern": "^sources/snapshots/"},
+        "content_hash": {"type": ["string", "null"], "pattern": "^sha256:"},
+        "registered_at": {"type": "string", "format": "date-time"}, "status": {"enum": ["active", "inactive"]}
+      }
+    }
+  }
+}

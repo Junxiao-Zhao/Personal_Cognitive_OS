@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object", "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1}, "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/archetype/v1"},
+    "payload": {
+      "type": "object", "additionalProperties": false, "required": ["name", "description", "aliases", "stance", "evidence_refs", "status"],
+      "properties": {"name": {"type": "string", "minLength": 1}, "description": {"type": "string", "minLength": 1}, "aliases": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}, "stance": {"enum": ["like", "dislike", "identify", "resist", "mixed", "unknown"]}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true}, "status": {"enum": ["active", "superseded", "tombstone"]}}
+    }
+  }
+}
