@@ -314,10 +314,75 @@ class CheckpointEngine:
         }
         return Operation(op="append", stream="checkpoints", record=record)
 
+    def _validate_rejection_candidate(self, state: CheckpointState, result: WorkerResult) -> None:
+        if state.decision != "no":
+            return
+        ensure(
+            not any(op.stream == "meta_revisions" for op in result.operations),
+            "REJECTION_REPROPOSED_META",
+            "worker_validation",
+            "A rejection revision cannot propose Meta-memory again in the same checkpoint",
+        )
+        initial = self.workspace.load_json(f"checkpoints/{state.id}/proposal-initial.json")
+        promoted_hypotheses = {
+            hypothesis_id
+            for operation in initial.get("operations", [])
+            if operation.get("op") == "append" and operation.get("stream") == "meta_revisions"
+            for hypothesis_id in operation.get("record", {}).get("payload", {}).get("promotion_refs", [])
+        }
+        if not promoted_hypotheses:
+            promoted_hypotheses = {
+                operation.get("record", {}).get("id")
+                for operation in initial.get("operations", [])
+                if operation.get("op") == "append" and operation.get("stream") == "hypotheses"
+            }
+            promoted_hypotheses.discard(None)
+        decision_ref = f"message:{state.decision_message_id}"
+        rejection_revisions = {
+            operation.record["id"]: operation.record
+            for operation in result.operations
+            if operation.op == "append"
+            and operation.stream == "hypotheses"
+            and operation.record is not None
+            and operation.record.get("payload", {}).get("status") in {"disputed", "rejected"}
+            and decision_ref in operation.record.get("payload", {}).get("counter_evidence_refs", [])
+            and str(operation.record.get("payload", {}).get("revision_reason", "")).strip()
+        }
+        ensure(
+            promoted_hypotheses and promoted_hypotheses.issubset(rejection_revisions),
+            "REJECTION_HYPOTHESIS_REVISION_REQUIRED",
+            "worker_validation",
+            "A rejection must append disputed/rejected revisions for the promoted hypotheses and cite the archived decision",
+            value={"required": sorted(promoted_hypotheses), "received": sorted(rejection_revisions), "decision_ref": decision_ref},
+        )
+
+    def _effective_search_receipts(self, state: CheckpointState, result: WorkerResult) -> list[dict[str, Any]]:
+        receipts: list[dict[str, Any]] = []
+        if state.decision == "no":
+            initial_path = self.workspace.state_path(f"checkpoints/{state.id}/worker-result-initial.json")
+            if initial_path.exists():
+                receipts.extend(self.workspace.load_json(f"checkpoints/{state.id}/worker-result-initial.json").get("search_receipts", []))
+        receipts.extend(result.search_receipts)
+        by_id: dict[str, dict[str, Any]] = {}
+        for receipt in receipts:
+            receipt_id = str(receipt.get("id", ""))
+            ensure(receipt_id, "SEARCH_RECEIPT_INVALID", "worker_validation", "Captured search receipt is missing an id")
+            ensure(
+                receipt_id not in by_id or by_id[receipt_id] == receipt,
+                "SEARCH_RECEIPT_CONFLICT",
+                "worker_validation",
+                "Captured search receipt id was reused with different content",
+                record_id=receipt_id,
+            )
+            by_id[receipt_id] = receipt
+        return list(by_id.values())
+
     def _prepare_candidate(self, state: CheckpointState, frozen: dict[str, Any], result: WorkerResult) -> dict[str, Any]:
+        self._validate_rejection_candidate(state, result)
+        search_receipts = self._effective_search_receipts(state, result)
         persisted_result = {
             "operations": [operation.normalized() for operation in result.operations],
-            "search_receipts": result.search_receipts,
+            "search_receipts": search_receipts,
             "diagnostics": result.diagnostics,
             "skill_versions": result.skill_versions,
             "runtime_info": result.runtime_info,
@@ -340,7 +405,7 @@ class CheckpointEngine:
             )
         receipt_operations = [
             Operation(op="append", stream="search_receipts", record=receipt)
-            for receipt in result.search_receipts
+            for receipt in search_receipts
         ]
         for operation in result.operations:
             if operation.op != "append" or operation.stream not in {"psychologies", "philosophies"} or operation.record is None:
@@ -349,7 +414,7 @@ class CheckpointEngine:
                 url = external_ref.get("url", "")
                 matches = [
                     receipt
-                    for receipt in result.search_receipts
+                    for receipt in search_receipts
                     if url and url in json.dumps(receipt.get("payload", {}), ensure_ascii=False, sort_keys=True, default=str)
                 ]
                 if matches:
@@ -573,44 +638,6 @@ class CheckpointEngine:
                     "frozen": frozen,
                 },
             )
-            ensure(
-                not any(op.stream == "meta_revisions" for op in revised.operations),
-                "REJECTION_REPROPOSED_META",
-                "worker_validation",
-                "A rejection revision cannot propose Meta-memory again in the same checkpoint",
-            )
-            initial = self.workspace.load_json(f"checkpoints/{state.id}/proposal-initial.json")
-            promoted_hypotheses = {
-                hypothesis_id
-                for operation in initial.get("operations", [])
-                if operation.get("op") == "append" and operation.get("stream") == "meta_revisions"
-                for hypothesis_id in operation.get("record", {}).get("payload", {}).get("promotion_refs", [])
-            }
-            if not promoted_hypotheses:
-                promoted_hypotheses = {
-                    operation.get("record", {}).get("id")
-                    for operation in initial.get("operations", [])
-                    if operation.get("op") == "append" and operation.get("stream") == "hypotheses"
-                }
-                promoted_hypotheses.discard(None)
-            decision_ref = f"message:{state.decision_message_id}"
-            rejection_revisions = {
-                operation.record["id"]: operation.record
-                for operation in revised.operations
-                if operation.op == "append"
-                and operation.stream == "hypotheses"
-                and operation.record is not None
-                and operation.record.get("payload", {}).get("status") in {"disputed", "rejected"}
-                and decision_ref in operation.record.get("payload", {}).get("counter_evidence_refs", [])
-                and str(operation.record.get("payload", {}).get("revision_reason", "")).strip()
-            }
-            ensure(
-                promoted_hypotheses and promoted_hypotheses.issubset(rejection_revisions),
-                "REJECTION_HYPOTHESIS_REVISION_REQUIRED",
-                "worker_validation",
-                "A rejection must append disputed/rejected revisions for the promoted hypotheses and cite the archived decision",
-                value={"required": sorted(promoted_hypotheses), "received": sorted(rejection_revisions), "decision_ref": decision_ref},
-            )
             return self._prepare_candidate(state, frozen, revised)
         except Exception as exc:
             self._recover(state, exc)
@@ -807,7 +834,7 @@ class CheckpointEngine:
                     "kind": "rejection_revision",
                     "decision_message_id": state.decision_message_id,
                     "original_proposal_hash": state.proposal_hash,
-                    "requirements": ["remove all user_approval operations", "do not ask a follow-up question"],
+                    "requirements": ["remove all user_approval operations", "append a disputed/rejected hypothesis revision", "cite the archived decision as counter-evidence", "include a non-empty revision reason", "do not ask a follow-up question"],
                     "frozen": frozen,
                 }
             else:

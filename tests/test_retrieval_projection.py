@@ -12,7 +12,7 @@ from pco.checkpoint import CheckpointEngine
 from pco.context import render
 from pco.harness import FakeHarnessAdapter, WorkerResult
 from pco.projections import _page, _projection_path, project_affine, project_markdown
-from pco.retrieval import _chunks, build_index, search, tokenize
+from pco.retrieval import _chunks, _eligible_backend_hits, build_index, search, tokenize
 
 from conftest import NOW, continuation, envelope, event, hypothesis, meta, visible_messages
 
@@ -69,6 +69,41 @@ def test_retrieval_reads_profile_ranking_and_candidate_policy(workspace) -> None
         "rrf_k": 17.0,
         "recency_half_life_days": 30.0,
     }
+
+
+def test_backend_candidates_expand_until_filtered_documents_are_found() -> None:
+    ranked = [
+        ("events:outside_1@1", 1.0),
+        ("events:outside_2@1", 0.9),
+        ("continuations:wanted_1@1", 0.8),
+        ("events:outside_3@1", 0.7),
+        ("continuations:wanted_2@1", 0.6),
+    ]
+    calls: list[int] = []
+
+    def search_once(fetch_limit: int) -> dict[str, float]:
+        calls.append(fetch_limit)
+        return dict(ranked[:fetch_limit])
+
+    result = _eligible_backend_hits(
+        search_once,
+        eligible_keys={"continuations:wanted_1@1", "continuations:wanted_2@1"},
+        candidate_limit=2,
+        total_documents=len(ranked),
+    )
+    assert list(result) == ["continuations:wanted_1@1", "continuations:wanted_2@1"]
+    assert calls == [2, 4, 5]
+
+
+def test_search_does_not_drop_filtered_results_for_disjoint_backend_hits(workspace, monkeypatch) -> None:
+    _seed(workspace)
+    monkeypatch.setattr(
+        "pco.retrieval._index_scores",
+        lambda **_kwargs: ({"events:outside_window@1": 1.0}, {}),
+    )
+    result = search(repo_root=workspace.config.memory_root, query="公开", mode="continuity", limit=5)
+    assert result["results"]
+    assert all(item["stream"] in {"continuations", "conversation_chunks"} for item in result["results"])
 
 
 def test_turn_chunker_splits_oversized_messages_without_indexing_reasoning(workspace) -> None:

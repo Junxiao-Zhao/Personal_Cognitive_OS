@@ -145,6 +145,28 @@ def test_non_pco_profile_uses_same_core_without_code_changes(tmp_path: Path) -> 
     projection = profile.invoke("projections.markdown", repo_root=repository.root, output_root=tmp_path / "research-projection")
     assert projection["ok"] and projection["pages"] == 1
 
+    protected = manager.begin(transaction_id="txn_claim", fingerprint_context={"run": "r1-claim"})
+    manager.append(
+        protected.id,
+        Operation(
+            op="append",
+            stream="claims",
+            record=envelope(
+                "claim_1",
+                "research/claim/v1",
+                {"statement": "The sample changed color.", "observation_refs": ["obs_1"]},
+            ),
+        ),
+    )
+    manager.attach_approval(
+        protected.id,
+        checkpoint_id="research_claim_review",
+        proposal_hash_value=manager.load(protected.id).proposal_hash,
+        receipt_id="approval_research_claim",
+    )
+    assert manager.commit(protected.id)["ok"]
+    assert repository.current_records("claims")["claim_1"]
+
     forbidden = manager.begin(transaction_id="txn_read_only", fingerprint_context={"run": "r2"})
     manager.append(
         forbidden.id,

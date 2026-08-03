@@ -9,7 +9,7 @@ import shutil
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from mem_core.profile import Profile
 from mem_core.registry import default_registry
@@ -353,16 +353,39 @@ def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = Fals
     return {"ok": True, "idempotent": False, **manifest, "generation_path": str(generation)}
 
 
+def _eligible_backend_hits(
+    search_once: Callable[[int], dict[str, float]],
+    *,
+    eligible_keys: set[str],
+    candidate_limit: int,
+    total_documents: int,
+) -> dict[str, float]:
+    if not eligible_keys or total_documents <= 0:
+        return {}
+    target = min(candidate_limit, len(eligible_keys))
+    fetch_limit = min(total_documents, max(1, candidate_limit))
+    while True:
+        raw = search_once(fetch_limit)
+        eligible = {key: score for key, score in raw.items() if key in eligible_keys}
+        if len(eligible) >= target or fetch_limit >= total_documents or len(raw) < fetch_limit:
+            return dict(list(eligible.items())[:target])
+        expanded = min(total_documents, max(fetch_limit + 1, fetch_limit * 2))
+        if expanded == fetch_limit:
+            return dict(list(eligible.items())[:target])
+        fetch_limit = expanded
+
+
 def _index_scores(
     *,
     generation: Path,
     manifest: dict[str, Any],
     query: str,
-    docs: list[dict[str, Any]],
+    eligible_keys: set[str],
     candidate_limit: int,
 ) -> tuple[dict[str, float], dict[str, float]]:
     dense: dict[str, float] = {}
     lexical: dict[str, float] = {}
+    total_documents = int(manifest.get("documents", 0))
     if manifest.get("lexical_backend") == "tantivy" and query.strip():
         try:
             import tantivy
@@ -371,12 +394,23 @@ def _index_scores(
             terms = tokenize(query)
             parsed = index.parse_query(" OR ".join(terms), ["text"])
             searcher = index.searcher()
-            for score, address in searcher.search(parsed, limit=max(1, candidate_limit)).hits:
-                key = searcher.doc(address).get_first("key")
-                lexical[str(key)] = float(score)
+
+            def lexical_search(fetch_limit: int) -> dict[str, float]:
+                hits: dict[str, float] = {}
+                for score, address in searcher.search(parsed, limit=fetch_limit).hits:
+                    key = searcher.doc(address).get_first("key")
+                    hits[str(key)] = float(score)
+                return hits
+
+            lexical = _eligible_backend_hits(
+                lexical_search,
+                eligible_keys=eligible_keys,
+                candidate_limit=candidate_limit,
+                total_documents=total_documents,
+            )
         except Exception:
             lexical = {}
-    if manifest.get("dense_backend") == "milvus-lite" and docs:
+    if manifest.get("dense_backend") == "milvus-lite" and eligible_keys:
         try:
             os.environ["NO_PROXY"] = _merge_no_proxy(os.environ.get("NO_PROXY"))
             os.environ["no_proxy"] = _merge_no_proxy(os.environ.get("no_proxy"))
@@ -385,15 +419,26 @@ def _index_scores(
             client = MilvusClient(str(generation / "milvus.db"))
             try:
                 vector = _vector(tokenize(query))
-                response = client.search(
-                    "memory",
-                    data=[[float(vector.get(index, 0.0)) for index in range(256)]],
-                    limit=max(1, candidate_limit),
-                    output_fields=["key"],
+
+                def dense_search(fetch_limit: int) -> dict[str, float]:
+                    response = client.search(
+                        "memory",
+                        data=[[float(vector.get(index, 0.0)) for index in range(256)]],
+                        limit=fetch_limit,
+                        output_fields=["key"],
+                    )
+                    hits: dict[str, float] = {}
+                    for hit in response[0]:
+                        key = hit.get("entity", {}).get("key") or hit.get("key") or hit.get("id")
+                        hits[str(key)] = float(hit.get("distance", 0.0))
+                    return hits
+
+                dense = _eligible_backend_hits(
+                    dense_search,
+                    eligible_keys=eligible_keys,
+                    candidate_limit=candidate_limit,
+                    total_documents=total_documents,
                 )
-                for hit in response[0]:
-                    key = hit.get("entity", {}).get("key") or hit.get("key") or hit.get("id")
-                    dense[str(key)] = float(hit.get("distance", 0.0))
             finally:
                 client.close()
         except Exception:
@@ -518,21 +563,29 @@ def search(
             continue
         filtered.append(doc)
 
+    eligible_keys = {
+        f"{doc['stream']}:{doc['id']}@{doc['revision']}"
+        for doc in filtered
+    }
     backend_dense, backend_lexical = _index_scores(
         generation=generation,
         manifest=index_result,
         query=query,
-        docs=filtered,
+        eligible_keys=eligible_keys,
         candidate_limit=candidate_limit,
     )
     backend_candidates = set(backend_dense) | set(backend_lexical)
     if backend_candidates:
-        filtered = [
+        backend_filtered = [
             doc
             for doc in filtered
             if f"{doc['stream']}:{doc['id']}@{doc['revision']}" in backend_candidates
         ]
-    elif len(filtered) > candidate_limit:
+        if backend_filtered:
+            filtered = backend_filtered
+        else:
+            backend_candidates = set()
+    if not backend_candidates and len(filtered) > candidate_limit:
         # Replaceable local indexes may be unavailable. Keep a bounded,
         # deterministic recent pool so Python reranking never expands to the
         # entire canonical corpus.

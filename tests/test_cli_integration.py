@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import json
 from pathlib import Path
+
+import yaml
 
 from pco.cli import _install_opencode
 from pco.config import load_config
@@ -40,10 +43,37 @@ def test_workspace_configuration_survives_restart(tmp_path: Path) -> None:
     assert reopened.checkpoint.derivations.projection == "markdown"
 
 
-def test_workspace_refreshes_its_canonical_profile_object(workspace) -> None:
+def test_workspace_migrates_old_canonical_profile_before_refresh(workspace) -> None:
     profile_file = workspace.config.memory_root / "profiles" / "pco" / "profile.yaml"
-    content = profile_file.read_text(encoding="utf-8").replace("version: 0.3.1", "version: 0.3.2", 1)
-    profile_file.write_text(content, encoding="utf-8")
-    workspace.refresh_repository_profile()
-    assert workspace.profile.version == "0.3.2"
-    assert workspace.repository.profile is workspace.profile
+    raw = yaml.safe_load(profile_file.read_text(encoding="utf-8"))
+    raw["version"] = "0.3.1"
+    raw["streams"].pop("search_receipts")
+    raw["retrieval"]["rrf_k"] = 17
+    raw["retrieval"].pop("candidate_count")
+    profile_file.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    schema = workspace.config.memory_root / "profiles" / "pco" / "schemas" / "search-receipt.schema.json"
+    stream = workspace.config.memory_root / "sources" / "search-receipts.jsonl"
+    schema.unlink()
+    stream.unlink()
+    marker_path = workspace.config.memory_root / ".mem-profile.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["version"] = "0.3.1"
+    marker_path.write_text(json.dumps(marker, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    workspace.repository._git("add", "-A")
+    workspace.repository._git("commit", "--no-verify", "-m", "fixture: emulate pco 0.3.1 workspace")
+    old_head = workspace.repository.head()
+
+    from pco.workspace import Workspace
+
+    reopened = Workspace(workspace.config)
+    reopened.refresh_repository_profile()
+    assert reopened.repository.head() != old_head
+    assert reopened.profile.version == "0.3.2"
+    assert reopened.repository.profile is reopened.profile
+    assert "search_receipts" in reopened.profile.config.streams
+    assert reopened.profile.raw["retrieval"]["candidate_count"] == 200
+    assert reopened.profile.raw["retrieval"]["rrf_k"] == 17
+    assert schema.is_file() and stream.is_file()
+    audit = workspace.config.memory_root / "transactions" / "profile-migrations.jsonl"
+    assert '"profile_after": "pco@0.3.2"' in audit.read_text(encoding="utf-8")
+    assert reopened.repository.is_clean()

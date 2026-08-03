@@ -7,7 +7,7 @@ from mem_core.models import Operation, proposal_hash
 from pco.checkpoint import CheckpointEngine
 from pco.harness import FakeHarnessAdapter, WorkerResult
 
-from conftest import continuation, event, hypothesis, meta, visible_messages
+from conftest import NOW, continuation, envelope, event, hypothesis, meta, visible_messages
 
 
 def basic_worker(_payload) -> WorkerResult:
@@ -153,7 +153,75 @@ def test_rejection_requires_disputed_hypothesis_with_decision_evidence(workspace
     with pytest.raises(MemError) as error:
         engine.decide("no", reason="这个解释不准确。")
     assert error.value.detail.code == "REJECTION_HYPOTHESIS_REVISION_REQUIRED"
+    with pytest.raises(MemError) as retry_error:
+        engine.retry()
+    assert retry_error.value.detail.code == "REJECTION_HYPOTHESIS_REVISION_REQUIRED"
     assert not workspace.repository.current_records("meta_revisions")
+
+
+def test_rejection_reuses_initial_wrapper_search_receipts(workspace) -> None:
+    concept = envelope(
+        "psy_rejection_receipt",
+        "pco/psychology/v1",
+        {
+            "name": "评价顾虑",
+            "description": "对外部评价的持续顾虑。",
+            "aliases": [],
+            "external_refs": [
+                {
+                    "url": "https://example.org/evaluation",
+                    "title": "Evaluation reference",
+                    "accessed_at": NOW,
+                    "search_receipt": "worker_placeholder",
+                }
+            ],
+            "status": "active",
+        },
+    )
+    receipt = envelope(
+        "search_rejection_receipt",
+        "pco/search-receipt/v1",
+        {
+            "worker_session_id": "ses_rejection_worker",
+            "call_id": "call_rejection_search",
+            "tool": "websearch",
+            "input": {"query": "evaluation"},
+            "output_excerpt": "Result: https://example.org/evaluation",
+            "status": "completed",
+        },
+    )
+
+    def worker(payload) -> WorkerResult:
+        if payload["kind"] == "consolidate":
+            return WorkerResult(
+                operations=[
+                    Operation(op="append", stream="psychologies", record=concept),
+                    Operation(op="append", stream="hypotheses", record=hypothesis()),
+                    Operation(op="append", stream="meta_revisions", record=meta()),
+                    Operation(op="append", stream="continuations", record=continuation()),
+                ],
+                search_receipts=[receipt],
+            )
+        rejected = hypothesis(status="rejected")
+        rejected["payload"]["counter_evidence_refs"] = [f"message:{payload['decision_message_id']}"]
+        rejected["payload"]["revision_reason"] = payload.get("reason", "用户否定了初始解释。")
+        return WorkerResult(
+            operations=[
+                Operation(op="append", stream="psychologies", record=concept),
+                Operation(op="append", stream="hypotheses", record=rejected),
+                Operation(op="append", stream="continuations", record=continuation(through=payload["decision_message_id"])),
+            ]
+        )
+
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=worker)
+    engine = CheckpointEngine(workspace, adapter)
+    assert engine.request("manual")["approval_required"]
+    result = engine.decide("no", reason="用户否定了初始解释。")
+    assert result["ok"]
+    stored_receipt = workspace.repository.current_records("search_receipts")[receipt["id"]]
+    stored_concept = workspace.repository.current_records("psychologies")[concept["id"]]
+    assert stored_receipt["payload"]["call_id"] == "call_rejection_search"
+    assert stored_concept["payload"]["external_refs"][0]["search_receipt"] == receipt["id"]
 
 
 @pytest.mark.parametrize(
