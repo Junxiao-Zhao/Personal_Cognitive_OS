@@ -3,20 +3,15 @@ from __future__ import annotations
 import difflib
 import hashlib
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 from mem_core.errors import MemError, ensure
-from mem_core.models import Operation
+from mem_core.models import Operation, utc_now
 from mem_core.transaction import TransactionManager
 
 from .workspace import Workspace
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def normalize_text(content: str) -> str:
@@ -48,7 +43,7 @@ class SourceManager:
         record = {
             "id": source_id,
             "revision": 1,
-            "recorded_at": _now(),
+            "recorded_at": utc_now(),
             "schema_version": "pco/source/v1",
             "payload": {
                 "source_id": source_id,
@@ -59,7 +54,7 @@ class SourceManager:
                 "reader_skill": "local-readonly",
                 "snapshot_path": f"sources/snapshots/{source_id}{source.suffix or '.md'}",
                 "content_hash": None,
-                "registered_at": _now(),
+                "registered_at": utc_now(),
                 "status": "active",
             },
         }
@@ -114,7 +109,7 @@ class SourceManager:
             updated = {
                 **record,
                 "revision": record["revision"] + 1,
-                "recorded_at": _now(),
+                "recorded_at": utc_now(),
                 "payload": {**record["payload"], "content_hash": digest},
             }
             operations.extend(

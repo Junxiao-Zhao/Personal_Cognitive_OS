@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
+from mem_core.models import latest_by_id
+
 
 def _problem(
     code: str,
@@ -28,20 +30,11 @@ def _problem(
     }
 
 
-def _current(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for record in records:
-        previous = result.get(record["id"])
-        if previous is None or record["revision"] > previous["revision"]:
-            result[record["id"]] = record
-    return result
-
-
 def validate_profile(
     _repo_root: Path,
     records: dict[str, list[dict[str, Any]]],
 ) -> Iterable[dict[str, Any]]:
-    current = {stream: _current(items) for stream, items in records.items()}
+    current = {stream: latest_by_id(items) for stream, items in records.items()}
     messages = current.get("messages", {})
     sources = current.get("sources", {})
     search_receipts = current.get("search_receipts", {})

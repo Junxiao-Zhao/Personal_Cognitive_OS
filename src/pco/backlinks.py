@@ -4,21 +4,14 @@ import json
 from pathlib import Path
 from typing import Any
 
-from mem_core.profile import Profile
-from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
 
-from .paths import bundled_profile
-
-
-def _profile(repo_root: Path) -> Profile:
-    canonical = repo_root / "profiles" / "pco"
-    return Profile.load(canonical if canonical.exists() else bundled_profile(), default_registry())
+from .repo_loader import profile_for_repo
 
 
 def build(*, repo_root: Path, output_path: str | Path | None = None, **_: Any) -> dict[str, Any]:
     repo_root = Path(repo_root)
-    repository = MemoryRepository(repo_root, _profile(repo_root))
+    repository = MemoryRepository(repo_root, profile_for_repo(repo_root))
     records = repository.records_by_stream()
     backlinks: dict[str, list[dict[str, Any]]] = {}
 

@@ -8,7 +8,7 @@ import pytest
 
 from mem_core.approval import verify_approval_receipt
 from mem_core.errors import MemError
-from mem_core.models import Operation
+from mem_core.models import Operation, latest_by_id
 from mem_core.profile import Profile
 from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
@@ -16,6 +16,15 @@ from mem_core.transaction import TransactionManager
 from pco.paths import bundled_profile
 
 from conftest import NOW, envelope, event, hypothesis, meta
+
+
+def test_latest_by_id_keeps_highest_revision():
+    records = [
+        {"id": "a", "revision": 1, "payload": {}},
+        {"id": "a", "revision": 2, "payload": {}},
+        {"id": "b", "revision": 1, "payload": {}},
+    ]
+    assert latest_by_id(records) == {"a": records[1], "b": records[2]}
 
 
 def test_protected_stream_requires_exact_approval(workspace) -> None:

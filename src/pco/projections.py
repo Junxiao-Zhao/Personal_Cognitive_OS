@@ -9,12 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from mem_core.errors import MemError
-from mem_core.profile import Profile
-from mem_core.registry import default_registry
-from mem_core.repository import MemoryRepository
-
 from .backlinks import build as build_backlinks
-from .paths import bundled_profile
+from .repo_loader import repository_for_repo
 
 
 STREAM_TITLES = {
@@ -38,12 +34,6 @@ def _projection_path(target_root: Path, stream: str, entity_id: str) -> Path:
     if root not in candidate.parents:
         raise MemError("PROJECTION_PATH_ESCAPE", "projection", str(candidate))
     return candidate
-
-
-def _repository(repo_root: Path) -> MemoryRepository:
-    profile_path = repo_root / "profiles" / "pco"
-    profile = Profile.load(profile_path if profile_path.exists() else bundled_profile(), default_registry())
-    return MemoryRepository(repo_root, profile)
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:
@@ -166,7 +156,7 @@ def _pages(repository: MemoryRepository) -> list[dict[str, Any]]:
 
 
 def project_markdown(*, repo_root: Path, output_root: str | Path, **_: Any) -> dict[str, Any]:
-    repository = _repository(Path(repo_root))
+    repository = repository_for_repo(Path(repo_root))
     commit = repository.head()
     target_root = Path(output_root)
     mapping_path = target_root / ".pco-projection.json"
@@ -209,7 +199,7 @@ def project_affine(
     request on stdin and one JSON response on stdout, keeping provider-specific
     CRDT/Yjs behavior outside canonical memory and mem-core.
     """
-    repository = _repository(Path(repo_root))
+    repository = repository_for_repo(Path(repo_root))
     commit = repository.head()
     state = Path(state_root) / "affine"
     mapping_path = state / "mapping.json"

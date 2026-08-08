@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -18,6 +18,15 @@ def canonical_json(value: Any) -> str:
 
 def sha256_json(value: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def latest_by_id(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    current: dict[str, dict[str, Any]] = {}
+    for record in records:
+        previous = current.get(record["id"])
+        if previous is None or record["revision"] > previous["revision"]:
+            current[record["id"]] = record
+    return current
 
 
 class RecordEnvelope(BaseModel):

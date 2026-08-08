@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import MemError, ensure
-from .models import RecordEnvelope
+from .models import RecordEnvelope, latest_by_id
 from .profile import Profile
 
 
@@ -156,12 +156,7 @@ class MemoryRepository:
         return {name: list(self.iter_records(name, root=root)) for name in self.profile.config.streams}
 
     def current_records(self, stream_name: str, *, root: Path | None = None) -> dict[str, dict[str, Any]]:
-        current: dict[str, dict[str, Any]] = {}
-        for record in self.iter_records(stream_name, root=root):
-            previous = current.get(record["id"])
-            if previous is None or record["revision"] > previous["revision"]:
-                current[record["id"]] = record
-        return current
+        return latest_by_id(self.iter_records(stream_name, root=root))
 
     def record_history(self, stream_name: str, record_id: str) -> list[dict[str, Any]]:
         return [record for record in self.iter_records(stream_name) if record.get("id") == record_id]

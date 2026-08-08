@@ -4,11 +4,9 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from mem_core.profile import Profile
-from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
 
-from .paths import bundled_profile
+from .repo_loader import profile_for_repo
 
 
 SECTION_LABELS = {
@@ -22,17 +20,11 @@ SECTION_LABELS = {
 }
 
 
-def _current(repository: MemoryRepository, stream: str, record_id: str) -> dict[str, Any] | None:
-    return repository.current_records(stream).get(record_id)
-
-
 def render(*, repo_root: Path, output_path: str | Path, checkpoint_id: str | None = None, **_: Any) -> dict[str, Any]:
     repo_root = Path(repo_root)
-    profile_path = repo_root / "profiles" / "pco"
-    profile = Profile.load(profile_path if profile_path.exists() else bundled_profile(), default_registry())
-    repository = MemoryRepository(repo_root, profile)
-    meta = _current(repository, "meta_revisions", "meta_current")
-    continuation = _current(repository, "continuations", "continuation_current")
+    repository = MemoryRepository(repo_root, profile_for_repo(repo_root))
+    meta = repository.current_records("meta_revisions").get("meta_current")
+    continuation = repository.current_records("continuations").get("continuation_current")
     lines = [
         "# PCO 当前上下文",
         "",

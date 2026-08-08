@@ -11,12 +11,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from mem_core.profile import Profile
-from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
 
 from .backlinks import build as build_backlinks
-from .paths import bundled_profile
+from .repo_loader import profile_for_repo, repository_for_repo
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]")
@@ -297,9 +295,8 @@ def _merge_no_proxy(value: str | None) -> str:
 
 def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = False, **_: Any) -> dict[str, Any]:
     repo_root = Path(repo_root)
-    profile_path = repo_root / "profiles" / "pco"
-    profile = Profile.load(profile_path if profile_path.exists() else bundled_profile(), default_registry())
-    repository = MemoryRepository(repo_root, profile)
+    repository = repository_for_repo(repo_root)
+    profile = repository.profile
     commit = repository.head()
     generation = Path(indexes_root) / "generations" / commit
     manifest_path = generation / "manifest.json"
@@ -535,9 +532,8 @@ def search(
     if mode not in {"continuity", "current", "pattern", "historical", "change"}:
         raise ValueError(f"Unknown retrieval mode: {mode}")
     repo_root = Path(repo_root)
-    profile_path = repo_root / "profiles" / "pco"
-    profile = Profile.load(profile_path if profile_path.exists() else bundled_profile(), default_registry())
-    repository = MemoryRepository(repo_root, profile)
+    repository = repository_for_repo(repo_root)
+    profile = repository.profile
     docs = _documents(repository)
     retrieval_config = profile.raw.get("retrieval", {})
     candidate_limit = max(limit, int(retrieval_config.get("candidate_count", 200)))

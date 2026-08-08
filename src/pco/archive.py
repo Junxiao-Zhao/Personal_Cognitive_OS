@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Iterable, Literal
 
-from mem_core.models import Operation
+from mem_core.models import Operation, utc_now
 from mem_core.transaction import TransactionManager
 
 from .workspace import Workspace
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class ConversationArchive:
@@ -26,7 +21,7 @@ class ConversationArchive:
         return {
             "id": message.get("id") or f"msg_{uuid.uuid4().hex}",
             "revision": 1,
-            "recorded_at": message.get("recorded_at") or _now(),
+            "recorded_at": message.get("recorded_at") or utc_now(),
             "schema_version": "conversation-message/v1",
             "payload": {
                 "thread_id": thread.thread_id,
@@ -39,7 +34,7 @@ class ConversationArchive:
                 "content": message.get("content", ""),
                 "reasoning": reasoning,
                 "refs": list(message.get("refs", [])),
-                "created_at": message.get("created_at") or _now(),
+                "created_at": message.get("created_at") or utc_now(),
             },
         }
 
