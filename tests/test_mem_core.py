@@ -288,3 +288,35 @@ def test_pre_commit_hook_rejects_unreceipted_protected_append(workspace) -> None
     )
     assert result.returncode == 1
     assert "TRANSACTION_RECEIPT_REQUIRED" in result.stdout
+
+
+def test_txn_commit_dry_run_does_not_commit(workspace) -> None:
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    state = manager.begin(fingerprint_context={"kind": "dry_run_test"})
+    message = envelope(
+        "msg_user_1",
+        "conversation-message/v1",
+        {
+            "thread_id": workspace.thread().thread_id,
+            "epoch_id": workspace.thread().active_epoch_id,
+            "harness": "fake",
+            "native_session_id": "ses_fake",
+            "native_message_id": "native_user",
+            "role": "user",
+            "kind": "conversation",
+            "content": "这是用户证据。",
+            "reasoning": None,
+            "refs": [],
+            "created_at": NOW,
+        },
+    )
+    manager.append(state.id, Operation(op="append", stream="messages", record=message))
+    manager.append(state.id, Operation(op="append", stream="events", record=event()))
+    head_before = workspace.repository.head()
+    result = manager.commit(state.id, dry_run=True)
+    assert result["dry_run"] is True
+    assert result["validation"]["ok"] is True
+    assert workspace.repository.head() == head_before
+    loaded = manager.load(state.id)
+    assert loaded.commit is None
+    assert loaded.status == "validated"

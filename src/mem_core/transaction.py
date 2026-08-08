@@ -279,7 +279,17 @@ class TransactionManager:
                 return record
         return None
 
-    def commit(self, transaction_id: str) -> dict[str, Any]:
+    def commit(self, transaction_id: str, *, dry_run: bool = False) -> dict[str, Any]:
+        if dry_run:
+            validation = self.validate(transaction_id, require_approval=True)
+            state = self.load(transaction_id)
+            return {
+                "ok": True,
+                "dry_run": True,
+                "transaction_id": transaction_id,
+                "validation": validation,
+                "would_commit": True,
+            }
         state = self.load(transaction_id)
         if state.status == "committed":
             return {"ok": True, "idempotent": True, "transaction_id": state.id, "commit": state.commit}

@@ -66,9 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
     append = txn_commands.add_parser("append")
     append.add_argument("--id", required=True)
     _add_input(append)
-    for name in ("validate", "commit", "abort", "status"):
+    for name in ("validate", "abort", "status"):
         target = txn_commands.add_parser(name)
         target.add_argument("--id", required=True)
+    commit = txn_commands.add_parser("commit")
+    commit.add_argument("--id", required=True)
+    commit.add_argument("--dry-run", action="store_true")
     approve = txn_commands.add_parser("approve")
     approve.add_argument("--id", required=True)
     _add_input(approve)
@@ -125,7 +128,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             return {"ok": True, "approval_receipt": receipt.model_dump(mode="json")}
         if args.txn_command == "commit":
-            return manager.commit(args.id)
+            return manager.commit(args.id, dry_run=args.dry_run)
         if args.txn_command == "abort":
             return manager.abort(args.id)
         return manager.status(args.id)
