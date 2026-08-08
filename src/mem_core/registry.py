@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+from importlib import metadata
+
 from .profile import ProfileRegistry
 
 
-def default_registry() -> ProfileRegistry:
+ENTRY_POINT_GROUP = "mem_core.capabilities"
+
+
+def discover_registry(group: str = ENTRY_POINT_GROUP) -> ProfileRegistry:
+    """Build an allowlist from installed entry points.
+
+    The distribution that ships each Profile declares its capabilities under
+    the ``mem_core.capabilities`` group. mem-core never imports domain
+    modules by name, keeping it profile-neutral.
+    """
     registry = ProfileRegistry()
-    registry.register_lazy("pco.validate", "pco.validation:validate_profile")
-    registry.register_lazy("pco.retrieval.search", "pco.retrieval:search")
-    registry.register_lazy("pco.backlinks.build", "pco.backlinks:build")
-    registry.register_lazy("pco.context.render", "pco.context:render")
-    registry.register_lazy("pco.index.build", "pco.retrieval:build_index")
-    registry.register_lazy("pco.projection.markdown", "pco.projections:project_markdown")
-    registry.register_lazy("pco.projection.affine", "pco.projections:project_affine")
-    registry.register_lazy("research.validate", "pco.research_profile:validate_profile")
-    registry.register_lazy("research.retrieval.search", "pco.research_profile:search")
-    registry.register_lazy("research.projection.markdown", "pco.research_profile:project_markdown")
+    for entry in metadata.entry_points(group=group):
+        registry.register_lazy(entry.name, entry.value)
     return registry
+
+
+def default_registry() -> ProfileRegistry:
+    return discover_registry()

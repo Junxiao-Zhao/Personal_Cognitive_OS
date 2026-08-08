@@ -26,6 +26,18 @@ dev = ["pytest>=8", "pytest-cov>=6"]
 mem = "mem_core.cli:main"
 pco = "pco.cli:main"
 
+[project.entry-points."mem_core.capabilities"]
+"pco.validate" = "pco.validation:validate_profile"
+"pco.retrieval.search" = "pco.retrieval:search"
+"pco.backlinks.build" = "pco.backlinks:build"
+"pco.context.render" = "pco.context:render"
+"pco.index.build" = "pco.retrieval:build_index"
+"pco.projection.markdown" = "pco.projections:project_markdown"
+"pco.projection.affine" = "pco.projections:project_affine"
+"research.validate" = "pco.research_profile:validate_profile"
+"research.retrieval.search" = "pco.research_profile:search"
+"research.projection.markdown" = "pco.research_profile:project_markdown"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/mem_core", "src/pco"]
 
