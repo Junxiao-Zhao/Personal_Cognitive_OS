@@ -75,9 +75,17 @@ def test_meta_proposal_cannot_commit_until_yes(workspace) -> None:
     assert result["ok"]
     assert adapter.resume_calls == 1
     assert result["receipt"]["proposal_hash"] == pending["proposal"]["proposal_hash"]
-    assert result["receipt"]["transaction_proposal_hash"] != pending["proposal"]["transaction_proposal_hash"]
+    # The checkpoint-result record now lands in its own post-commit transaction,
+    # so the main changeset is byte-identical between the reviewed proposal and
+    # the committed transaction.
+    assert result["receipt"]["transaction_proposal_hash"] == pending["proposal"]["transaction_proposal_hash"]
     assert workspace.repository.current_records("meta_revisions")["meta_current"]
-    transaction = list((workspace.config.memory_root / "transactions" / "transactions.jsonl").read_text(encoding="utf-8").splitlines())[-1]
+    transactions = (workspace.config.memory_root / "transactions" / "transactions.jsonl").read_text(encoding="utf-8").splitlines()
+    transaction = next(
+        line
+        for line in reversed(transactions)
+        if f'"transaction_proposal_hash": "{result["receipt"]["transaction_proposal_hash"]}"' in line
+    )
     assert '"decision": "yes"' in transaction
     assert '"transaction_proposal_hash"' in transaction
 
@@ -305,7 +313,7 @@ def test_context_publish_failure_retries_without_recommit(workspace) -> None:
 
     result = engine.retry()
     assert result["ok"]
-    assert workspace.repository.head() == committed_head
+    assert result["receipt"]["git_commit"] == committed_head
     assert adapter.compact_calls == 1
 
 
@@ -346,3 +354,17 @@ def test_unavailable_child_is_rebuilt_from_the_same_frozen_boundary(workspace) -
     assert adapter.worker_calls == 2
     assert engine._load().worker_handle != original
     assert result["receipt"]["message_range"] == frozen["message_range"]
+
+
+def test_checkpoint_record_carries_real_commit_and_derivations(workspace) -> None:
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
+    result = CheckpointEngine(workspace, adapter).request("manual")
+    record = workspace.repository.current_records("checkpoints")[result["checkpoint_id"]]
+    assert record["revision"] == 1
+    assert record["payload"]["git_commit"] == result["receipt"]["git_commit"]
+    assert record["payload"]["status"] in {"committed", "committed_with_pending_derivations"}
+    assert record["payload"]["derivations"] != {
+        "index": "scheduled",
+        "backlinks": "scheduled",
+        "projection": "scheduled",
+    }

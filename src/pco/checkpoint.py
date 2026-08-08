@@ -252,68 +252,6 @@ class CheckpointEngine:
             self._recover(state, exc)
             raise
 
-    def _checkpoint_operation(
-        self,
-        state: CheckpointState,
-        transaction_id: str,
-        operations: list[Operation],
-        result: WorkerResult,
-        reviewed_proposal_hash: str,
-        protected_operations: list[Operation],
-    ) -> Operation:
-        continuation = [op.record for op in operations if op.op == "append" and op.stream == "continuations"]
-        ensure(len(continuation) == 1, "CONTINUATION_REQUIRED", "worker_validation", "A checkpoint must append exactly one continuation revision")
-        continuation_limit = int(self.workspace.profile.raw.get("continuation", {}).get("max_tokens", 1200))
-        continuation_text = json.dumps(continuation[0]["payload"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        estimated_tokens = math.ceil(sum(1.0 if ord(char) > 127 else 0.25 for char in continuation_text))
-        ensure(
-            estimated_tokens <= continuation_limit,
-            "CONTINUATION_TOO_LONG",
-            "worker_validation",
-            f"Continuation exceeds Profile limit of {continuation_limit} tokens",
-            value={"estimated_tokens": estimated_tokens, "max_tokens": continuation_limit},
-        )
-        meta = [op.record for op in operations if op.op == "append" and op.stream == "meta_revisions"]
-        counts = Counter(op.stream or "artifacts" for op in operations)
-        binding = self.workspace.binding()
-        record = {
-            "id": state.id,
-            "revision": 1,
-            "recorded_at": utc_now(),
-            "schema_version": "pco/checkpoint/v1",
-            "payload": {
-                "thread_id": binding.thread_id,
-                "harness_binding_id": binding.id,
-                "parent_session_id": state.parent_session_id,
-                "archive_cursor": state.archive_cursor,
-                "source_hashes": state.source_hashes,
-                "worker": state.worker_handle,
-                "runtime": state.harness_runtime,
-                "trigger": state.trigger,
-                "status": "committed",
-                "message_range": {"after": state.after_message_id, "through": state.through_message_id},
-                "transaction_id": transaction_id,
-                "git_commit": None,
-                "operation_counts": dict(counts),
-                "proposal_hash": reviewed_proposal_hash,
-                "promotion_proposal_hash": state.promotion_proposal_hash,
-                "approval_decision": "yes" if meta else (state.decision or "not_required"),
-                "protected_streams": sorted(
-                    {operation.stream for operation in protected_operations if operation.stream}
-                ),
-                "promotion_protected_streams": state.promotion_protected_streams,
-                "meta_revision": meta[-1]["revision"] if meta else None,
-                "continuation_revision": continuation[0]["revision"],
-                "derivations": {"index": "scheduled", "backlinks": "scheduled", "projection": "scheduled"},
-                "versions": {"profile": f"pco@{self.workspace.profile.version}", "policy_hash": self.workspace.profile.policy_hash, "workflow": "consolidate@0.3.1", "skills": result.skill_versions},
-                "warnings": [],
-                "started_at": state.created_at,
-                "ended_at": utc_now(),
-                "retry_count": state.retries,
-            },
-        }
-        return Operation(op="append", stream="checkpoints", record=record)
-
     def _validate_rejection_candidate(self, state: CheckpointState, result: WorkerResult) -> None:
         if state.decision != "no":
             return
@@ -377,8 +315,30 @@ class CheckpointEngine:
             by_id[receipt_id] = receipt
         return list(by_id.values())
 
+    def _validate_continuation(self, state: CheckpointState, operations: list[Operation]) -> None:
+        continuation = [op.record for op in operations if op.op == "append" and op.stream == "continuations"]
+        ensure(
+            len(continuation) == 1,
+            "CONTINUATION_REQUIRED",
+            "worker_validation",
+            "A checkpoint must append exactly one continuation revision",
+        )
+        continuation_limit = int(self.workspace.profile.raw.get("continuation", {}).get("max_tokens", 1200))
+        continuation_text = json.dumps(
+            continuation[0]["payload"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        estimated_tokens = math.ceil(sum(1.0 if ord(char) > 127 else 0.25 for char in continuation_text))
+        ensure(
+            estimated_tokens <= continuation_limit,
+            "CONTINUATION_TOO_LONG",
+            "worker_validation",
+            f"Continuation exceeds Profile limit of {continuation_limit} tokens",
+            value={"estimated_tokens": estimated_tokens, "max_tokens": continuation_limit},
+        )
+
     def _prepare_candidate(self, state: CheckpointState, frozen: dict[str, Any], result: WorkerResult) -> dict[str, Any]:
         self._validate_rejection_candidate(state, result)
+        self._validate_continuation(state, [*frozen.get("source_operations", []), *result.operations])
         search_receipts = self._effective_search_receipts(state, result)
         persisted_result = {
             "operations": [operation.normalized() for operation in result.operations],
@@ -456,15 +416,6 @@ class CheckpointEngine:
                 {operation.stream for operation in protected_operations if operation.stream}
             )
         transaction_id = f"txn_{state.id}_{uuid.uuid4().hex[:8]}"
-        checkpoint_operation = self._checkpoint_operation(
-            state,
-            transaction_id,
-            operations,
-            result,
-            reviewed_proposal_hash,
-            protected_operations,
-        )
-        operations.append(checkpoint_operation)
         transaction = self.manager.begin(
             transaction_id=transaction_id,
             fingerprint_context={
@@ -713,6 +664,62 @@ class CheckpointEngine:
             "summary": summary,
         }
 
+    def _write_checkpoint_record(self, state: CheckpointState) -> None:
+        if self.workspace.repository.current_records("checkpoints").get(state.id) is not None:
+            return
+        pending = any(not item.get("ok", False) for item in state.derivations.values())
+        binding = self.workspace.binding()
+        approval = state.decision or ("not_required" if not state.protected_streams else "no")
+        record = {
+            "id": state.id,
+            "revision": 1,
+            "recorded_at": utc_now(),
+            "schema_version": "pco/checkpoint/v1",
+            "payload": {
+                "thread_id": binding.thread_id,
+                "harness_binding_id": binding.id,
+                "parent_session_id": state.parent_session_id,
+                "archive_cursor": state.archive_cursor,
+                "source_hashes": state.source_hashes,
+                "worker": state.worker_handle,
+                "runtime": state.harness_runtime,
+                "trigger": state.trigger,
+                "status": "committed_with_pending_derivations" if pending else "committed",
+                "message_range": {"after": state.after_message_id, "through": state.through_message_id},
+                "transaction_id": state.transaction_id,
+                "git_commit": state.commit,
+                "operation_counts": dict(state.operation_counts),
+                "proposal_hash": state.proposal_hash,
+                "promotion_proposal_hash": state.promotion_proposal_hash,
+                "approval_decision": approval,
+                "protected_streams": state.protected_streams,
+                "promotion_protected_streams": state.promotion_protected_streams,
+                "meta_revision": state.meta_revision,
+                "continuation_revision": state.continuation_revision,
+                "derivations": {
+                    name: ({"ok": True} if item.get("ok") else {"ok": False, "pending": True})
+                    for name, item in state.derivations.items()
+                },
+                "versions": {
+                    "profile": f"{self.workspace.profile.name}@{self.workspace.profile.version}",
+                    "policy_hash": self.workspace.profile.policy_hash,
+                    "workflow": "consolidate@0.3.1",
+                    "skills": state.skill_versions,
+                },
+                "warnings": [],
+                "started_at": state.created_at,
+                "ended_at": utc_now(),
+                "retry_count": state.retries,
+            },
+        }
+        manager = TransactionManager(self.workspace.repository, self.workspace.config.state_root)
+        txn = manager.begin(
+            transaction_id=f"txn_checkpoint_{state.id[5:17]}_{uuid.uuid4().hex[:8]}",
+            fingerprint_context={"kind": "checkpoint_result", "checkpoint_id": state.id},
+        )
+        manager.append(txn.id, Operation(op="append", stream="checkpoints", record=record))
+        manager.commit(txn.id)
+
     def _finalize_committed(self, state: CheckpointState) -> dict[str, Any]:
         try:
             if state.context_bundle is None:
@@ -761,6 +768,7 @@ class CheckpointEngine:
         state.status = "COMMITTED_WITH_PENDING_DERIVATIONS" if pending else "DONE"
         state.completed_at = utc_now()
         self._save(state)
+        self._write_checkpoint_record(state)
         receipt = self._receipt(state)
         self.workspace.save_json(f"checkpoints/{state.id}/receipt.json", receipt)
         return {"ok": True, "checkpoint_id": state.id, "status": state.status, "receipt": receipt}
@@ -874,6 +882,7 @@ class CheckpointEngine:
         state.status = "COMMITTED_WITH_PENDING_DERIVATIONS" if pending else "DONE"
         state.completed_at = utc_now()
         self._save(state)
+        self._write_checkpoint_record(state)
         receipt = self._receipt(state)
         self.workspace.save_json(f"checkpoints/{state.id}/receipt.json", receipt)
         return {"ok": True, "checkpoint_id": state.id, "status": state.status, "derivations": state.derivations, "receipt": receipt}
