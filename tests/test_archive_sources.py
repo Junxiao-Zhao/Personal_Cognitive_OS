@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pco.checkpoint import CheckpointEngine
+from pco.harness import FakeHarnessAdapter
 from pco.archive import ConversationArchive
 from pco.sources import SourceManager
 
@@ -18,6 +20,21 @@ def test_turn_archive_is_incremental_and_omits_non_public_messages(workspace) ->
     second = archive.archive(messages)
     assert first["archived"] == 2
     assert second["archived"] == 0
+
+
+def test_archive_dedups_after_crash_between_commit_and_cursor_update(workspace) -> None:
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages())
+    engine = CheckpointEngine(workspace, adapter)
+    first = engine.archive.archive(adapter.messages)
+    assert first["archived"] == 2
+    # Simulate a crash after the canonical commit but before the cursor update.
+    thread = workspace.thread()
+    thread.last_archived_message_id = None
+    thread.archive_cursor = None
+    workspace.save_thread(thread)
+    second = engine.archive.archive(adapter.messages)
+    assert second["archived"] == 0
+    assert workspace.thread().archive_cursor == "native_assistant_1"
     stored = list(workspace.repository.iter_records("messages"))
     assert [record["payload"]["role"] for record in stored] == ["user", "assistant"]
     assert stored[1]["payload"]["reasoning"] == "exposed reasoning"

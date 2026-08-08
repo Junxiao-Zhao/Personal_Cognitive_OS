@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any, Iterable, Literal
 
@@ -40,14 +41,11 @@ class ConversationArchive:
 
     def archive(self, messages: Iterable[dict[str, Any]]) -> dict[str, Any]:
         allowed = [message for message in messages if message.get("role") in {"user", "assistant"} and message.get("kind", "conversation") in {"conversation", "checkpoint_decision"}]
-        existing_keys = {
-            (
-                record["payload"]["harness"],
-                record["payload"]["native_session_id"],
-                record["payload"]["native_message_id"],
-            )
-            for record in self.workspace.repository.iter_records("messages")
-        }
+        # The adapter returns messages strictly after the persisted cursor, so
+        # duplicates can only be the last committed batch (crash between commit
+        # and cursor update). Reading the canonical tail keeps dedup O(1)
+        # amortized instead of O(corpus) per turn.
+        tail_keys = self._tail_native_keys()
         records: list[dict[str, Any]] = []
         for message in allowed:
             record = self._record(message)
@@ -56,9 +54,9 @@ class ConversationArchive:
                 record["payload"]["native_session_id"],
                 record["payload"]["native_message_id"],
             )
-            if key in existing_keys:
+            if key in tail_keys:
                 continue
-            existing_keys.add(key)
+            tail_keys.add(key)
             records.append(record)
         if not records:
             # A previous attempt may have committed the canonical records and
@@ -92,6 +90,20 @@ class ConversationArchive:
         thread.archive_cursor = records[-1]["payload"]["native_message_id"]
         self.workspace.save_thread(thread)
         return {"ok": True, "archived": len(records), "commit": result["commit"], "last_message_id": records[-1]["id"]}
+
+    def _tail_native_keys(self) -> set[tuple[str, str, str]]:
+        path = self.workspace.repository.profile.stream_path(self.workspace.config.memory_root, "messages")
+        if not path.is_file():
+            return set()
+        lines = path.read_text(encoding="utf-8").splitlines()
+        keys: set[tuple[str, str, str]] = set()
+        for line in lines[-64:]:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            payload = record["payload"]
+            keys.add((payload["harness"], payload["native_session_id"], payload["native_message_id"]))
+        return keys
 
     def archive_decision(
         self,
