@@ -53,8 +53,13 @@ AFFiNE 内容使用其前端内部的 BlockSuite/Yjs 文档模型，目前没有
 ```bash
 pytest
 
-# 需要本机 loopback；验证真实 Milvus Lite 与 Tantivy，而非 fallback。
+# 检索功能测试需要本机 loopback；验证真实 Milvus Lite 与 Tantivy 后端。
 PCO_RUN_MILVUS=1 pytest -m milvus
 ```
+
+Tantivy 与 Milvus Lite 是硬依赖。后端不可用时 `pco derive index` 与 `pco search`
+会返回带稳定 code 与 recovery 提示的明确错误（`INDEX_BACKEND_FAILED`），不会静默
+降级到本地简化索引。PRD 规模（10 万消息）的性能基准与当前差距见
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
 产品与验收基线见 [MRD](docs/PCO_MRD_v0.3.md) 与 [PRD](docs/PCO_PRD_v0.3.1.md)。实现验收矩阵见 [MVP verification](docs/MVP_VERIFICATION.md)。

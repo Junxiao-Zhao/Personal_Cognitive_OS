@@ -29,7 +29,7 @@ Test names are under `tests/` and can be selected directly with `pytest -q -k <n
 ## Additional release evidence
 
 - The generic transaction path enforces `auto`, `user_approval`, and `read_only`; approval binds the reviewed protected-operation hash, final operation-set hash, decision message, base commit, and transaction fingerprint.
-- The managed Git pre-commit hook reruns Profile/schema/reference validation and rejects an invalid staged JSONL envelope.
+- The managed Git pre-commit hook reruns Profile/schema/reference validation and rejects an invalid staged JSONL envelope; messages-only archive commits use an incremental delta fast path, structured commits still get full-tree validation.
 - Canonical transaction state, checkpoint artifact, raw decision, Meta/continuation revisions, source snapshot, and receipt are Git-tracked; derived index/projection failures never roll back them.
 - A fresh Git clone rebuilds Milvus/Tantivy (or explicit local fallbacks when those libraries fail), backlinks, Markdown, and the AFFiNE bridge batch.
 - OpenCode 1.17.18 successfully parses the installed local plugin, hidden agent, commands, permissions, and `pco-memory` skill.
@@ -37,6 +37,22 @@ Test names are under `tests/` and can be selected directly with `pytest -q -k <n
 - In that same compacted session, a new model request was asked for the second `current_topics` item. It returned the exact published-context value `Distinguishing facts from personality patterns`. The awaited idle hook archived only that post-checkpoint user/assistant turn; the native compaction marker/summary was absent from raw conversation. This live path also found and fixed awaited-idle, structured-output compatibility, worker-model propagation, control-message filtering, and the unavailable v2 compact endpoint.
 - The built wheel contains both Profiles and every OpenCode agent/command/plugin/skill resource.
 - Three paired `pco-memory` skill evals score 100% with the skill versus 66.7% baseline. Timing/token metadata was unavailable from the executor notifications and was not invented.
+
+## Retrieval backend note
+
+Since the refactor removed the self-built lexical/dense fallback engines, tests that
+exercise real `search`/`build_index` (AC-11, AC-15, and the retrieval projection suite)
+require a loopback-capable Milvus Lite and are skipped unless `PCO_RUN_MILVUS=1` is set.
+Backend failures now surface as `INDEX_BACKEND_FAILED` with recovery hints instead of
+silent degradation.
+
+## Performance baseline
+
+PRD §25.4-scale benchmark (100k messages / 10k events / 5k concepts / 1k sources) is
+reproducible via `scripts/benchmark_corpus.py`; results and deviation analysis are in
+[PERFORMANCE.md](PERFORMANCE.md). Current numbers exceed the 10 s validate/commit and
+2 s retrieval targets; the dominant cost is full-corpus validation inside
+`TransactionManager.validate`, which is the next optimization item.
 
 ## Commands
 
