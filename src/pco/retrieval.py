@@ -534,7 +534,6 @@ def search(
     repo_root = Path(repo_root)
     repository = repository_for_repo(repo_root)
     profile = repository.profile
-    docs = _documents(repository)
     retrieval_config = profile.raw.get("retrieval", {})
     candidate_limit = max(limit, int(retrieval_config.get("candidate_count", 200)))
     candidate_overfetch_factor = max(1, int(retrieval_config.get("candidate_overfetch_factor", 4)))
@@ -544,6 +543,11 @@ def search(
     indexes_root = Path(indexes_root) if indexes_root is not None else repo_root.parent / "indexes"
     index_result = build_index(repo_root=repo_root, indexes_root=indexes_root)
     generation = Path(index_result["generation_path"])
+    docs_path = generation / "documents.json"
+    if docs_path.is_file():
+        docs = json.loads(docs_path.read_text(encoding="utf-8"))
+    else:
+        docs = _documents(repository)
     start_at, end_at = _parse_time(start), _parse_time(end)
     filtered: list[dict[str, Any]] = []
     for doc in docs:
@@ -648,7 +652,11 @@ def search(
         )
         scored.append(item)
     if mode in {"pattern", "historical", "change"} and scored:
-        backlink_map = build_backlinks(repo_root=repo_root)["backlinks"]
+        backlink_path = generation / "backlinks.json"
+        if backlink_path.is_file():
+            backlink_map = json.loads(backlink_path.read_text(encoding="utf-8"))["backlinks"]
+        else:
+            backlink_map = build_backlinks(repo_root=repo_root)["backlinks"]
         seeds = sorted(scored, key=lambda item: (item["rrf_score"], item["time_score"]), reverse=True)[:5]
         neighbors: set[str] = set()
         for seed in seeds:

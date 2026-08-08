@@ -348,3 +348,26 @@ def test_concept_rejects_forged_nonempty_search_receipt(workspace) -> None:
     with pytest.raises(MemError) as error:
         manager.validate(transaction.id)
     assert error.value.detail.code == "EXTERNAL_REFERENCE_INVALID"
+
+
+def test_search_reads_documents_from_generation_without_reload(workspace, monkeypatch) -> None:
+    def worker(_payload) -> WorkerResult:
+        return WorkerResult(
+            operations=[
+                Operation(op="append", stream="events", record=event()),
+                Operation(op="append", stream="hypotheses", record=hypothesis()),
+                Operation(op="append", stream="continuations", record=continuation()),
+            ]
+        )
+
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=worker)
+    CheckpointEngine(workspace, adapter).request("manual")
+    indexes_root = workspace.config.indexes_root
+    search(repo_root=workspace.config.memory_root, query="拖延", indexes_root=indexes_root)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("_documents must not be reloaded when a generation exists")
+
+    monkeypatch.setattr("pco.retrieval._documents", _boom)
+    result = search(repo_root=workspace.config.memory_root, query="评价", indexes_root=indexes_root)
+    assert result["ok"]
