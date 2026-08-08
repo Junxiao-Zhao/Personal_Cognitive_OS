@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from mem_core.models import Operation
 from pco.checkpoint import CheckpointEngine
@@ -9,6 +12,12 @@ from pco.retrieval import search
 from pco.sources import SourceManager
 
 from conftest import NOW, continuation, envelope, hypothesis, meta, visible_messages
+
+
+needs_loopback = pytest.mark.skipif(
+    os.getenv("PCO_RUN_MILVUS") != "1",
+    reason="Milvus Lite needs a loopback port",
+)
 
 
 def _concept(record_id: str, schema_version: str, name: str) -> dict:
@@ -118,6 +127,7 @@ def test_ac01_source_cold_start_commits_four_classes_meta_and_continuation(works
     assert result["receipt"]["source_hashes"][registration["source_id"]] == source["payload"]["content_hash"]
 
 
+@needs_loopback
 def test_ac11_natural_language_correction_keeps_history_and_updates_current_meta(workspace) -> None:
     first_operations = [
         Operation(op="append", stream="hypotheses", record=hypothesis()),

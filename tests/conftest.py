@@ -17,7 +17,10 @@ NOW = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc).isoformat()
 def workspace(tmp_path: Path) -> Workspace:
     config = load_config(
         workspace=tmp_path / "pco",
-        overrides=["checkpoint.derivations.projection=markdown"],
+        overrides=[
+            "checkpoint.derivations.projection=markdown",
+            "checkpoint.derivations.index=false",
+        ],
     )
     result = Workspace(config).init()
     assert result["ok"]

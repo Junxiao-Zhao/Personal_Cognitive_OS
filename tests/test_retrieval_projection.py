@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import pytest
@@ -12,9 +13,15 @@ from pco.checkpoint import CheckpointEngine
 from pco.context import render
 from pco.harness import FakeHarnessAdapter, WorkerResult
 from pco.projections import _page, _projection_path, project_affine, project_markdown
-from pco.retrieval import _chunks, _eligible_backend_hits, build_index, search, tokenize
+from pco.retrieval import _chunks, build_index, search, tokenize
 
 from conftest import NOW, continuation, envelope, event, hypothesis, meta, visible_messages
+
+
+needs_loopback = pytest.mark.skipif(
+    os.getenv("PCO_RUN_MILVUS") != "1",
+    reason="Milvus Lite needs a loopback port",
+)
 
 
 def _seed(workspace, *, with_meta: bool = False):
@@ -38,6 +45,7 @@ def _seed(workspace, *, with_meta: bool = False):
     return adapter, result
 
 
+@needs_loopback
 def test_five_retrieval_modes_return_evidence_time_and_qualification(workspace) -> None:
     _seed(workspace)
     for mode in ("continuity", "current", "pattern", "historical", "change"):
@@ -55,6 +63,7 @@ def test_five_retrieval_modes_return_evidence_time_and_qualification(workspace) 
     assert change["change_windows"]["caution"].startswith("Missing records")
 
 
+@needs_loopback
 def test_retrieval_reads_profile_ranking_and_candidate_policy(workspace) -> None:
     _seed(workspace)
     profile_file = workspace.config.memory_root / "profiles" / "pco" / "profile.yaml"
@@ -73,31 +82,7 @@ def test_retrieval_reads_profile_ranking_and_candidate_policy(workspace) -> None
     }
 
 
-def test_backend_candidate_expansion_stops_at_overfetch_limit() -> None:
-    ranked = [
-        ("events:outside_1@1", 1.0),
-        ("events:outside_2@1", 0.9),
-        ("continuations:wanted_1@1", 0.8),
-        ("events:outside_3@1", 0.7),
-        ("continuations:wanted_2@1", 0.6),
-    ]
-    calls: list[int] = []
-
-    def search_once(fetch_limit: int) -> dict[str, float]:
-        calls.append(fetch_limit)
-        return dict(ranked[:fetch_limit])
-
-    result = _eligible_backend_hits(
-        search_once,
-        eligible_keys={"continuations:wanted_1@1", "continuations:wanted_2@1"},
-        candidate_limit=2,
-        total_documents=len(ranked),
-        max_fetch_limit=4,
-    )
-    assert list(result) == ["continuations:wanted_1@1"]
-    assert calls == [2, 4]
-
-
+@needs_loopback
 def test_search_does_not_drop_filtered_results_for_disjoint_backend_hits(workspace, monkeypatch) -> None:
     _seed(workspace)
     monkeypatch.setattr(
@@ -143,6 +128,7 @@ def test_turn_chunker_splits_oversized_messages_without_indexing_reasoning(works
     assert all("never index this reasoning" not in chunk["text"] for chunk in chunks)
 
 
+@needs_loopback
 def test_reasoning_is_archived_but_not_indexed_or_context_injected(workspace) -> None:
     _seed(workspace)
     index = build_index(repo_root=workspace.config.memory_root, indexes_root=workspace.config.indexes_root)
@@ -157,6 +143,7 @@ def test_reasoning_is_archived_but_not_indexed_or_context_injected(workspace) ->
     assert "公开成果前的拖延" in content
 
 
+@needs_loopback
 def test_current_mode_excludes_old_meta_but_historical_includes_it(workspace) -> None:
     _seed(workspace, with_meta=True)
     manager = TransactionManager(workspace.repository, workspace.config.state_root)
@@ -185,6 +172,7 @@ def test_current_mode_excludes_old_meta_but_historical_includes_it(workspace) ->
     assert next(item for item in historical_meta if item["revision"] == 1)["revision_reason"] == "建立第一版有边界的当前认识。"
 
 
+@needs_loopback
 def test_historical_mode_exposes_revision_policy_and_reason(workspace) -> None:
     _seed(workspace)
     manager = TransactionManager(workspace.repository, workspace.config.state_root)
@@ -246,6 +234,7 @@ def test_projection_relations_are_clickable_and_paths_cannot_escape(tmp_path: Pa
     assert error.value.detail.code == "PROJECTION_ENTITY_ID_UNSAFE"
 
 
+@needs_loopback
 def test_clone_rebuilds_all_replaceable_derivations(workspace, tmp_path: Path) -> None:
     _seed(workspace)
     canonical_commit = workspace.repository.head()
@@ -260,8 +249,9 @@ def test_clone_rebuilds_all_replaceable_derivations(workspace, tmp_path: Path) -
     indexes = tmp_path / "rebuilt-indexes"
     rebuilt = build_index(repo_root=clone, indexes_root=indexes)
     assert rebuilt["memory_commit"] == canonical_commit
-    assert rebuilt["dense_backend"] in {"milvus-lite", "local-hashed-vector"}
-    assert rebuilt["lexical_backend"] in {"tantivy", "local-inverted-index"}
+    assert rebuilt["dense_backend"] == "milvus-lite"
+    assert rebuilt["lexical_backend"] == "tantivy"
+    assert "backend_errors" not in rebuilt
     assert (Path(rebuilt["generation_path"]) / "backlinks.json").is_file()
 
     markdown = project_markdown(repo_root=clone, output_root=tmp_path / "rebuilt-markdown")
@@ -350,6 +340,7 @@ def test_concept_rejects_forged_nonempty_search_receipt(workspace) -> None:
     assert error.value.detail.code == "EXTERNAL_REFERENCE_INVALID"
 
 
+@needs_loopback
 def test_search_reads_documents_from_generation_without_reload(workspace, monkeypatch) -> None:
     def worker(_payload) -> WorkerResult:
         return WorkerResult(
@@ -371,3 +362,14 @@ def test_search_reads_documents_from_generation_without_reload(workspace, monkey
     monkeypatch.setattr("pco.retrieval._documents", _boom)
     result = search(repo_root=workspace.config.memory_root, query="评价", indexes_root=indexes_root)
     assert result["ok"]
+
+
+def test_index_backend_failure_is_loud(workspace, monkeypatch) -> None:
+    def _fail(*_args, **_kwargs):
+        raise RuntimeError("loopback unavailable")
+
+    monkeypatch.setattr("pco.retrieval._build_milvus", _fail)
+    with pytest.raises(MemError) as exc:
+        build_index(repo_root=workspace.config.memory_root, indexes_root=workspace.config.indexes_root)
+    assert exc.value.detail.code == "INDEX_BACKEND_FAILED"
+    assert exc.value.detail.retryable is True

@@ -6,12 +6,13 @@ import math
 import os
 import re
 import shutil
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
 from mem_core.repository import MemoryRepository
+from mem_core.errors import MemError
 
 from .backlinks import build as build_backlinks
 from .repo_loader import profile_for_repo, repository_for_repo
@@ -36,12 +37,6 @@ def _vector(tokens: Iterable[str], dimensions: int = 256) -> dict[int, float]:
         counts[index] += 1
     norm = math.sqrt(sum(value * value for value in counts.values())) or 1.0
     return {index: value / norm for index, value in counts.items()}
-
-
-def _cosine(left: dict[int, float], right: dict[int, float]) -> float:
-    if len(left) > len(right):
-        left, right = right, left
-    return sum(value * right.get(index, 0.0) for index, value in left.items())
 
 
 def _text(record: dict[str, Any]) -> str:
@@ -307,39 +302,39 @@ def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = Fals
         shutil.rmtree(generation)
     generation.mkdir(parents=True, exist_ok=True)
     docs = _documents(repository)
-    terms: dict[str, list[str]] = defaultdict(list)
-    vectors: dict[str, dict[str, float]] = {}
-    for doc in docs:
-        key = f"{doc['stream']}:{doc['id']}@{doc['revision']}"
-        tokens = tokenize(doc["text"])
-        for term in sorted(set(tokens)):
-            terms[term].append(key)
-        vectors[key] = {str(index): value for index, value in _vector(tokens).items()}
     (generation / "documents.json").write_text(json.dumps(docs, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    (generation / "lexical.json").write_text(json.dumps(terms, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    (generation / "dense.json").write_text(json.dumps(vectors, sort_keys=True), encoding="utf-8")
     backlink_result = build_backlinks(repo_root=repo_root, output_path=generation / "backlinks.json")
-    lexical_backend = "tantivy"
-    dense_backend = "milvus-lite"
-    backend_errors: dict[str, str] = {}
     try:
         _build_tantivy(generation / "tantivy", docs)
+    except MemError:
+        raise
     except Exception as exc:
-        lexical_backend = "local-inverted-index"
-        backend_errors["tantivy"] = str(exc)
+        raise MemError(
+            "INDEX_BACKEND_FAILED",
+            "index",
+            f"Tantivy index build failed: {exc}",
+            retryable=True,
+            recovery=["Verify the local backend installation and retry", "Run `pco derive index --force`"],
+        ) from exc
     try:
         _build_milvus(generation / "milvus.db", docs)
+    except MemError:
+        raise
     except Exception as exc:
-        dense_backend = "local-hashed-vector"
-        backend_errors["milvus-lite"] = str(exc)
+        raise MemError(
+            "INDEX_BACKEND_FAILED",
+            "index",
+            f"Milvus index build failed: {exc}",
+            retryable=True,
+            recovery=["Verify the local backend installation and retry", "Run `pco derive index --force`"],
+        ) from exc
     manifest = {
         "memory_commit": commit,
         "profile": f"{profile.name}@{profile.version}",
         "documents": len(docs),
-        "dense_backend": dense_backend,
-        "lexical_backend": lexical_backend,
+        "dense_backend": "milvus-lite",
+        "lexical_backend": "tantivy",
         "backlinks": len(backlink_result["backlinks"]),
-        "backend_errors": backend_errors,
     }
     (generation / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
     active = Path(indexes_root) / "active.json"
@@ -350,30 +345,6 @@ def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = Fals
     return {"ok": True, "idempotent": False, **manifest, "generation_path": str(generation)}
 
 
-def _eligible_backend_hits(
-    search_once: Callable[[int], dict[str, float]],
-    *,
-    eligible_keys: set[str],
-    candidate_limit: int,
-    total_documents: int,
-    max_fetch_limit: int,
-) -> dict[str, float]:
-    if not eligible_keys or total_documents <= 0:
-        return {}
-    target = min(candidate_limit, len(eligible_keys))
-    fetch_ceiling = min(total_documents, max(candidate_limit, max_fetch_limit))
-    fetch_limit = min(fetch_ceiling, max(1, candidate_limit))
-    while True:
-        raw = search_once(fetch_limit)
-        eligible = {key: score for key, score in raw.items() if key in eligible_keys}
-        if len(eligible) >= target or fetch_limit >= fetch_ceiling or len(raw) < fetch_limit:
-            return dict(list(eligible.items())[:target])
-        expanded = min(fetch_ceiling, max(fetch_limit + 1, fetch_limit * 2))
-        if expanded == fetch_limit:
-            return dict(list(eligible.items())[:target])
-        fetch_limit = expanded
-
-
 def _index_scores(
     *,
     generation: Path,
@@ -381,11 +352,9 @@ def _index_scores(
     query: str,
     eligible_keys: set[str],
     candidate_limit: int,
-    max_fetch_limit: int,
 ) -> tuple[dict[str, float], dict[str, float]]:
     dense: dict[str, float] = {}
     lexical: dict[str, float] = {}
-    total_documents = int(manifest.get("documents", 0))
     if manifest.get("lexical_backend") == "tantivy" and query.strip():
         try:
             import tantivy
@@ -394,23 +363,20 @@ def _index_scores(
             terms = tokenize(query)
             parsed = index.parse_query(" OR ".join(terms), ["text"])
             searcher = index.searcher()
-
-            def lexical_search(fetch_limit: int) -> dict[str, float]:
-                hits: dict[str, float] = {}
-                for score, address in searcher.search(parsed, limit=fetch_limit).hits:
-                    key = searcher.doc(address).get_first("key")
-                    hits[str(key)] = float(score)
-                return hits
-
-            lexical = _eligible_backend_hits(
-                lexical_search,
-                eligible_keys=eligible_keys,
-                candidate_limit=candidate_limit,
-                total_documents=total_documents,
-                max_fetch_limit=max_fetch_limit,
-            )
-        except Exception:
-            lexical = {}
+            for score, address in searcher.search(parsed, limit=candidate_limit).hits:
+                key = searcher.doc(address).get_first("key")
+                if str(key) in eligible_keys:
+                    lexical[str(key)] = float(score)
+        except MemError:
+            raise
+        except Exception as exc:
+            raise MemError(
+                "INDEX_BACKEND_FAILED",
+                "retrieval",
+                f"Tantivy search failed: {exc}",
+                retryable=True,
+                recovery=["Verify the local backend installation and retry", "Run `pco derive index --force`"],
+            ) from exc
     if manifest.get("dense_backend") == "milvus-lite" and eligible_keys:
         try:
             os.environ["NO_PROXY"] = _merge_no_proxy(os.environ.get("NO_PROXY"))
@@ -420,31 +386,28 @@ def _index_scores(
             client = MilvusClient(str(generation / "milvus.db"))
             try:
                 vector = _vector(tokenize(query))
-
-                def dense_search(fetch_limit: int) -> dict[str, float]:
-                    response = client.search(
-                        "memory",
-                        data=[[float(vector.get(index, 0.0)) for index in range(256)]],
-                        limit=fetch_limit,
-                        output_fields=["key"],
-                    )
-                    hits: dict[str, float] = {}
-                    for hit in response[0]:
-                        key = hit.get("entity", {}).get("key") or hit.get("key") or hit.get("id")
-                        hits[str(key)] = float(hit.get("distance", 0.0))
-                    return hits
-
-                dense = _eligible_backend_hits(
-                    dense_search,
-                    eligible_keys=eligible_keys,
-                    candidate_limit=candidate_limit,
-                    total_documents=total_documents,
-                    max_fetch_limit=max_fetch_limit,
+                response = client.search(
+                    "memory",
+                    data=[[float(vector.get(index, 0.0)) for index in range(256)]],
+                    limit=candidate_limit,
+                    output_fields=["key"],
                 )
+                for hit in response[0]:
+                    key = hit.get("entity", {}).get("key") or hit.get("key") or hit.get("id")
+                    if str(key) in eligible_keys:
+                        dense[str(key)] = float(hit.get("distance", 0.0))
             finally:
                 client.close()
-        except Exception:
-            dense = {}
+        except MemError:
+            raise
+        except Exception as exc:
+            raise MemError(
+                "INDEX_BACKEND_FAILED",
+                "retrieval",
+                f"Milvus search failed: {exc}",
+                retryable=True,
+                recovery=["Verify the local backend installation and retry", "Run `pco derive index --force`"],
+            ) from exc
     return dense, lexical
 
 
@@ -580,7 +543,6 @@ def search(
         query=query,
         eligible_keys=eligible_keys,
         candidate_limit=candidate_limit,
-        max_fetch_limit=max_fetch_limit,
     )
     backend_candidates = set(backend_dense) | set(backend_lexical)
     if backend_candidates:
@@ -613,19 +575,14 @@ def search(
             reverse=True,
         )[:candidate_limit]
 
-    query_tokens = tokenize(query)
-    query_counts = Counter(query_tokens)
-    query_vector = _vector(query_tokens)
     dense = {}
     for index, doc in enumerate(filtered):
         key = f"{doc['stream']}:{doc['id']}@{doc['revision']}"
-        dense[index] = backend_dense.get(key, _cosine(query_vector, _vector(tokenize(doc["text"]))))
+        dense[index] = backend_dense.get(key, 0.0)
     lexical: dict[int, float] = {}
     for index, doc in enumerate(filtered):
-        counts = Counter(tokenize(doc["text"]))
-        fallback = sum(min(counts[token], count) for token, count in query_counts.items()) / (len(query_tokens) or 1)
         key = f"{doc['stream']}:{doc['id']}@{doc['revision']}"
-        lexical[index] = backend_lexical.get(key, fallback)
+        lexical[index] = backend_lexical.get(key, 0.0)
     dense_rank = {index: rank for rank, (index, _) in enumerate(sorted(dense.items(), key=lambda item: item[1], reverse=True), 1)}
     lexical_rank = {index: rank for rank, (index, _) in enumerate(sorted(lexical.items(), key=lambda item: item[1], reverse=True), 1)}
     now = datetime.now(timezone.utc)

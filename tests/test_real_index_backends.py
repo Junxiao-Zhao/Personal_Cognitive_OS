@@ -28,7 +28,7 @@ def test_real_milvus_lite_and_tantivy_generation(workspace) -> None:
     )
     assert built["dense_backend"] == "milvus-lite"
     assert built["lexical_backend"] == "tantivy"
-    assert built["backend_errors"] == {}
+    assert "backend_errors" not in built
 
     result = search(
         repo_root=workspace.config.memory_root,
