@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+from mem_core.approval import verify_approval_receipt
 from mem_core.errors import MemError
 from mem_core.models import Operation
 from mem_core.profile import Profile
@@ -59,6 +60,30 @@ def test_protected_stream_requires_exact_approval(workspace) -> None:
     assert committed["ok"]
     assert workspace.repository.current_records("meta_revisions")["meta_current"]["revision"] == 1
     assert manager.commit(transaction.id)["idempotent"] is True
+
+
+def test_shared_approval_verification_rejects_stale_hash(workspace) -> None:
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    state = manager.begin(fingerprint_context={"kind": "shared_approval"})
+    manager.append(state.id, Operation(op="append", stream="meta_revisions", record=meta()))
+    manager.attach_approval(
+        state.id,
+        checkpoint_id="ckpt_shared",
+        proposal_hash_value=manager.load(state.id).proposal_hash,
+    )
+    state = manager.load(state.id)
+    protected = {"meta_revisions"}
+    with pytest.raises(MemError) as exc:
+        verify_approval_receipt(
+            receipt=state.approval_receipt,
+            operations=state.operations,
+            protected=protected,
+            profile=workspace.repository.profile,
+            reviewed_proposal_hash=state.proposal_hash,
+            transaction_proposal_hash="sha256:stale",
+            transaction_fingerprint=state.transaction_fingerprint,
+        )
+    assert exc.value.detail.code == "APPROVAL_STALE"
 
 
 def test_profile_rejects_assistant_as_user_evidence(workspace) -> None:

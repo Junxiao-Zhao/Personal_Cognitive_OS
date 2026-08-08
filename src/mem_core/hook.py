@@ -8,8 +8,9 @@ import tarfile
 import tempfile
 from pathlib import Path
 
+from .approval import verify_approval_receipt
 from .errors import MemError, ensure
-from .models import ApprovalReceipt, Operation, proposal_hash, protected_operations_hash, transaction_fingerprint
+from .models import ApprovalReceipt, Operation, proposal_hash, transaction_fingerprint
 from .profile import Profile
 from .registry import default_registry
 from .repository import MemoryRepository
@@ -132,22 +133,15 @@ def _verify_increment(root: Path, old_root: Path, staged_root: Path, profile: Pr
         except Exception as exc:
             raise MemError("USER_APPROVAL_REQUIRED", "pre_commit", str(exc)) from exc
         reviewed_hash = str(transaction_record.get("fingerprint_context", {}).get("reviewed_proposal_hash") or transaction_record.get("proposal_hash"))
-        ensure(receipt.proposal_hash == reviewed_hash, "APPROVAL_STALE", "pre_commit", "Approval reviewed hash does not match")
-        ensure(receipt.transaction_proposal_hash == transaction_record.get("proposal_hash"), "APPROVAL_STALE", "pre_commit", "Approval proposal hash does not match")
-        ensure(receipt.transaction_fingerprint == expected_fingerprint, "APPROVAL_STALE", "pre_commit", "Approval fingerprint does not match")
-        ensure(receipt.protected_operations_hash == protected_operations_hash(operations, protected), "APPROVAL_STALE", "pre_commit", "Protected operation hash does not match")
-        for operation in operations:
-            if operation.op != "append" or operation.stream not in protected or operation.record is None:
-                continue
-            pointer = profile.stream(operation.stream).approval_ref_pointer
-            if not pointer:
-                continue
-            value: object = operation.record
-            for part in pointer.lstrip("/").split("/"):
-                key = part.replace("~1", "/").replace("~0", "~")
-                ensure(isinstance(value, dict) and key in value, "APPROVAL_REF_MISSING", "pre_commit", f"Missing approval pointer {pointer}")
-                value = value[key]
-            ensure(value == receipt.id, "APPROVAL_REF_MISMATCH", "pre_commit", "Protected record does not reference receipt")
+        verify_approval_receipt(
+            receipt=receipt,
+            operations=operations,
+            protected=protected,
+            profile=profile,
+            reviewed_proposal_hash=reviewed_hash,
+            transaction_proposal_hash=str(transaction_record.get("proposal_hash")),
+            transaction_fingerprint=str(transaction_record.get("transaction_fingerprint")),
+        )
     else:
         ensure(transaction_record.get("approval_receipt") is None, "APPROVAL_RECEIPT_UNEXPECTED", "pre_commit", "Unprotected transaction includes an approval receipt")
     return {"transaction_id": transaction_record.get("id"), "operations": len(operations)}

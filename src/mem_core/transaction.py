@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .approval import verify_approval_receipt
 from .errors import MemError, ensure
 from .models import (
     ApprovalReceipt,
@@ -169,50 +170,16 @@ class TransactionManager:
     def _verify_approval(self, state: TransactionState, protected: set[str]) -> None:
         if not protected:
             return
-        receipt = state.approval_receipt
-        ensure(
-            receipt is not None,
-            "USER_APPROVAL_REQUIRED",
-            "write_policy",
-            f"Protected streams require approval: {', '.join(sorted(protected))}",
-            retryable=True,
-            recovery=["Show the exact protected diff to the user and attach a matching approval receipt"],
-        )
         reviewed_proposal_hash = str(state.fingerprint_context.get("reviewed_proposal_hash") or state.proposal_hash)
-        ensure(receipt.proposal_hash == reviewed_proposal_hash, "APPROVAL_STALE", "write_policy", "Reviewed proposal changed after approval")
-        ensure(receipt.transaction_proposal_hash == state.proposal_hash, "APPROVAL_STALE", "write_policy", "Transaction proposal changed after approval")
-        ensure(receipt.transaction_fingerprint == state.transaction_fingerprint, "APPROVAL_STALE", "write_policy", "Transaction changed after approval")
-        expected = protected_operations_hash(state.operations, protected)
-        ensure(receipt.protected_operations_hash == expected, "APPROVAL_STALE", "write_policy", "Protected operations changed after approval")
-        for operation in state.operations:
-            if operation.op != "append" or operation.stream not in protected or operation.record is None:
-                continue
-            pointer = self.repository.profile.stream(operation.stream).approval_ref_pointer
-            if not pointer:
-                continue
-            value: Any = operation.record
-            for part in pointer.lstrip("/").split("/"):
-                key = part.replace("~1", "/").replace("~0", "~")
-                ensure(
-                    isinstance(value, dict) and key in value,
-                    "APPROVAL_REF_MISSING",
-                    "write_policy",
-                    f"Protected record is missing approval reference at {pointer}",
-                    stream=operation.stream,
-                    record_id=operation.record.get("id"),
-                    path=pointer,
-                )
-                value = value[key]
-            ensure(
-                value == receipt.id,
-                "APPROVAL_REF_MISMATCH",
-                "write_policy",
-                "Protected record approval reference does not match the attached receipt",
-                stream=operation.stream,
-                record_id=operation.record.get("id"),
-                path=pointer,
-                value=value,
-            )
+        verify_approval_receipt(
+            receipt=state.approval_receipt,
+            operations=state.operations,
+            protected=protected,
+            profile=self.repository.profile,
+            reviewed_proposal_hash=reviewed_proposal_hash,
+            transaction_proposal_hash=state.proposal_hash,
+            transaction_fingerprint=state.transaction_fingerprint,
+        )
 
     def _prepare_worktree(self, state: TransactionState) -> Path:
         worktree = self._worktree_path(state.id)
