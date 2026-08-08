@@ -27,6 +27,44 @@ def test_latest_by_id_keeps_highest_revision():
     assert latest_by_id(records) == {"a": records[1], "b": records[2]}
 
 
+def _message_record(native_id: str) -> dict:
+    return envelope(
+        f"msg_{native_id}",
+        "conversation-message/v1",
+        {
+            "thread_id": "thread_t",
+            "epoch_id": "epoch_e",
+            "harness": "fake",
+            "native_session_id": "ses_fake_main",
+            "native_message_id": native_id,
+            "role": "user",
+            "kind": "conversation",
+            "content": "公开消息",
+            "reasoning": None,
+            "refs": [],
+            "created_at": NOW,
+        },
+    )
+
+
+def test_messages_only_commit_still_rejects_append_only_violation(workspace) -> None:
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    state = manager.begin(fingerprint_context={"kind": "tamper_test"})
+    manager.append(state.id, Operation(op="append", stream="messages", record=_message_record("native_tamper_1")))
+    manager.commit(state.id)
+    path = workspace.config.memory_root / "raw" / "conversations" / "messages.jsonl"
+    original = path.read_text(encoding="utf-8")
+    path.write_text(original.replace(original.splitlines()[0], "{}"), encoding="utf-8")
+    workspace.repository._git("add", ".")
+    result = subprocess.run(
+        ["git", "-C", str(workspace.config.memory_root), "commit", "-m", "tamper"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "APPEND_ONLY_VIOLATION" in result.stderr + result.stdout
+
+
 def test_protected_stream_requires_exact_approval(workspace) -> None:
     manager = TransactionManager(workspace.repository, workspace.config.state_root)
     transaction = manager.begin(transaction_id="txn_meta", fingerprint_context={"checkpoint_id": "ckpt_1"})

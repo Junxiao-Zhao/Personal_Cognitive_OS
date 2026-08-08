@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .approval import verify_approval_receipt
 from .errors import MemError, ensure
-from .models import ApprovalReceipt, Operation, proposal_hash, transaction_fingerprint
+from .models import ApprovalReceipt, Operation, RecordEnvelope, proposal_hash, transaction_fingerprint
 from .profile import Profile
 from .registry import default_registry
 from .repository import MemoryRepository
@@ -27,6 +27,22 @@ def _git(root: Path, *args: str, text: bool = True) -> str | bytes:
         stderr = result.stderr if text else result.stderr.decode("utf-8", errors="replace")
         raise MemError("GIT_COMMAND_FAILED", "pre_commit", stderr.strip())
     return result.stdout
+
+
+def _old_bytes(root: Path, relative: str) -> bytes:
+    """Read a path's bytes at HEAD without materializing the whole tree."""
+    try:
+        return _git(root, "show", f"HEAD:{relative}", text=False)
+    except MemError:
+        return b""
+
+
+def _staged_bytes(root: Path, relative: str) -> bytes:
+    """Read a path's bytes from the index (what pre-commit must validate)."""
+    try:
+        return _git(root, "show", f":{relative}", text=False)
+    except MemError:
+        return b""
 
 
 def _materialize_tree(root: Path, revision: str, target: Path) -> None:
@@ -63,9 +79,7 @@ def _load_profile(root: Path) -> Profile:
     return profile
 
 
-def _appended_json(old_root: Path, new_root: Path, relative: Path) -> list[dict[str, object]]:
-    old = (old_root / relative).read_bytes() if (old_root / relative).exists() else b""
-    new = (new_root / relative).read_bytes() if (new_root / relative).exists() else b""
+def _appended_json(old: bytes, new: bytes, relative: Path) -> list[dict[str, object]]:
     ensure(new.startswith(old), "APPEND_ONLY_VIOLATION", "pre_commit", f"Historical bytes changed: {relative}", path=str(relative))
     suffix = new[len(old) :]
     if not suffix:
@@ -77,13 +91,13 @@ def _appended_json(old_root: Path, new_root: Path, relative: Path) -> list[dict[
         raise MemError("TRANSACTION_DELTA_INVALID", "pre_commit", str(exc), path=str(relative)) from exc
 
 
-def _verify_increment(root: Path, old_root: Path, staged_root: Path, profile: Profile) -> dict[str, object]:
-    actual_by_stream = {
-        name: _appended_json(old_root, staged_root, Path(stream.path))
-        for name, stream in profile.config.streams.items()
-    }
+def _verify_increment(root: Path, profile: Profile, changed: set[str]) -> dict[str, object]:
+    actual_by_stream: dict[str, list[dict[str, object]]] = {}
+    for name, stream in profile.config.streams.items():
+        relative = Path(stream.path)
+        actual_by_stream[name] = _appended_json(_old_bytes(root, stream.path), _staged_bytes(root, stream.path), relative)
     transaction_path = Path("transactions/transactions.jsonl")
-    transaction_records = _appended_json(old_root, staged_root, transaction_path)
+    transaction_records = _appended_json(_old_bytes(root, transaction_path.as_posix()), _staged_bytes(root, transaction_path.as_posix()), transaction_path)
     ensure(len(transaction_records) == 1, "TRANSACTION_RECEIPT_REQUIRED", "pre_commit", "A commit must append exactly one transaction receipt")
     transaction_record = transaction_records[0]
     try:
@@ -101,14 +115,13 @@ def _verify_increment(root: Path, old_root: Path, staged_root: Path, profile: Pr
             expected_paths.add(Path(stream.path).as_posix())
         else:
             assert operation.path is not None and operation.content is not None
-            artifact = profile.artifact_path(staged_root, operation.path)
-            ensure(artifact.is_file(), "ARTIFACT_MISSING", "pre_commit", operation.path)
-            ensure(artifact.read_text(encoding="utf-8") == operation.content, "ARTIFACT_CONTENT_MISMATCH", "pre_commit", operation.path)
+            ensure(operation.path in changed, "ARTIFACT_MISSING", "pre_commit", operation.path)
+            artifact_content = _staged_bytes(root, operation.path).decode("utf-8")
+            ensure(artifact_content == operation.content, "ARTIFACT_CONTENT_MISMATCH", "pre_commit", operation.path)
             expected_paths.add(Path(operation.path).as_posix())
     for stream, actual in actual_by_stream.items():
         ensure(actual == expected_by_stream[stream], "TRANSACTION_DELTA_MISMATCH", "pre_commit", f"Staged delta is not authorized by transaction operations: {stream}", stream=stream)
 
-    changed = set(str(_git(root, "diff", "--cached", "--name-only", "HEAD")).splitlines())
     ensure(changed == expected_paths, "TRANSACTION_PATH_MISMATCH", "pre_commit", "Staged paths do not exactly match the transaction receipt", value={"changed": sorted(changed), "expected": sorted(expected_paths)})
     head = str(_git(root, "rev-parse", "HEAD")).strip()
     ensure(transaction_record.get("base_commit") == head, "BASE_COMMIT_CHANGED", "pre_commit", "Transaction base is not HEAD")
@@ -144,24 +157,58 @@ def _verify_increment(root: Path, old_root: Path, staged_root: Path, profile: Pr
         )
     else:
         ensure(transaction_record.get("approval_receipt") is None, "APPROVAL_RECEIPT_UNEXPECTED", "pre_commit", "Unprotected transaction includes an approval receipt")
-    return {"transaction_id": transaction_record.get("id"), "operations": len(operations)}
+    return {
+        "transaction_id": transaction_record.get("id"),
+        "operations": len(operations),
+        "messages_only": all(operation.op == "append" and operation.stream == "messages" for operation in operations),
+    }
+
+
+def _delta_validate_messages(profile: Profile, appended: list[dict[str, object]]) -> None:
+    for record in appended:
+        try:
+            RecordEnvelope.model_validate(record)
+        except Exception as exc:
+            raise MemError("ENVELOPE_INVALID", "envelope_validation", str(exc), stream="messages", record_id=record.get("id")) from exc
+        profile.validate_record_schema("messages", record)
+
+
+def _check_append_only(root: Path, profile: Profile) -> None:
+    """Byte-level append-only guard for every stream, checked before any
+    envelope or receipt logic so historical tampering is always reported as
+    APPEND_ONLY_VIOLATION."""
+    for stream in profile.config.streams.values():
+        relative = Path(stream.path)
+        _appended_json(_old_bytes(root, stream.path), _staged_bytes(root, stream.path), relative)
+    transaction_path = Path("transactions/transactions.jsonl")
+    _appended_json(_old_bytes(root, transaction_path.as_posix()), _staged_bytes(root, transaction_path.as_posix()), transaction_path)
 
 
 def validate_repository(repo_root: Path) -> dict[str, object]:
     root = repo_root.resolve()
-    staged_tree = str(_git(root, "write-tree")).strip()
-    with tempfile.TemporaryDirectory(prefix="mem-core-hook-") as temporary:
-        temporary_root = Path(temporary)
-        old_root = temporary_root / "head"
-        staged_root = temporary_root / "staged"
-        old_root.mkdir()
-        staged_root.mkdir()
-        _materialize_tree(root, "HEAD", old_root)
-        _materialize_tree(root, staged_tree, staged_root)
-        profile = _load_profile(staged_root)
-        validation = MemoryRepository(staged_root, profile).validate_all(root=staged_root)
-        increment = _verify_increment(root, old_root, staged_root, profile)
-        return {**validation, "increment": increment}
+    profile = _load_profile(root)
+    _check_append_only(root, profile)
+    changed = set(str(_git(root, "diff", "--cached", "--name-only", "HEAD")).splitlines())
+    if "messages" in profile.config.streams:
+        messages_path = profile.stream("messages").path
+        if messages_path in changed:
+            appended = _appended_json(_old_bytes(root, messages_path), _staged_bytes(root, messages_path), Path(messages_path))
+            _delta_validate_messages(profile, appended)
+    increment = _verify_increment(root, profile, changed)
+    if increment.get("messages_only"):
+        validation: dict[str, object] = {
+            "ok": True,
+            "profile": f"{profile.name}@{profile.version}",
+            "mode": "incremental",
+        }
+    else:
+        staged_tree = str(_git(root, "write-tree")).strip()
+        with tempfile.TemporaryDirectory(prefix="mem-core-hook-") as temporary:
+            staged_root = Path(temporary) / "staged"
+            staged_root.mkdir()
+            _materialize_tree(root, staged_tree, staged_root)
+            validation = MemoryRepository(staged_root, profile).validate_all(root=staged_root)
+    return {**validation, "increment": increment}
 
 
 def main(argv: list[str] | None = None) -> None:
