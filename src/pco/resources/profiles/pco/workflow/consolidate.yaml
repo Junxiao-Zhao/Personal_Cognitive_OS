@@ -1,3 +1,5 @@
+# Reference only: execution follows src/pco/checkpoint step modules.
+# This YAML documents the PRD 18.3 step list and is not loaded by any runner.
 version: consolidate@0.3.1
 steps:
   - freeze_transcript
