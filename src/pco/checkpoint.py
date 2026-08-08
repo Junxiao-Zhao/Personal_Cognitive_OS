@@ -338,7 +338,6 @@ class CheckpointEngine:
 
     def _prepare_candidate(self, state: CheckpointState, frozen: dict[str, Any], result: WorkerResult) -> dict[str, Any]:
         self._validate_rejection_candidate(state, result)
-        self._validate_continuation(state, [*frozen.get("source_operations", []), *result.operations])
         search_receipts = self._effective_search_receipts(state, result)
         persisted_result = {
             "operations": [operation.normalized() for operation in result.operations],
@@ -383,6 +382,7 @@ class CheckpointEngine:
                     external_ref["search_receipt"] = matches[-1]["id"]
         source_operations = [Operation.model_validate(item) for item in frozen.get("source_operations", [])]
         operations = [*source_operations, *receipt_operations, *result.operations]
+        self._validate_continuation(state, operations)
         state.harness_runtime.update(result.runtime_info)
         state.skill_versions = dict(result.skill_versions)
         state.operation_counts = dict(Counter(operation.stream or "artifacts" for operation in operations))
