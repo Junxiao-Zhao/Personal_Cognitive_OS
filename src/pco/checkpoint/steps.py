@@ -328,12 +328,9 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
     elif state.decision == "yes":
         workspace.save_json(f"checkpoints/{state.id}/proposal-approved.json", proposal)
     workspace.save_json(f"checkpoints/{state.id}/proposal.json", proposal)
-    state.status = "PROPOSAL_VALIDATED"
-    state_store.save(engine, state)
+    state_store.transition(engine, state, "PROPOSAL_VALIDATED")
     if state.protected_streams:
-        state.status = "AWAITING_META_APPROVAL"
-        state_store.save(engine, state)
+        state_store.transition(engine, state, "AWAITING_META_APPROVAL")
         return {"ok": True, "checkpoint_id": state.id, "status": state.status, "approval_required": True, "proposal": proposal}
-    state.status = "FINAL_CHANGESET_VALIDATED"
-    state_store.save(engine, state)
+    state_store.transition(engine, state, "FINAL_CHANGESET_VALIDATED")
     return finalize_steps.commit_and_finalize(engine, state)

@@ -116,14 +116,12 @@ class CheckpointEngine:
             archive_cursor=thread.archive_cursor,
             harness_runtime=self.adapter.runtime_info(),
         )
-        state_store.save(self, state)
+        state_store.transition(self, state, "CHECKPOINT_REQUESTED")
         try:
-            state.status = "INPUT_LOCKED"
-            state_store.save(self, state)
+            state_store.transition(self, state, "INPUT_LOCKED")
             frozen = checkpoint_steps.freeze(self, state)
             state.source_hashes = dict(frozen.get("source_hashes", {}))
-            state.status = "TRANSCRIPT_FROZEN"
-            state_store.save(self, state)
+            state_store.transition(self, state, "TRANSCRIPT_FROZEN")
             handle = self.adapter.spawn_worker(
                 {
                     "checkpoint_id": state.id,
@@ -132,8 +130,7 @@ class CheckpointEngine:
                 }
             )
             state.worker_handle = handle.as_dict()
-            state.status = "WORKER_RUNNING"
-            state_store.save(self, state)
+            state_store.transition(self, state, "WORKER_RUNNING")
             result = self.adapter.resume_worker(handle, {"kind": "consolidate", "frozen": frozen})
             return checkpoint_steps.prepare_candidate(self, state, frozen, result)
         except Exception as exc:

@@ -18,7 +18,6 @@ def commit_and_finalize(engine: Any, state: CheckpointState) -> dict[str, Any]:
     ensure(state.transaction_id is not None, "CHECKPOINT_STATE_INVALID", "commit", "Missing transaction")
     result = engine.manager.commit(state.transaction_id)
     state.commit = result["commit"]
-    state.status = "MEMORY_COMMITTED"
     thread = engine.workspace.thread()
     thread.last_consolidated_message_id = (
         state.decision_message_id
@@ -26,7 +25,7 @@ def commit_and_finalize(engine: Any, state: CheckpointState) -> dict[str, Any]:
         else state.through_message_id
     )
     engine.workspace.save_thread(thread)
-    state_store.save(engine, state)
+    state_store.transition(engine, state, "MEMORY_COMMITTED")
     return finalize_committed(engine, state)
 
 
@@ -158,42 +157,36 @@ def finalize_committed(engine: Any, state: CheckpointState) -> dict[str, Any]:
         if not state.context_published:
             engine.adapter.publish_context(state.context_bundle)
             state.context_published = True
-            state.status = "CONTEXT_PUBLISHED"
-            state_store.save(engine, state)
+            state_store.transition(engine, state, "CONTEXT_PUBLISHED")
         if not state.compacted:
             engine.adapter.compact()
             state.compacted = True
-            state.status = "CONTEXT_COMPACTED"
-            state_store.save(engine, state)
+            state_store.transition(engine, state, "CONTEXT_COMPACTED")
     except Exception as exc:
         state.status = "COMMITTED_CONTEXT_PENDING"
         state_store.recover(engine, state, exc, preserve_status=True)
         raise
     try:
         if not state.receipt_inserted:
-            state.status = "RECEIPT_INSERTED"
+            state_store.transition(engine, state, "RECEIPT_INSERTED")
             current_receipt = receipt(engine, state)
             engine.adapter.insert_receipt(current_receipt)
             state.receipt_inserted = True
-            state_store.save(engine, state)
             workspace.save_json(f"checkpoints/{state.id}/receipt.json", current_receipt)
         if not state.input_unlocked:
             engine.adapter.unlock_input()
             state.input_unlocked = True
-            state.status = "INPUT_UNLOCKED"
-            state_store.save(engine, state)
+            state_store.transition(engine, state, "INPUT_UNLOCKED")
     except Exception as exc:
         state.status = "COMMITTED_CONTEXT_PENDING"
         state_store.recover(engine, state, exc, preserve_status=True)
         raise
-    state.status = "DERIVATIONS_RUNNING"
-    state_store.save(engine, state)
+    state_store.transition(engine, state, "DERIVATIONS_RUNNING")
     derivations_steps.run_derivations(engine, state)
     derivations_steps.cleanup_worker(engine, state)
     pending = any(not item.get("ok", False) for item in state.derivations.values())
-    state.status = "COMMITTED_WITH_PENDING_DERIVATIONS" if pending else "DONE"
     state.completed_at = utc_now()
-    state_store.save(engine, state)
+    state_store.transition(engine, state, "COMMITTED_WITH_PENDING_DERIVATIONS" if pending else "DONE")
     write_checkpoint_record(engine, state)
     current_receipt = receipt(engine, state)
     workspace.save_json(f"checkpoints/{state.id}/receipt.json", current_receipt)

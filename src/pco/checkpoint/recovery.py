@@ -25,8 +25,7 @@ def retry(engine: Any) -> dict[str, Any]:
     state.error = None
     state.failure_phase = None
     if state.commit:
-        state.status = "MEMORY_COMMITTED"
-        state_store.save(engine, state)
+        state_store.transition(engine, state, "MEMORY_COMMITTED")
         return finalize_steps.finalize_committed(engine, state)
     try:
         frozen = engine.workspace.load_json(f"checkpoints/{state.id}/frozen.json")
@@ -42,8 +41,7 @@ def retry(engine: Any) -> dict[str, Any]:
             }
         else:
             payload = {"kind": "consolidate", "frozen": frozen, "retry": state.retries}
-        state.status = "WORKER_RUNNING"
-        state_store.save(engine, state)
+        state_store.transition(engine, state, "WORKER_RUNNING")
         try:
             result = engine.adapter.resume_worker(handle, payload)
         except MemError as exc:
@@ -75,9 +73,8 @@ def retry_derivations(engine: Any) -> dict[str, Any]:
     derivations_steps.run_derivations(engine, state)
     derivations_steps.cleanup_worker(engine, state)
     pending = any(not item.get("ok", False) for item in state.derivations.values())
-    state.status = "COMMITTED_WITH_PENDING_DERIVATIONS" if pending else "DONE"
     state.completed_at = utc_now()
-    state_store.save(engine, state)
+    state_store.transition(engine, state, "COMMITTED_WITH_PENDING_DERIVATIONS" if pending else "DONE")
     finalize_steps.write_checkpoint_record(engine, state)
     current_receipt = finalize_steps.receipt(engine, state)
     engine.workspace.save_json(f"checkpoints/{state.id}/receipt.json", current_receipt)
@@ -92,8 +89,7 @@ def abort(engine: Any) -> dict[str, Any]:
         if transaction.status != "aborted":
             engine.manager.abort(state.transaction_id)
     derivations_steps.cleanup_worker(engine, state)
-    state.status = "ABORTED"
     engine.adapter.unlock_input()
     state.input_unlocked = True
-    state_store.save(engine, state)
+    state_store.transition(engine, state, "ABORTED")
     return {"ok": True, "checkpoint_id": state.id, "status": state.status}

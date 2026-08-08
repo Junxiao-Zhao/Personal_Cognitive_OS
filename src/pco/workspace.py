@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +62,7 @@ class Workspace:
             encoding="utf-8",
         )
         commit = self.repository.init(copy_profile=True)
-        now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         thread_id = f"thread_{uuid.uuid4().hex}"
         epoch_id = f"epoch_{uuid.uuid4().hex}"
         thread = ThreadState(thread_id=thread_id, active_epoch_id=epoch_id, created_at=now)

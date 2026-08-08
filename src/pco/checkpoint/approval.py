@@ -59,8 +59,7 @@ def decide(
             decision_message_id=state.decision_message_id,
             receipt_id=f"approval_{state.id}",
         )
-        state.status = "FINAL_CHANGESET_VALIDATED"
-        state_store.save(engine, state)
+        state_store.transition(engine, state, "FINAL_CHANGESET_VALIDATED")
         try:
             return finalize_steps.commit_and_finalize(engine, state)
         except Exception as exc:
@@ -87,8 +86,7 @@ def decide(
         frozen["messages"].append(decision_message)
         frozen["base_commit"] = workspace.repository.head()
         workspace.save_json(f"checkpoints/{state.id}/frozen.json", frozen)
-        state.status = "WORKER_RUNNING"
-        state_store.save(engine, state)
+        state_store.transition(engine, state, "WORKER_RUNNING")
         handle = WorkerHandle(**(state.worker_handle or {}))
         revised = engine.adapter.resume_worker(
             handle,

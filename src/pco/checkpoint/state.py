@@ -92,8 +92,14 @@ def save(engine: Any, state: CheckpointState) -> None:
     state.updated_at = utc_now()
     engine.workspace.save_json("active-checkpoint.json", state.model_dump(mode="json"))
     engine.workspace.save_json(f"checkpoints/{state.id}/state.json", state.model_dump(mode="json"))
+
+
+def transition(engine: Any, state: CheckpointState, new_status: str) -> None:
+    """Persist a status change and maintain the external input lock."""
+    state.status = new_status
     if not state.input_unlocked and state.status not in TERMINAL_STATUSES:
         engine.adapter.lock_input(state.id, state.status)
+    save(engine, state)
 
 
 def load(engine: Any) -> CheckpointState:
@@ -134,4 +140,4 @@ def recover(engine: Any, state: CheckpointState, exc: Exception, *, preserve_sta
         }
     if not preserve_status:
         state.status = "RECOVERY"
-    save(engine, state)
+    transition(engine, state, state.status)
