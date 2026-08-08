@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
-import hashlib
 import io
 import json
 import subprocess
@@ -15,49 +13,6 @@ from .models import ApprovalReceipt, Operation, proposal_hash, protected_operati
 from .profile import Profile
 from .registry import default_registry
 from .repository import MemoryRepository
-
-
-PCO_SEARCH_RECEIPT_SCHEMA_SHA256 = "11307872d79940fa432dae9dfebd5dd15585852a80ff9a1277fc6c9970edfa10"
-PCO_SEARCH_RECEIPT_STREAM = {
-    "path": "sources/search-receipts.jsonl",
-    "schema": "schemas/search-receipt.schema.json",
-    "schema_version": "pco/search-receipt/v1",
-    "write_policy": "auto",
-}
-
-
-def _legacy_external_refs(root: Path, profile: Profile) -> list[dict[str, object]]:
-    legacy: list[dict[str, object]] = []
-    for stream in ("psychologies", "philosophies"):
-        if stream not in profile.config.streams:
-            continue
-        path = profile.stream_path(root, stream)
-        if not path.is_file():
-            continue
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            for index, reference in enumerate(record.get("payload", {}).get("external_refs", [])):
-                legacy.append(
-                    {
-                        "stream": stream,
-                        "record_id": record.get("id"),
-                        "revision": record.get("revision"),
-                        "external_ref_index": index,
-                        "url": reference.get("url"),
-                        "search_receipt": reference.get("search_receipt"),
-                    }
-                )
-    return sorted(
-        legacy,
-        key=lambda item: (
-            str(item["stream"]),
-            str(item["record_id"]),
-            int(item["revision"]),
-            int(item["external_ref_index"]),
-        ),
-    )
 
 
 def _git(root: Path, *args: str, text: bool = True) -> str | bytes:
@@ -198,62 +153,6 @@ def _verify_increment(root: Path, old_root: Path, staged_root: Path, profile: Pr
     return {"transaction_id": transaction_record.get("id"), "operations": len(operations)}
 
 
-def _verify_profile_migration(root: Path, old_root: Path, staged_root: Path, profile: Profile) -> dict[str, object]:
-    old_profile = _load_profile(old_root)
-    ensure(
-        old_profile.name == profile.name == "pco" and old_profile.version == "0.3.1" and profile.version == "0.3.2",
-        "PROFILE_MIGRATION_UNSUPPORTED",
-        "pre_commit",
-        "Only the audited pco@0.3.1 to pco@0.3.2 migration is supported",
-    )
-    expected_raw = copy.deepcopy(old_profile.raw)
-    expected_raw["version"] = "0.3.2"
-    expected_raw.setdefault("streams", {})["search_receipts"] = dict(PCO_SEARCH_RECEIPT_STREAM)
-    expected_raw.setdefault("retrieval", {}).setdefault("candidate_count", 200)
-    expected_raw.setdefault("retrieval", {}).setdefault("candidate_overfetch_factor", 4)
-    ensure(profile.raw == expected_raw, "PROFILE_MIGRATION_INVALID", "pre_commit", "Canonical Profile contains changes outside the supported migration")
-
-    schema_path = Path("profiles/pco/schemas/search-receipt.schema.json")
-    stream_path = Path("sources/search-receipts.jsonl")
-    marker_path = Path(".mem-profile.json")
-    profile_path = Path("profiles/pco/profile.yaml")
-    audit_path = Path("transactions/profile-migrations.jsonl")
-    schema_hash = hashlib.sha256((staged_root / schema_path).read_bytes()).hexdigest()
-    ensure(schema_hash == PCO_SEARCH_RECEIPT_SCHEMA_SHA256, "PROFILE_MIGRATION_INVALID", "pre_commit", "Search receipt schema does not match the supported migration")
-    old_stream = (old_root / stream_path).read_bytes() if (old_root / stream_path).exists() else b""
-    ensure((staged_root / stream_path).read_bytes() == old_stream, "PROFILE_MIGRATION_INVALID", "pre_commit", "Profile migration cannot alter canonical search receipts")
-
-    records = _appended_json(old_root, staged_root, audit_path)
-    ensure(len(records) == 1, "PROFILE_MIGRATION_RECEIPT_REQUIRED", "pre_commit", "Profile migration must append exactly one audit record")
-    record = records[0]
-    head = str(_git(root, "rev-parse", "HEAD")).strip()
-    ensure(record.get("kind") == "profile_migration", "PROFILE_MIGRATION_RECEIPT_INVALID", "pre_commit", "Invalid migration receipt kind")
-    ensure(str(record.get("id", "")).startswith("profile_pco_0_3_2_"), "PROFILE_MIGRATION_RECEIPT_INVALID", "pre_commit", "Invalid migration receipt id")
-    ensure(record.get("base_commit") == head, "BASE_COMMIT_CHANGED", "pre_commit", "Profile migration base is not HEAD")
-    ensure(record.get("profile_before") == "pco@0.3.1" and record.get("profile_after") == "pco@0.3.2", "PROFILE_MIGRATION_RECEIPT_INVALID", "pre_commit", "Migration receipt versions do not match")
-    ensure(
-        record.get("legacy_external_refs") == _legacy_external_refs(old_root, old_profile),
-        "PROFILE_MIGRATION_RECEIPT_INVALID",
-        "pre_commit",
-        "Migration receipt does not exactly account for legacy external references",
-    )
-    audited_paths = [marker_path, profile_path, schema_path, stream_path]
-    expected_hashes = {
-        path.as_posix(): "sha256:" + hashlib.sha256((staged_root / path).read_bytes()).hexdigest()
-        for path in audited_paths
-    }
-    ensure(record.get("changed_files") == expected_hashes, "PROFILE_MIGRATION_RECEIPT_INVALID", "pre_commit", "Migration receipt file hashes do not match the staged tree")
-    expected_changed = {
-        path.as_posix()
-        for path in audited_paths
-        if not (old_root / path).exists() or (old_root / path).read_bytes() != (staged_root / path).read_bytes()
-    }
-    expected_changed.add(audit_path.as_posix())
-    changed = set(str(_git(root, "diff", "--cached", "--name-only", "HEAD")).splitlines())
-    ensure(changed == expected_changed, "PROFILE_MIGRATION_PATH_MISMATCH", "pre_commit", "Staged paths do not exactly match the supported Profile migration")
-    return {"migration_id": record.get("id"), "profile": "pco@0.3.2"}
-
-
 def validate_repository(repo_root: Path) -> dict[str, object]:
     root = repo_root.resolve()
     staged_tree = str(_git(root, "write-tree")).strip()
@@ -267,12 +166,7 @@ def validate_repository(repo_root: Path) -> dict[str, object]:
         _materialize_tree(root, staged_tree, staged_root)
         profile = _load_profile(staged_root)
         validation = MemoryRepository(staged_root, profile).validate_all(root=staged_root)
-        changed = set(str(_git(root, "diff", "--cached", "--name-only", "HEAD")).splitlines())
-        increment = (
-            _verify_profile_migration(root, old_root, staged_root, profile)
-            if "transactions/profile-migrations.jsonl" in changed
-            else _verify_increment(root, old_root, staged_root, profile)
-        )
+        increment = _verify_increment(root, old_root, staged_root, profile)
         return {**validation, "increment": increment}
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import uuid
@@ -8,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from mem_core.errors import MemError, ensure
-from mem_core.models import utc_now
 from mem_core.profile import Profile
 from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
@@ -117,152 +115,19 @@ class Workspace:
         path = self.config.memory_root / "profiles" / self.profile.name
         return Profile.load(path, default_registry())
 
-    @staticmethod
-    def _legacy_external_refs(repo_root: Path, profile_raw: dict[str, Any]) -> list[dict[str, Any]]:
-        legacy: list[dict[str, Any]] = []
-        for stream in ("psychologies", "philosophies"):
-            relative = profile_raw.get("streams", {}).get(stream, {}).get("path")
-            if not relative:
-                continue
-            path = repo_root / relative
-            if not path.is_file():
-                continue
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                record = json.loads(line)
-                for index, reference in enumerate(record.get("payload", {}).get("external_refs", [])):
-                    legacy.append(
-                        {
-                            "stream": stream,
-                            "record_id": record.get("id"),
-                            "revision": record.get("revision"),
-                            "external_ref_index": index,
-                            "url": reference.get("url"),
-                            "search_receipt": reference.get("search_receipt"),
-                        }
-                    )
-        return sorted(
-            legacy,
-            key=lambda item: (
-                str(item["stream"]),
-                str(item["record_id"]),
-                int(item["revision"]),
-                int(item["external_ref_index"]),
-            ),
-        )
-
-    def _migrate_canonical_profile(self) -> str | None:
-        if self.profile.name != "pco":
-            return None
-        canonical_root = self.config.memory_root / "profiles" / "pco"
-        profile_file = canonical_root / "profile.yaml"
-        ensure(profile_file.is_file(), "PROFILE_NOT_FOUND", "profile_migration", f"Missing {profile_file}")
-        raw = yaml.safe_load(profile_file.read_text(encoding="utf-8"))
-        schema_relative = Path("profiles/pco/schemas/search-receipt.schema.json")
-        stream_relative = Path("sources/search-receipts.jsonl")
-        current_version = str(raw.get("version", ""))
-        has_stream = "search_receipts" in raw.get("streams", {})
-        has_schema = (self.config.memory_root / schema_relative).is_file()
-        if current_version == self.profile.version and has_stream and has_schema:
-            return None
-        ensure(
-            current_version == "0.3.1" and self.profile.version == "0.3.2",
-            "PROFILE_MIGRATION_UNSUPPORTED",
-            "profile_migration",
-            f"No automatic PCO Profile migration from {current_version} to {self.profile.version}",
-            recovery=["Install a supported intermediate PCO version or migrate the canonical Profile explicitly"],
-        )
-        self.repository.assert_clean()
+    def refresh_repository_profile(self) -> MemoryRepository:
+        canonical = self.canonical_profile()
         marker_path = self.config.memory_root / ".mem-profile.json"
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        ensure(
-            marker.get("name") == "pco" and marker.get("version") == current_version,
-            "PROFILE_MARKER_MISMATCH",
-            "profile_migration",
-            "Canonical Profile marker does not match the Profile being migrated",
-        )
-
-        migration_id = f"profile_pco_0_3_2_{uuid.uuid4().hex[:12]}"
-        worktree = self.config.state_root / "profile-migrations" / migration_id / "worktree"
-        base_commit = self.repository.head()
-        self.repository.remove_worktree(worktree)
-        self.repository.add_worktree(worktree, base_commit)
-        try:
-            migrated_profile_file = worktree / "profiles" / "pco" / "profile.yaml"
-            migrated_raw = yaml.safe_load(migrated_profile_file.read_text(encoding="utf-8"))
-            migrated_raw["version"] = self.profile.version
-            streams = migrated_raw.setdefault("streams", {})
-            streams["search_receipts"] = dict(self.profile.raw["streams"]["search_receipts"])
-            migrated_raw.setdefault("retrieval", {}).setdefault(
-                "candidate_count",
-                self.profile.raw.get("retrieval", {}).get("candidate_count", 200),
+        if canonical.name != marker.get("name") or canonical.version != marker.get("version"):
+            raise MemError(
+                "PROFILE_MARKER_MISMATCH",
+                "profile_load",
+                f"Canonical Profile {canonical.name}@{canonical.version} does not match .mem-profile.json",
+                path=str(marker_path),
+                recovery=["Recreate the workspace", "Restore a matching Profile version"],
             )
-            migrated_raw.setdefault("retrieval", {}).setdefault(
-                "candidate_overfetch_factor",
-                self.profile.raw.get("retrieval", {}).get("candidate_overfetch_factor", 4),
-            )
-            migrated_profile_file.write_text(
-                yaml.safe_dump(migrated_raw, allow_unicode=True, sort_keys=False),
-                encoding="utf-8",
-            )
-
-            migrated_schema = worktree / schema_relative
-            migrated_schema.parent.mkdir(parents=True, exist_ok=True)
-            migrated_schema.write_bytes((self.profile.root / "schemas" / "search-receipt.schema.json").read_bytes())
-            migrated_stream = worktree / stream_relative
-            migrated_stream.parent.mkdir(parents=True, exist_ok=True)
-            migrated_stream.touch(exist_ok=True)
-            migrated_marker_path = worktree / ".mem-profile.json"
-            migrated_marker = json.loads(migrated_marker_path.read_text(encoding="utf-8"))
-            migrated_marker["version"] = self.profile.version
-            migrated_marker_path.write_text(
-                json.dumps(migrated_marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-
-            changed_files = [
-                Path(".mem-profile.json"),
-                Path("profiles/pco/profile.yaml"),
-                schema_relative,
-                stream_relative,
-            ]
-            audit = {
-                "id": migration_id,
-                "kind": "profile_migration",
-                "base_commit": base_commit,
-                "profile_before": f"pco@{current_version}",
-                "profile_after": f"pco@{self.profile.version}",
-                "changed_files": {
-                    path.as_posix(): "sha256:" + hashlib.sha256((worktree / path).read_bytes()).hexdigest()
-                    for path in changed_files
-                },
-                "legacy_external_refs": self._legacy_external_refs(worktree, migrated_raw),
-                "applied_at": utc_now(),
-            }
-            audit_path = worktree / "transactions" / "profile-migrations.jsonl"
-            with audit_path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(audit, ensure_ascii=False, sort_keys=True) + "\n")
-            migrated_profile = Profile.load(worktree / "profiles" / "pco", default_registry())
-            MemoryRepository(worktree, migrated_profile).validate_all(root=worktree)
-            self.repository._git("add", "--", *(path.as_posix() for path in [*changed_files, Path("transactions/profile-migrations.jsonl")]), cwd=worktree)
-            self.repository._git(
-                "commit",
-                "-m",
-                "migrate canonical Profile to pco@0.3.2",
-                "-m",
-                "Add wrapper-authenticated search receipts before checkpoint workers can reference them.",
-                cwd=worktree,
-            )
-            commit = self.repository._git("rev-parse", "HEAD", cwd=worktree)
-            self.repository.fast_forward(commit)
-            return commit
-        finally:
-            self.repository.remove_worktree(worktree)
-
-    def refresh_repository_profile(self) -> MemoryRepository:
-        self._migrate_canonical_profile()
-        self.profile = self.canonical_profile()
+        self.profile = canonical
         self.profile_path = self.config.memory_root / "profiles" / self.profile.name
         self.repository = MemoryRepository(self.config.memory_root, self.profile)
         return self.repository
