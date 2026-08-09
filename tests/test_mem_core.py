@@ -47,6 +47,36 @@ def _message_record(native_id: str) -> dict:
     )
 
 
+def test_schema_validator_reused_within_profile(workspace) -> None:
+    profile = workspace.repository.profile
+    assert profile.schema_validator("messages") is profile.schema_validator("messages")
+
+
+def test_cached_schema_validator_still_reports_first_error_pointer(workspace) -> None:
+    record = {
+        "id": "msg_bad",
+        "revision": 1,
+        "recorded_at": NOW,
+        "schema_version": "conversation-message/v1",
+        "payload": {
+            "thread_id": "t",
+            "epoch_id": "e",
+            "harness": "h",
+            "native_session_id": "s",
+            "native_message_id": "n",
+            "role": "robot",
+            "kind": "conversation",
+            "content": "x",
+            "reasoning": None,
+            "refs": [],
+            "created_at": NOW,
+        },
+    }
+    with pytest.raises(MemError) as exc:
+        workspace.repository.profile.validate_record_schema("messages", record)
+    assert exc.value.detail.code == "SCHEMA_VALIDATION_FAILED"
+
+
 def test_messages_only_commit_still_rejects_append_only_violation(workspace) -> None:
     manager = TransactionManager(workspace.repository, workspace.config.state_root)
     state = manager.begin(fingerprint_context={"kind": "tamper_test"})

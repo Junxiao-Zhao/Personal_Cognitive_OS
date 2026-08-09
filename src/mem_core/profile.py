@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -76,6 +76,7 @@ class Profile:
     config: ProfileConfig
     registry: ProfileRegistry
     raw: dict[str, Any]
+    _schema_validators: dict[str, Draft202012Validator] = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
     def load(cls, root: Path, registry: ProfileRegistry | None = None) -> "Profile":
@@ -145,10 +146,15 @@ class Profile:
         return repo_root / self._safe_relative(self.stream(name).path)
 
     def schema_validator(self, name: str) -> Draft202012Validator:
+        cached = self._schema_validators.get(name)
+        if cached is not None:
+            return cached
         stream = self.stream(name)
         schema = json.loads((self.root / stream.schema_path).read_text(encoding="utf-8"))
         Draft202012Validator.check_schema(schema)
-        return Draft202012Validator(schema, format_checker=FormatChecker())
+        validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        self._schema_validators[name] = validator
+        return validator
 
     def validate_record_schema(self, stream_name: str, record: dict[str, Any]) -> None:
         stream = self.stream(stream_name)
@@ -162,7 +168,10 @@ class Profile:
             path="/schema_version",
             value=record.get("schema_version"),
         )
-        errors = sorted(self.schema_validator(stream_name).iter_errors(record), key=lambda e: list(e.absolute_path))
+        validator = self.schema_validator(stream_name)
+        if validator.is_valid(record):
+            return
+        errors = sorted(validator.iter_errors(record), key=lambda e: list(e.absolute_path))
         if errors:
             error = errors[0]
             pointer = "/" + "/".join(str(part).replace("~", "~0").replace("/", "~1") for part in error.absolute_path)
