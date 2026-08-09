@@ -160,6 +160,91 @@ def build_corpus(workspace: Workspace, args: argparse.Namespace) -> None:
     )
 
 
+def _message_record(native_id: str) -> dict:
+    return {
+        "id": f"msg_{native_id}",
+        "revision": 1,
+        "recorded_at": utc_now(),
+        "schema_version": "conversation-message/v1",
+        "payload": {
+            "thread_id": "thread_bench",
+            "epoch_id": "epoch_bench",
+            "harness": "benchmark",
+            "native_session_id": "ses_bench",
+            "native_message_id": native_id,
+            "role": "user",
+            "kind": "conversation",
+            "content": f"基准事务消息 {native_id}",
+            "reasoning": None,
+            "refs": [],
+            "created_at": utc_now(),
+        },
+    }
+
+
+def _structured_records() -> list[tuple[str, dict]]:
+    """Checkpoint-type transaction: user message + event + hypothesis + continuation."""
+    now = utc_now()
+    return [
+        (
+            "messages",
+            _message_record("native_bench_structured"),
+        ),
+        (
+            "events",
+            {
+                "id": "evt_bench_structured",
+                "revision": 1,
+                "recorded_at": now,
+                "schema_version": "pco/event/v1",
+                "payload": {
+                    "occurred_at": {"start": "2026-01-01", "end": "2026-01-01", "precision": "day"},
+                    "description": "结构化基准事件：公开前的拖延与对评价的厌恶。",
+                    "links": {"psychologies": [], "philosophies": [], "archetypes": []},
+                    "evidence_refs": ["message:msg_bench_000000"],
+                    "revision_reason": "benchmark structured transaction",
+                    "status": "active",
+                },
+            },
+        ),
+        (
+            "hypotheses",
+            {
+                "id": "hyp_bench_structured",
+                "revision": 1,
+                "recorded_at": now,
+                "schema_version": "pco/hypothesis/v1",
+                "payload": {
+                    "statement": "用户可能更厌恶被评价，而非单纯害怕失败。",
+                    "confidence": "low",
+                    "evidence_refs": ["message:msg_bench_000000"],
+                    "counter_evidence_refs": [],
+                    "status": "hypothesis",
+                    "policy_version": "promotion@0.3",
+                },
+            },
+        ),
+        (
+            "continuations",
+            {
+                "id": "continuation_current",
+                "revision": 1,
+                "recorded_at": now,
+                "schema_version": "pco/continuation/v1",
+                "payload": {
+                    "current_topics": ["公开成果前的拖延"],
+                    "open_questions": ["核心是害怕失败还是厌恶被评价？"],
+                    "active_tensions": [],
+                    "recent_decisions": [],
+                    "next_possible_directions": [],
+                    "message_range": {"after": None, "through": "msg_bench_000000"},
+                    "status": "active",
+                },
+            },
+        ),
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--messages", type=int, default=100_000)
@@ -186,41 +271,36 @@ def main() -> None:
         validate_seconds = round(time.monotonic() - started, 3)
 
         manager = TransactionManager(opened.repository, opened.config.state_root)
-        txn = manager.begin(
-            transaction_id="txn_benchmark_commit",
+        messages_txn = manager.begin(
+            transaction_id="txn_benchmark_messages",
             fingerprint_context={"kind": "benchmark"},
         )
         manager.append(
-            txn.id,
-            Operation(
-                op="append",
-                stream="messages",
-                record={
-                    "id": "msg_bench_commit",
-                    "revision": 1,
-                    "recorded_at": utc_now(),
-                    "schema_version": "conversation-message/v1",
-                    "payload": {
-                        "thread_id": "thread_bench",
-                        "epoch_id": "epoch_bench",
-                        "harness": "benchmark",
-                        "native_session_id": "ses_bench",
-                        "native_message_id": "native_bench_commit",
-                        "role": "user",
-                        "kind": "conversation",
-                        "content": "基准提交消息",
-                        "reasoning": None,
-                        "refs": [],
-                        "created_at": utc_now(),
-                    },
-                },
-            ),
+            messages_txn.id,
+            Operation(op="append", stream="messages", record=_message_record("native_bench_commit")),
         )
         started = time.monotonic()
-        commit_result = manager.commit(txn.id)
-        commit_seconds = round(time.monotonic() - started, 3)
+        messages_validation = manager.validate(messages_txn.id)
+        messages_validate_seconds = round(time.monotonic() - started, 3)
+        started = time.monotonic()
+        messages_commit_result = manager.commit(messages_txn.id)
+        messages_commit_seconds = round(time.monotonic() - started, 3)
 
-        search_seconds: float | None = None
+        structured_txn = manager.begin(
+            transaction_id="txn_benchmark_structured",
+            fingerprint_context={"kind": "checkpoint"},
+        )
+        for stream, record in _structured_records():
+            manager.append(structured_txn.id, Operation(op="append", stream=stream, record=record))
+        started = time.monotonic()
+        structured_validation = manager.validate(structured_txn.id)
+        structured_validate_seconds = round(time.monotonic() - started, 3)
+        started = time.monotonic()
+        structured_commit_result = manager.commit(structured_txn.id)
+        structured_commit_seconds = round(time.monotonic() - started, 3)
+
+        cold_search_seconds: float | None = None
+        warm_search_seconds: float | None = None
         search_error: str | None = None
         started = time.monotonic()
         try:
@@ -231,7 +311,16 @@ def main() -> None:
                 mode="current",
                 limit=10,
             )
-            search_seconds = round(time.monotonic() - started, 3)
+            cold_search_seconds = round(time.monotonic() - started, 3)
+            started = time.monotonic()
+            search(
+                repo_root=opened.config.memory_root,
+                indexes_root=opened.config.indexes_root,
+                query="拖延",
+                mode="current",
+                limit=10,
+            )
+            warm_search_seconds = round(time.monotonic() - started, 3)
         except MemError as exc:
             search_error = exc.detail.code
 
@@ -242,11 +331,38 @@ def main() -> None:
                 "concepts": args.concepts,
                 "sources": args.sources,
             },
-            "validate_seconds": validate_seconds,
-            "validation": {"ok": validation["ok"], "records": validation["records"]},
-            "commit_seconds": commit_seconds,
-            "commit": commit_result["commit"],
-            "search_seconds": search_seconds,
+            "validate_all": {
+                "mode": "full",
+                "seconds": validate_seconds,
+                "ok": validation["ok"],
+                "records": validation["records"],
+            },
+            "messages_validate": {
+                "mode": messages_validation["mode"],
+                "seconds": messages_validate_seconds,
+                "ok": messages_validation["ok"],
+                "records": messages_validation["records"],
+                "delta": messages_validation.get("delta"),
+            },
+            "messages_commit": {
+                "mode": "incremental",
+                "seconds": messages_commit_seconds,
+                "commit": messages_commit_result["commit"],
+            },
+            "structured_validate": {
+                "mode": structured_validation["mode"],
+                "seconds": structured_validate_seconds,
+                "ok": structured_validation["ok"],
+                "records": structured_validation["records"],
+                "delta": structured_validation.get("delta"),
+            },
+            "structured_commit": {
+                "mode": "incremental_validate_plus_full_hook",
+                "seconds": structured_commit_seconds,
+                "commit": structured_commit_result["commit"],
+            },
+            "cold_search": {"mode": "index_build_plus_query", "seconds": cold_search_seconds},
+            "warm_search": {"mode": "query_only", "seconds": warm_search_seconds},
             "search_error": search_error,
         }
         print(json.dumps(result, ensure_ascii=False, indent=2))
