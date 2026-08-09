@@ -9,8 +9,9 @@ import tempfile
 from pathlib import Path
 
 from .approval import verify_approval_receipt
+from .delta import is_messages_only, validate_delta_records
 from .errors import MemError, ensure
-from .models import ApprovalReceipt, Operation, RecordEnvelope, proposal_hash, transaction_fingerprint
+from .models import ApprovalReceipt, Operation, proposal_hash, transaction_fingerprint
 from .profile import Profile
 from .registry import default_registry
 from .repository import MemoryRepository
@@ -160,17 +161,8 @@ def _verify_increment(root: Path, profile: Profile, changed: set[str]) -> dict[s
     return {
         "transaction_id": transaction_record.get("id"),
         "operations": len(operations),
-        "messages_only": all(operation.op == "append" and operation.stream == "messages" for operation in operations),
+        "messages_only": is_messages_only(operations),
     }
-
-
-def _delta_validate_messages(profile: Profile, appended: list[dict[str, object]]) -> None:
-    for record in appended:
-        try:
-            RecordEnvelope.model_validate(record)
-        except Exception as exc:
-            raise MemError("ENVELOPE_INVALID", "envelope_validation", str(exc), stream="messages", record_id=record.get("id")) from exc
-        profile.validate_record_schema("messages", record)
 
 
 def _check_append_only(root: Path, profile: Profile) -> None:
@@ -193,7 +185,7 @@ def validate_repository(repo_root: Path) -> dict[str, object]:
         messages_path = profile.stream("messages").path
         if messages_path in changed:
             appended = _appended_json(_old_bytes(root, messages_path), _staged_bytes(root, messages_path), Path(messages_path))
-            _delta_validate_messages(profile, appended)
+            validate_delta_records(profile, {"messages": appended})
     increment = _verify_increment(root, profile, changed)
     if increment.get("messages_only"):
         validation: dict[str, object] = {

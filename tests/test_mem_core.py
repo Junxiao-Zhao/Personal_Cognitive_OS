@@ -77,6 +77,105 @@ def test_cached_schema_validator_still_reports_first_error_pointer(workspace) ->
     assert exc.value.detail.code == "SCHEMA_VALIDATION_FAILED"
 
 
+def test_messages_only_validate_is_incremental(workspace) -> None:
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    state = manager.begin(fingerprint_context={"kind": "delta"})
+    manager.append(state.id, Operation(op="append", stream="messages", record=_message_record("native_delta_1")))
+    validation = manager.validate(state.id)
+    assert validation["mode"] == "incremental"
+    assert validation["delta"] == {"messages": 1}
+    assert validation["records"] == 1
+
+
+def test_messages_only_validate_rejects_revision_collision(workspace) -> None:
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    first = manager.begin(transaction_id="txn_collision_a", fingerprint_context={"kind": "delta"})
+    manager.append(first.id, Operation(op="append", stream="messages", record=_message_record("native_collision")))
+    manager.commit(first.id)
+
+    second = manager.begin(transaction_id="txn_collision_b", fingerprint_context={"kind": "delta"})
+    manager.append(second.id, Operation(op="append", stream="messages", record=_message_record("native_collision")))
+    with pytest.raises(MemError) as exc:
+        manager.validate(second.id)
+    assert exc.value.detail.code == "REVISION_SEQUENCE_INVALID"
+
+
+def test_messages_only_validate_skips_historical_corruption(workspace) -> None:
+    path = workspace.config.memory_root / "raw" / "conversations" / "messages.jsonl"
+    original = path.read_text(encoding="utf-8")
+    path.write_text(original + '{"broken"\n{}\n', encoding="utf-8")
+    workspace.repository._git("add", ".")
+    workspace.repository._git("commit", "--no-verify", "-m", "fixture: corrupt history")
+    assert workspace.repository.is_clean()
+
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    state = manager.begin(fingerprint_context={"kind": "delta"})
+    manager.append(state.id, Operation(op="append", stream="messages", record=_message_record("native_after_corruption")))
+    validation = manager.validate(state.id)
+    assert validation["mode"] == "incremental"
+    assert validation["ok"] is True
+
+    with pytest.raises(MemError) as exc:
+        workspace.repository.verify()
+    assert exc.value.detail.code == "JSONL_INVALID"
+
+
+def test_messages_only_validate_skips_revision_check_when_baseline_corrupt(workspace) -> None:
+    # 历史：msg_native_rev_corrupt rev 1 之后跟一条损坏行（实际应为 rev 2，但不可解析）。
+    # 若按"容忍后的最新基线"继续断言，delta rev 3 会被误判 REVISION_SEQUENCE_INVALID；
+    # 基线不可靠时应跳过该流 delta 的 revision 连续性断言。
+    path = workspace.config.memory_root / "raw" / "conversations" / "messages.jsonl"
+    base = _message_record("native_rev_corrupt")
+    path.write_text(
+        json.dumps(base, ensure_ascii=False, sort_keys=True)
+        + '\n{"id":"msg_native_rev_corrupt","revision":2,"broken"\n',
+        encoding="utf-8",
+    )
+    workspace.repository._git("add", ".")
+    workspace.repository._git("commit", "--no-verify", "-m", "fixture: corrupt latest revision")
+    assert workspace.repository.is_clean()
+
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    state = manager.begin(fingerprint_context={"kind": "delta"})
+    manager.append(state.id, Operation(op="append", stream="messages", record={**base, "revision": 3}))
+    validation = manager.validate(state.id)
+    assert validation["mode"] == "incremental"
+    assert validation["ok"] is True
+
+
+def _user_message(workspace) -> dict:
+    """event() 的 evidence_refs 引用 message:msg_user_1，结构化测试必须先有这条消息。"""
+    return envelope(
+        "msg_user_1",
+        "conversation-message/v1",
+        {
+            "thread_id": workspace.thread().thread_id,
+            "epoch_id": workspace.thread().active_epoch_id,
+            "harness": "fake",
+            "native_session_id": "ses_fake",
+            "native_message_id": "native_user_1",
+            "role": "user",
+            "kind": "conversation",
+            "content": "这是用户证据。",
+            "reasoning": None,
+            "refs": [],
+            "created_at": NOW,
+        },
+    )
+
+
+def test_structured_validate_stays_full_until_task_3(workspace) -> None:
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    state = manager.begin(transaction_id="txn_structured", fingerprint_context={"kind": "checkpoint"})
+    manager.append(state.id, Operation(op="append", stream="messages", record=_user_message(workspace)))
+    manager.append(state.id, Operation(op="append", stream="events", record=event()))
+    validation = manager.validate(state.id)
+    assert validation["mode"] == "full"
+    # manager.validate() 在当前实现下对 worktree（base + delta）做 validate_all，
+    # records 含本次新增的 2 条；canonical 主库只有 base。fixture 新 workspace 为 0，故 + 2。
+    assert validation["records"] == workspace.repository.validate_all()["records"] + 2
+
+
 def test_messages_only_commit_still_rejects_append_only_violation(workspace) -> None:
     manager = TransactionManager(workspace.repository, workspace.config.state_root)
     state = manager.begin(fingerprint_context={"kind": "tamper_test"})

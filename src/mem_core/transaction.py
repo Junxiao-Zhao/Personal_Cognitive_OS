@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .approval import verify_approval_receipt
+from .delta import is_messages_only, latest_base_by_id, show_bytes, validate_delta_records
 from .errors import MemError, ensure
 from .models import (
     ApprovalReceipt,
@@ -211,8 +212,22 @@ class TransactionManager:
         protected = self.protected_streams(state)
         if require_approval:
             self._verify_approval(state, protected)
-        worktree = self._prepare_worktree(state)
-        validation = self.repository.validate_all(root=worktree)
+        profile = self.repository.profile
+        delta: dict[str, list[dict[str, Any]]] = {}
+        for op in state.operations:
+            if op.op == "append" and op.stream:
+                delta.setdefault(op.stream, []).append(op.record)
+        if is_messages_only(state.operations):
+            messages_path = profile.stream("messages").path
+            base_bytes = show_bytes(self.repository.root, state.base_commit, messages_path)
+            current, baseline_reliable = latest_base_by_id(base_bytes.decode("utf-8").splitlines())
+            # 基线不可靠（历史含损坏行）时跳过 revision 连续性断言，避免误拒合法 delta（D6）
+            count = validate_delta_records(profile, delta, {"messages": current} if baseline_reliable else None)
+            validation = {"ok": True, "profile": f"{profile.name}@{profile.version}", "mode": "incremental",
+                          "records": count, "delta": {name: len(records) for name, records in delta.items()}}
+        else:
+            worktree = self._prepare_worktree(state)
+            validation = {**self.repository.validate_all(root=worktree), "mode": "full"}
         state.status = "validated"
         state.validation = {
             **validation,
@@ -277,6 +292,9 @@ class TransactionManager:
         validation = self.validate(transaction_id, require_approval=True)
         state = self.load(transaction_id)
         worktree = self._worktree_path(transaction_id)
+        if not (worktree / ".git").exists():
+            # messages-only 快路径不建 worktree（validate 无副作用）；结构化路径已复用现有 worktree
+            worktree = self._prepare_worktree(state)
         transaction_record = {
             "id": state.id,
             "transaction_fingerprint": state.transaction_fingerprint,
