@@ -164,16 +164,27 @@ def _user_message(workspace) -> dict:
     )
 
 
-def test_structured_validate_stays_full_until_task_3(workspace) -> None:
+def test_structured_validate_is_incremental(workspace) -> None:
     manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    state = manager.begin(transaction_id="txn_structured", fingerprint_context={"kind": "checkpoint"})
+    state = manager.begin(transaction_id="txn_structured_delta", fingerprint_context={"kind": "checkpoint"})
+    # event() 的 evidence_refs 引用 message:msg_user_1，缺失时交叉校验会先抛 EVIDENCE_NOT_FOUND
     manager.append(state.id, Operation(op="append", stream="messages", record=_user_message(workspace)))
     manager.append(state.id, Operation(op="append", stream="events", record=event()))
     validation = manager.validate(state.id)
-    assert validation["mode"] == "full"
-    # manager.validate() 在当前实现下对 worktree（base + delta）做 validate_all，
-    # records 含本次新增的 2 条；canonical 主库只有 base。fixture 新 workspace 为 0，故 + 2。
-    assert validation["records"] == workspace.repository.validate_all()["records"] + 2
+    assert validation["mode"] == "incremental"
+    assert validation["delta"] == {"messages": 1, "events": 1}
+    assert validation["records"] == 2
+
+
+def test_structured_incremental_rejects_bad_delta_envelope(workspace) -> None:
+    manager = TransactionManager(workspace.repository, workspace.config.state_root)
+    record = event()
+    record["revision"] = 99
+    state = manager.begin(transaction_id="txn_bad_delta", fingerprint_context={"kind": "checkpoint"})
+    manager.append(state.id, Operation(op="append", stream="events", record=record))
+    with pytest.raises(MemError) as exc:
+        manager.validate(state.id)
+    assert exc.value.detail.code == "REVISION_SEQUENCE_INVALID"
 
 
 def test_messages_only_commit_still_rejects_append_only_violation(workspace) -> None:
