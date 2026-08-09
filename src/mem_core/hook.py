@@ -92,13 +92,20 @@ def _appended_json(old: bytes, new: bytes, relative: Path) -> list[dict[str, obj
         raise MemError("TRANSACTION_DELTA_INVALID", "pre_commit", str(exc), path=str(relative)) from exc
 
 
-def _verify_increment(root: Path, profile: Profile, changed: set[str]) -> dict[str, object]:
+def _verify_increment(
+    root: Path,
+    profile: Profile,
+    changed: set[str],
+    bytes_by_stream: dict[str, tuple[bytes, bytes]],
+    transaction_bytes: tuple[bytes, bytes],
+) -> dict[str, object]:
     actual_by_stream: dict[str, list[dict[str, object]]] = {}
     for name, stream in profile.config.streams.items():
         relative = Path(stream.path)
-        actual_by_stream[name] = _appended_json(_old_bytes(root, stream.path), _staged_bytes(root, stream.path), relative)
+        old, new = bytes_by_stream.get(name, (b"", b""))
+        actual_by_stream[name] = _appended_json(old, new, relative)
     transaction_path = Path("transactions/transactions.jsonl")
-    transaction_records = _appended_json(_old_bytes(root, transaction_path.as_posix()), _staged_bytes(root, transaction_path.as_posix()), transaction_path)
+    transaction_records = _appended_json(transaction_bytes[0], transaction_bytes[1], transaction_path)
     ensure(len(transaction_records) == 1, "TRANSACTION_RECEIPT_REQUIRED", "pre_commit", "A commit must append exactly one transaction receipt")
     transaction_record = transaction_records[0]
     try:
@@ -165,28 +172,39 @@ def _verify_increment(root: Path, profile: Profile, changed: set[str]) -> dict[s
     }
 
 
-def _check_append_only(root: Path, profile: Profile) -> None:
+def _check_append_only(
+    profile: Profile,
+    bytes_by_stream: dict[str, tuple[bytes, bytes]],
+    transaction_bytes: tuple[bytes, bytes],
+) -> None:
     """Byte-level append-only guard for every stream, checked before any
     envelope or receipt logic so historical tampering is always reported as
     APPEND_ONLY_VIOLATION."""
-    for stream in profile.config.streams.values():
+    for name, stream in profile.config.streams.items():
         relative = Path(stream.path)
-        _appended_json(_old_bytes(root, stream.path), _staged_bytes(root, stream.path), relative)
+        old, new = bytes_by_stream[name]
+        _appended_json(old, new, relative)
     transaction_path = Path("transactions/transactions.jsonl")
-    _appended_json(_old_bytes(root, transaction_path.as_posix()), _staged_bytes(root, transaction_path.as_posix()), transaction_path)
+    _appended_json(transaction_bytes[0], transaction_bytes[1], transaction_path)
 
 
 def validate_repository(repo_root: Path) -> dict[str, object]:
     root = repo_root.resolve()
     profile = _load_profile(root)
-    _check_append_only(root, profile)
     changed = set(str(_git(root, "diff", "--cached", "--name-only", "HEAD")).splitlines())
+    bytes_by_stream = {
+        name: (_old_bytes(root, stream.path), _staged_bytes(root, stream.path))
+        for name, stream in profile.config.streams.items()
+    }
+    transaction_path = "transactions/transactions.jsonl"
+    transaction_bytes = (_old_bytes(root, transaction_path), _staged_bytes(root, transaction_path))
+    _check_append_only(profile, bytes_by_stream, transaction_bytes)
     if "messages" in profile.config.streams:
         messages_path = profile.stream("messages").path
         if messages_path in changed:
-            appended = _appended_json(_old_bytes(root, messages_path), _staged_bytes(root, messages_path), Path(messages_path))
+            appended = _appended_json(bytes_by_stream["messages"][0], bytes_by_stream["messages"][1], Path(messages_path))
             validate_delta_records(profile, {"messages": appended})
-    increment = _verify_increment(root, profile, changed)
+    increment = _verify_increment(root, profile, changed, bytes_by_stream, transaction_bytes)
     if increment.get("messages_only"):
         validation: dict[str, object] = {
             "ok": True,
