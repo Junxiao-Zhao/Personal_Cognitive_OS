@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from collections import Counter
 from typing import Any
@@ -86,54 +87,90 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
     }
 
 
-def write_checkpoint_record(engine: Any, state: CheckpointState) -> None:
+def _checkpoint_derivations(state: CheckpointState) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for name, item in state.derivations.items():
+        entry: dict[str, Any] = {"ok": bool(item.get("ok", False))}
+        if not entry["ok"]:
+            entry["pending"] = True
+        if item.get("error"):
+            error = item["error"]
+            # Keep structured MemError details queryable in canonical memory
+            # (for example code/recovery/pointer), while retaining a safe
+            # fallback for arbitrary exception values.
+            try:
+                json.dumps(error, ensure_ascii=False)
+            except (TypeError, ValueError):
+                error = str(error)
+            entry["error"] = error
+        result[name] = entry
+    return result
+
+
+def _checkpoint_payload(engine: Any, state: CheckpointState) -> dict[str, Any]:
     workspace = engine.workspace
-    if workspace.repository.current_records("checkpoints").get(state.id) is not None:
-        return
-    pending = any(not item.get("ok", False) for item in state.derivations.values())
+    derivations = _checkpoint_derivations(state)
+    pending = any(not item["ok"] for item in derivations.values())
     binding = workspace.binding()
     approval = state.decision or ("not_required" if not state.protected_streams else "no")
+    return {
+        "thread_id": binding.thread_id,
+        "harness_binding_id": binding.id,
+        "parent_session_id": state.parent_session_id,
+        "archive_cursor": state.archive_cursor,
+        "source_hashes": state.source_hashes,
+        "worker": state.worker_handle,
+        "runtime": state.harness_runtime,
+        "trigger": state.trigger,
+        "status": "committed_with_pending_derivations" if pending else "committed",
+        "message_range": {"after": state.after_message_id, "through": state.through_message_id},
+        "transaction_id": state.transaction_id,
+        "git_commit": state.commit,
+        "operation_counts": dict(state.operation_counts),
+        "proposal_hash": state.proposal_hash,
+        "promotion_proposal_hash": state.promotion_proposal_hash,
+        "approval_decision": approval,
+        "protected_streams": state.protected_streams,
+        "promotion_protected_streams": state.promotion_protected_streams,
+        "meta_revision": state.meta_revision,
+        "continuation_revision": state.continuation_revision,
+        "derivations": derivations,
+        "versions": {
+            "profile": f"{workspace.profile.name}@{workspace.profile.version}",
+            "policy_hash": workspace.profile.policy_hash,
+            "workflow": "consolidate@0.3.1",
+            "skills": state.skill_versions,
+        },
+        "warnings": [],
+        "started_at": state.created_at,
+        "ended_at": utc_now(),
+        "retry_count": state.retries,
+    }
+
+
+def write_checkpoint_record(engine: Any, state: CheckpointState) -> None:
+    workspace = engine.workspace
+    current = workspace.repository.current_records("checkpoints").get(state.id)
+    payload = _checkpoint_payload(engine, state)
+    if current is not None:
+        current_payload = current.get("payload", {})
+        # Runtime timestamps and retry counters are not canonical state
+        # changes by themselves. Only an observable checkpoint outcome or
+        # derivation result warrants another append-only revision.
+        if (
+            current_payload.get("status") == payload["status"]
+            and current_payload.get("derivations") == payload["derivations"]
+        ):
+            return
+        revision = int(current["revision"]) + 1
+    else:
+        revision = 1
     record = {
         "id": state.id,
-        "revision": 1,
+        "revision": revision,
         "recorded_at": utc_now(),
         "schema_version": "pco/checkpoint/v1",
-        "payload": {
-            "thread_id": binding.thread_id,
-            "harness_binding_id": binding.id,
-            "parent_session_id": state.parent_session_id,
-            "archive_cursor": state.archive_cursor,
-            "source_hashes": state.source_hashes,
-            "worker": state.worker_handle,
-            "runtime": state.harness_runtime,
-            "trigger": state.trigger,
-            "status": "committed_with_pending_derivations" if pending else "committed",
-            "message_range": {"after": state.after_message_id, "through": state.through_message_id},
-            "transaction_id": state.transaction_id,
-            "git_commit": state.commit,
-            "operation_counts": dict(state.operation_counts),
-            "proposal_hash": state.proposal_hash,
-            "promotion_proposal_hash": state.promotion_proposal_hash,
-            "approval_decision": approval,
-            "protected_streams": state.protected_streams,
-            "promotion_protected_streams": state.promotion_protected_streams,
-            "meta_revision": state.meta_revision,
-            "continuation_revision": state.continuation_revision,
-            "derivations": {
-                name: ({"ok": True} if item.get("ok") else {"ok": False, "pending": True})
-                for name, item in state.derivations.items()
-            },
-            "versions": {
-                "profile": f"{workspace.profile.name}@{workspace.profile.version}",
-                "policy_hash": workspace.profile.policy_hash,
-                "workflow": "consolidate@0.3.1",
-                "skills": state.skill_versions,
-            },
-            "warnings": [],
-            "started_at": state.created_at,
-            "ended_at": utc_now(),
-            "retry_count": state.retries,
-        },
+        "payload": payload,
     }
     manager = TransactionManager(workspace.repository, workspace.config.state_root)
     txn = manager.begin(

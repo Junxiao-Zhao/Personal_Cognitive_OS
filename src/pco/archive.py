@@ -41,11 +41,12 @@ class ConversationArchive:
 
     def archive(self, messages: Iterable[dict[str, Any]]) -> dict[str, Any]:
         allowed = [message for message in messages if message.get("role") in {"user", "assistant"} and message.get("kind", "conversation") in {"conversation", "checkpoint_decision"}]
-        # The adapter returns messages strictly after the persisted cursor, so
-        # duplicates can only be the last committed batch (crash between commit
-        # and cursor update). Reading the canonical tail keeps dedup O(1)
-        # amortized instead of O(corpus) per turn.
-        tail_keys = self._tail_native_keys()
+        # The adapter returns messages strictly after the persisted cursor. If
+        # the process crashed between the canonical commit and cursor update,
+        # the complete committed batch is therefore at the canonical tail. The
+        # tail window must cover the whole adapter batch: a fixed-size window
+        # silently misses the beginning of batches larger than 64 messages.
+        tail_keys = self._tail_native_keys(limit=max(64, len(allowed)))
         records: list[dict[str, Any]] = []
         for message in allowed:
             record = self._record(message)
@@ -91,18 +92,40 @@ class ConversationArchive:
         self.workspace.save_thread(thread)
         return {"ok": True, "archived": len(records), "commit": result["commit"], "last_message_id": records[-1]["id"]}
 
-    def _tail_native_keys(self) -> set[tuple[str, str, str]]:
+    def _tail_native_keys(self, *, limit: int = 64) -> set[tuple[str, str, str]]:
         path = self.workspace.repository.profile.stream_path(self.workspace.config.memory_root, "messages")
         if not path.is_file():
             return set()
-        lines = path.read_text(encoding="utf-8").splitlines()
         keys: set[tuple[str, str, str]] = set()
-        for line in lines[-64:]:
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            payload = record["payload"]
-            keys.add((payload["harness"], payload["native_session_id"], payload["native_message_id"]))
+        # Read backwards so the normal path remains bounded by the requested
+        # tail size even when the canonical message stream is large.
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            position = handle.tell()
+            chunks: list[bytes] = []
+            newline_count = 0
+            chunk_size = 64 * 1024
+            # Read one extra delimiter when possible. The first line in the
+            # assembled buffer may begin in the middle of a JSONL record; its
+            # terminating newline must not consume one of the requested full
+            # tail records.
+            while position > 0 and newline_count <= limit:
+                size = min(chunk_size, position)
+                position -= size
+                handle.seek(position)
+                chunk = handle.read(size)
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+            data = b"".join(reversed(chunks))
+            lines = data.splitlines()
+            if position > 0 and lines:
+                lines = lines[1:]
+            lines = lines[-limit:]
+        for line in lines[-limit:]:
+            if line.strip():
+                record = json.loads(line.decode("utf-8"))
+                payload = record["payload"]
+                keys.add((payload["harness"], payload["native_session_id"], payload["native_message_id"]))
         return keys
 
     def archive_decision(

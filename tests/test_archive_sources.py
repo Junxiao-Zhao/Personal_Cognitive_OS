@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from pco.checkpoint import CheckpointEngine
@@ -54,6 +55,65 @@ def test_deduplicated_retry_recovers_archive_cursor(workspace) -> None:
     assert retried["archived"] == 0
     assert recovered.archive_cursor == "native_assistant_1"
     assert recovered.last_archived_message_id == "msg_assistant_1"
+
+
+def test_archive_deduplicates_a_large_crash_recovery_batch(workspace) -> None:
+    messages = [
+        {
+            "id": f"msg_{index}",
+            "native_message_id": f"native_{index}",
+            "role": "user" if index % 2 == 0 else "assistant",
+            "kind": "conversation",
+            "content": f"message {index}",
+        }
+        for index in range(600)
+    ]
+    archive = ConversationArchive(workspace)
+    assert archive.archive(messages)["archived"] == 600
+
+    # Simulate the crash window after canonical commit and before the cursor
+    # update. The retry must deduplicate the entire committed batch.
+    thread = workspace.thread()
+    thread.last_archived_message_id = None
+    thread.archive_cursor = None
+    workspace.save_thread(thread)
+
+    assert archive.archive(messages)["archived"] == 0
+    stored = list(workspace.repository.iter_records("messages"))
+    assert len(stored) == 600
+    assert len({record["payload"]["native_message_id"] for record in stored}) == 600
+    assert workspace.thread().archive_cursor == "native_599"
+
+
+def test_archive_tail_reader_discards_a_chunk_boundary_fragment(workspace) -> None:
+    archive = ConversationArchive(workspace)
+    path = workspace.repository.profile.stream_path(workspace.config.memory_root, "messages")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 100 records of exactly 1,025 bytes make the 64 KiB read begin 64 bytes
+    # into record 36. The first chunk therefore contains a truncated JSONL
+    # record whose terminating newline is part of the 64-line window.
+    lines: list[bytes] = []
+    for index in range(100):
+        message = {
+            "id": f"msg_{index:03d}",
+            "native_message_id": f"native_{index:03d}",
+            "role": "user",
+            "kind": "conversation",
+            "content": "",
+        }
+        while True:
+            record = archive._record(message)
+            line = json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
+            if len(line) >= 1025:
+                break
+            message["content"] += "x" * (1025 - len(line))
+        assert len(line) == 1025
+        lines.append(line)
+    path.write_bytes(b"".join(lines))
+
+    keys = archive._tail_native_keys(limit=64)
+    assert {key[2] for key in keys} == {f"native_{index:03d}" for index in range(36, 100)}
 
 
 def test_reasoning_is_not_fabricated_or_saved_when_disabled(workspace) -> None:

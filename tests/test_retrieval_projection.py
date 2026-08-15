@@ -269,7 +269,8 @@ def test_affine_failure_is_reported_after_commit_and_retry_is_idempotent(workspa
     workspace.config.checkpoint.derivations.projection = "affine"
     monkeypatch.delenv("PCO_AFFINE_COMMAND", raising=False)
     adapter, result = _seed(workspace)
-    committed = workspace.repository.head()
+    canonical_memory_commit = result["receipt"]["git_commit"]
+    checkpoint_record_commit = workspace.repository.head()
     assert result["status"] == "COMMITTED_WITH_PENDING_DERIVATIONS"
     assert result["receipt"]["derivations"]["projection"]["error"]["code"] == "AFFINE_BRIDGE_NOT_CONFIGURED"
     assert adapter.receipts[-1]["status"] == "RECEIPT_INSERTED"
@@ -279,7 +280,13 @@ def test_affine_failure_is_reported_after_commit_and_retry_is_idempotent(workspa
     monkeypatch.setenv("PCO_AFFINE_COMMAND", f"python {bridge}")
     retried = CheckpointEngine(workspace, adapter).retry_derivations()
     assert retried["status"] == "DONE"
-    assert workspace.repository.head() == committed
+    assert workspace.repository.head() != checkpoint_record_commit
+    checkpoint_record = workspace.repository.current_records("checkpoints")[result["checkpoint_id"]]
+    assert checkpoint_record["payload"]["git_commit"] == canonical_memory_commit
+    history = workspace.repository.record_history("checkpoints", result["checkpoint_id"])
+    assert history[0]["payload"]["derivations"]["projection"]["error"]["code"] == "AFFINE_BRIDGE_NOT_CONFIGURED"
+    assert history[1]["payload"]["derivations"]["projection"] == {"ok": True}
+    assert [record["revision"] for record in workspace.repository.record_history("checkpoints", result["checkpoint_id"])] == [1, 2]
     assert len(adapter.receipts) == 1
     persisted = workspace.load_json(f"checkpoints/{result['checkpoint_id']}/receipt.json")
     assert persisted["status"] == "DONE"

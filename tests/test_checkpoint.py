@@ -328,6 +328,17 @@ def test_worker_cleanup_failure_is_a_retryable_derivation(workspace) -> None:
     retried = engine.retry_derivations()
     assert retried["status"] == "DONE"
     assert retried["derivations"]["worker_cleanup"]["ok"]
+    history = workspace.repository.record_history("checkpoints", retried["checkpoint_id"])
+    assert [record["revision"] for record in history] == [1, 2]
+    assert history[0]["payload"]["status"] == "committed_with_pending_derivations"
+    assert history[1]["payload"]["status"] == "committed"
+    assert history[1]["payload"]["derivations"]["worker_cleanup"] == {"ok": True}
+
+    # A retry after the successful revision is idempotent and must not append
+    # another canonical checkpoint revision.
+    retried_again = engine.retry_derivations()
+    assert retried_again["status"] == "DONE"
+    assert [record["revision"] for record in workspace.repository.record_history("checkpoints", retried["checkpoint_id"])] == [1, 2]
 
 
 def test_unavailable_child_is_rebuilt_from_the_same_frozen_boundary(workspace) -> None:

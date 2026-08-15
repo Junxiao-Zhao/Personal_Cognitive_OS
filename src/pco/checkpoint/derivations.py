@@ -31,7 +31,7 @@ def cleanup_worker(engine: Any, state: CheckpointState) -> None:
 
 def run_derivations(engine: Any, state: CheckpointState) -> None:
     config = engine.workspace.config.checkpoint.derivations
-    if config.index:
+    if config.index and not state.derivations.get("index", {}).get("ok"):
         try:
             state.derivations["index"] = build_index(
                 repo_root=engine.workspace.config.memory_root,
@@ -39,7 +39,7 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
             )
         except Exception as exc:
             state.derivations["index"] = {"ok": False, "pending": True, "error": str(exc)}
-    if config.backlinks:
+    if config.backlinks and not state.derivations.get("backlinks", {}).get("ok"):
         try:
             state.derivations["backlinks"] = build_backlinks(
                 repo_root=engine.workspace.config.memory_root,
@@ -47,7 +47,7 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
             )
         except Exception as exc:
             state.derivations["backlinks"] = {"ok": False, "pending": True, "error": str(exc)}
-    if config.projection == "markdown":
+    if config.projection == "markdown" and not state.derivations.get("projection", {}).get("ok"):
         try:
             state.derivations["projection"] = project_markdown(
                 repo_root=engine.workspace.config.memory_root,
@@ -55,7 +55,7 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
             )
         except Exception as exc:
             state.derivations["projection"] = {"ok": False, "pending": True, "error": str(exc)}
-    elif config.projection == "affine":
+    elif config.projection == "affine" and not state.derivations.get("projection", {}).get("ok"):
         try:
             state.derivations["projection"] = project_affine(
                 repo_root=engine.workspace.config.memory_root,
