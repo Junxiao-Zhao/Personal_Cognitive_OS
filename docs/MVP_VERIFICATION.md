@@ -59,7 +59,10 @@ reproducible via `scripts/benchmark_corpus.py`; results and deviation analysis a
 ```bash
 pytest -q
 PCO_RUN_MILVUS=1 pytest -q -m milvus
-python -m pip wheel . --no-deps --no-build-isolation -w /tmp/pco-wheel-check
+
+# Build both distributions from the monorepo:
+python -m pip wheel packages/mem-core --no-deps --no-build-isolation -w /tmp/pco-wheel-check
+python -m pip wheel packages/pco --no-deps --no-build-isolation -w /tmp/pco-wheel-check
 
 # Run inside a temporary project after `pco install-opencode`:
 opencode debug config

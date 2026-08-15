@@ -11,8 +11,15 @@ PCO（Personal Cognitive OS）是一个本地优先、证据可追溯的单用�
 
 要求 Python 3.11+、Git 和 OpenCode。Milvus Lite 与 Tantivy 已作为 Python 依赖安装。
 
+项目拆分为两个 Python 分发包：
+
+- `packages/mem-core`：领域无关的 `mem-core`，提供 `mem` CLI；
+- `packages/pco`：PCO 应用层，依赖 `mem-core`，提供 `pco` CLI。
+
 ```bash
-python -m pip install -e '.[dev]'
+# 开发安装（mem-core 需先以 editable 安装，pco 才能解析本地依赖）
+python -m pip install -e packages/mem-core
+python -m pip install -e 'packages/pco[dev]'
 
 # 默认使用 AFFiNE 投影；未配置 bridge 时 canonical commit 仍会成功，投影标记 pending。
 pco --workspace .pco init --projection affine

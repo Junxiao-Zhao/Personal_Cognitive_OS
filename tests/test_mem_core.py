@@ -407,10 +407,7 @@ def test_pre_commit_hook_reuses_profile_validation(workspace) -> None:
         text=True,
         capture_output=True,
         check=False,
-        env={
-            **__import__("os").environ,
-            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-        },
+        env={**__import__("os").environ},
     )
     assert result.returncode == 1
     assert "ENVELOPE_INVALID" in result.stdout
@@ -451,7 +448,7 @@ def test_pre_commit_hook_rejects_schema_valid_historical_edit(workspace) -> None
         text=True,
         capture_output=True,
         check=False,
-        env={**__import__("os").environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        env={**__import__("os").environ},
     )
     assert result.returncode == 1
     assert "APPEND_ONLY_VIOLATION" in result.stdout
@@ -496,7 +493,7 @@ def test_pre_commit_hook_rejects_unreceipted_protected_append(workspace) -> None
         text=True,
         capture_output=True,
         check=False,
-        env={**__import__("os").environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        env={**__import__("os").environ},
     )
     assert result.returncode == 1
     assert "TRANSACTION_RECEIPT_REQUIRED" in result.stdout

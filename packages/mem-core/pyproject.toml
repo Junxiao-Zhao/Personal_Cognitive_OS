@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mem-core"
+version = "0.1.0"
+description = "Profile-neutral, append-only canonical memory core"
+requires-python = ">=3.11"
+dependencies = [
+  "jsonschema>=4.23",
+  "pydantic>=2.10",
+  "PyYAML>=6.0",
+]
+
+[project.scripts]
+mem = "mem_core.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mem_core"]

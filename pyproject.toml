@@ -1,50 +1,16 @@
-[build-system]
-requires = ["hatchling>=1.27"]
-build-backend = "hatchling.build"
-
-[project]
-name = "pco"
-version = "0.1.0"
-description = "PCO personal cognitive OS and its profile-neutral memory core"
-readme = "README.md"
-requires-python = ">=3.11"
-dependencies = [
-  "hydra-core>=1.3",
-  "httpx>=0.27",
-  "jsonschema>=4.23",
-  "json-repair>=0.61.7,<0.62",
-  "pydantic>=2.10",
-  "pymilvus[milvus-lite]>=3.0",
-  "PyYAML>=6.0",
-  "tantivy>=0.26",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=8", "pytest-cov>=6"]
-
-[project.scripts]
-mem = "mem_core.cli:main"
-pco = "pco.cli:main"
-
-[project.entry-points."mem_core.capabilities"]
-"pco.validate" = "pco.validation:validate_profile"
-"pco.retrieval.search" = "pco.retrieval:search"
-"pco.backlinks.build" = "pco.backlinks:build"
-"pco.context.render" = "pco.context:render"
-"pco.index.build" = "pco.retrieval:build_index"
-"pco.projection.markdown" = "pco.projections:project_markdown"
-"pco.projection.affine" = "pco.projections:project_affine"
-"research.validate" = "pco.research_profile:validate_profile"
-"research.retrieval.search" = "pco.research_profile:search"
-"research.projection.markdown" = "pco.research_profile:project_markdown"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/mem_core", "src/pco"]
+# Dev workspace tool configuration only.
+# Distributions live in:
+#   packages/mem-core  -> mem-core (mem_core package)
+#   packages/pco       -> pco (pco package)
+#
+# Install for development:
+#   python -m pip install -e packages/mem-core
+#   python -m pip install -e 'packages/pco[dev]'
 
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["packages/mem-core/src", "packages/pco/src"]
 markers = ["milvus: requires a local loopback port for Milvus Lite"]
 
 [tool.coverage.run]
