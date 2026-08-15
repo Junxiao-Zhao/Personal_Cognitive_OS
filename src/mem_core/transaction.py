@@ -7,13 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from .approval import verify_approval_receipt
-from .delta import is_messages_only, latest_base_by_id, show_bytes, validate_delta_records
+from .delta import is_messages_only, latest_base_by_id, show_bytes, validate_delta_records, validate_structured_delta
 from .errors import MemError, ensure
 from .models import (
     ApprovalReceipt,
     Operation,
-    RecordEnvelope,
-    latest_by_id,
     TransactionState,
     proposal_hash,
     protected_operations_hash,
@@ -229,32 +227,18 @@ class TransactionManager:
                           "records": count, "delta": {name: len(records) for name, records in delta.items()}}
         else:
             worktree = self._prepare_worktree(state)
-            # 严格 envelope 基线：canonical root（head == base_commit 已断言）。与 validate_all 同错码——
-            # JSON 语法损坏由 iter_records 抛 JSONL_INVALID；JSON 合法但缺 id/revision 或 envelope 非法的
-            # 历史记录由 RecordEnvelope.model_validate 抛 ENVELOPE_INVALID（而非裸 KeyError）。
-            base_records: dict[str, list[dict[str, Any]]] = {}
-            base_current: dict[str, dict[str, dict[str, Any]]] = {}
-            for stream in profile.config.streams:
-                records = list(self.repository.iter_records(stream))
-                for record in records:
-                    try:
-                        RecordEnvelope.model_validate(record)
-                    except Exception as exc:
-                        raise MemError(
-                            "ENVELOPE_INVALID",
-                            "envelope_validation",
-                            str(exc),
-                            stream=stream,
-                            record_id=record.get("id"),
-                        ) from exc
-                base_records[stream] = records
-                base_current[stream] = latest_by_id(records)
-            count = validate_delta_records(profile, delta, base_current)
-            # 交叉校验视图 = base + delta（与 worktree 内容逐行一致，且全部记录已过 envelope 校验）：
-            # 仅 base 视图会漏掉本次新增记录的 EVIDENCE_INELIGIBLE / EVIDENCE_REFERENCE_INVALID /
-            # EVIDENCE_REFERENCE_AMBIGUOUS / REFERENCE_NOT_FOUND 等全部检查。
-            merged = {stream: base_records[stream] + delta.get(stream, []) for stream in profile.config.streams}
-            profile.run_validators(worktree, merged)
+            # 严格 envelope 基线 + delta schema/revision + base+delta 合并 validator 视图。
+            # 与 validate_all 同错码，但不再重复校验全部历史 schema/revision。
+            base_records = {
+                stream: list(self.repository.iter_records(stream))
+                for stream in profile.config.streams
+            }
+            count = validate_structured_delta(
+                profile=profile,
+                base_records=base_records,
+                delta=delta,
+                root=worktree,
+            )
             validation = {"ok": True, "profile": f"{profile.name}@{profile.version}", "mode": "incremental",
                           "records": count, "delta": {name: len(records) for name, records in delta.items()}}
         state.status = "validated"

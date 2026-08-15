@@ -8,7 +8,7 @@ import pytest
 
 from mem_core.approval import verify_approval_receipt
 from mem_core.errors import MemError
-from mem_core.models import Operation, latest_by_id
+from mem_core.models import Operation, latest_by_id, proposal_hash, transaction_fingerprint
 from mem_core.profile import Profile
 from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
@@ -532,3 +532,92 @@ def test_txn_commit_dry_run_does_not_commit(workspace) -> None:
     loaded = manager.load(state.id)
     assert loaded.commit is None
     assert loaded.status == "validated"
+
+
+def _stage_structured_commit(workspace, *, event_record=None) -> dict:
+    """Stage a transaction-shaped structured change in the canonical repo.
+
+    This mirrors what TransactionManager.commit writes to the worktree, so the
+    pre-commit hook can be exercised directly without spawning a git commit.
+    """
+    from mem_core.hook import validate_repository
+
+    root = workspace.config.memory_root
+    profile = workspace.repository.profile
+    message = envelope(
+        "msg_hook_user",
+        "conversation-message/v1",
+        {
+            "thread_id": workspace.thread().thread_id,
+            "epoch_id": workspace.thread().active_epoch_id,
+            "harness": "fake",
+            "native_session_id": "ses_fake",
+            "native_message_id": "native_hook_user",
+            "role": "user",
+            "kind": "conversation",
+            "content": "这是 hook 增量校验测试的用户证据。",
+            "reasoning": None,
+            "refs": [],
+            "created_at": NOW,
+        },
+    )
+    evt = event_record or event()
+    evt["payload"]["evidence_refs"] = ["message:msg_hook_user"]
+    operations = [
+        Operation(op="append", stream="messages", record=message),
+        Operation(op="append", stream="events", record=evt),
+    ]
+    base_commit = workspace.repository.head()
+    fingerprint_context = {"kind": "hook_structured_incremental"}
+    transaction_record = {
+        "id": "txn_hook_structured",
+        "transaction_fingerprint": transaction_fingerprint(
+            base_commit=base_commit,
+            profile_name=profile.name,
+            profile_version=profile.version,
+            fingerprint_context=fingerprint_context,
+            operations=operations,
+        ),
+        "proposal_hash": proposal_hash(operations),
+        "base_commit": base_commit,
+        "profile": f"{profile.name}@{profile.version}",
+        "fingerprint_context": fingerprint_context,
+        "operation_count": len(operations),
+        "operations": [operation.normalized() for operation in operations],
+        "approval_receipt": None,
+        "committed_at": NOW,
+    }
+    for operation in operations:
+        stream = operation.stream or ""
+        path = profile.stream_path(root, stream)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(operation.record, ensure_ascii=False, sort_keys=True) + "\n")
+    transaction_path = root / "transactions" / "transactions.jsonl"
+    with transaction_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(transaction_record, ensure_ascii=False, sort_keys=True) + "\n")
+    workspace.repository._git("add", ".")
+    return {"validate_repository": validate_repository, "root": root, "operations": operations}
+
+
+def test_structured_pre_commit_hook_uses_incremental_validation(workspace, monkeypatch) -> None:
+    staged = _stage_structured_commit(workspace)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("MemoryRepository.validate_all must not run for structured incremental hook")
+
+    monkeypatch.setattr(MemoryRepository, "validate_all", _boom)
+    result = staged["validate_repository"](staged["root"])
+    assert result["mode"] == "incremental"
+    assert result["ok"] is True
+    assert result["increment"]["messages_only"] is False
+    assert result["increment"]["operations"] == 2
+
+
+def test_structured_pre_commit_hook_still_runs_cross_validators(workspace) -> None:
+    bad = event()
+    bad["payload"]["links"]["psychologies"] = ["psy_missing"]
+    staged = _stage_structured_commit(workspace, event_record=bad)
+    with pytest.raises(MemError) as exc:
+        staged["validate_repository"](staged["root"])
+    assert exc.value.detail.code == "REFERENCE_NOT_FOUND"

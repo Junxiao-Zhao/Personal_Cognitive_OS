@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import MemError, ensure
-from .models import Operation, RecordEnvelope
+from .models import Operation, RecordEnvelope, latest_by_id
 from .profile import Profile
 
 
@@ -79,4 +79,42 @@ def validate_delta_records(
                 stream_current[envelope.id] = record
             profile.validate_record_schema(stream, record)
             count += 1
+    return count
+
+
+def validate_structured_delta(
+    *,
+    profile: Profile,
+    base_records: dict[str, list[dict[str, Any]]],
+    delta: dict[str, list[dict[str, Any]]],
+    root: Path,
+) -> int:
+    """Validate a structured transaction against base + delta records.
+
+    Historical records are strict-envelope checked only (cheap), delta records
+    get envelope + schema + revision continuity, and Profile Validators run on
+    the merged base + delta view so cross-record references behave exactly like
+    a full validation of the materialized staged tree.
+    """
+    base_current: dict[str, dict[str, dict[str, Any]]] = {}
+    for stream in profile.config.streams:
+        records = base_records.get(stream, [])
+        for record in records:
+            try:
+                RecordEnvelope.model_validate(record)
+            except Exception as exc:
+                raise MemError(
+                    "ENVELOPE_INVALID",
+                    "envelope_validation",
+                    str(exc),
+                    stream=stream,
+                    record_id=record.get("id"),
+                ) from exc
+        base_current[stream] = latest_by_id(records)
+    count = validate_delta_records(profile, delta, base_current)
+    merged = {
+        stream: base_records.get(stream, []) + delta.get(stream, [])
+        for stream in profile.config.streams
+    }
+    profile.run_validators(root, merged)
     return count

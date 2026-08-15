@@ -9,12 +9,11 @@ import tempfile
 from pathlib import Path
 
 from .approval import verify_approval_receipt
-from .delta import is_messages_only, validate_delta_records
+from .delta import is_messages_only, validate_delta_records, validate_structured_delta
 from .errors import MemError, ensure
-from .models import ApprovalReceipt, Operation, proposal_hash, transaction_fingerprint
+from .models import ApprovalReceipt, Operation, RecordEnvelope, proposal_hash, transaction_fingerprint
 from .profile import Profile
 from .registry import default_registry
-from .repository import MemoryRepository
 
 
 def _git(root: Path, *args: str, text: bool = True) -> str | bytes:
@@ -46,8 +45,11 @@ def _staged_bytes(root: Path, relative: str) -> bytes:
         return b""
 
 
-def _materialize_tree(root: Path, revision: str, target: Path) -> None:
-    archive = _git(root, "archive", "--format=tar", revision, text=False)
+def _extract_archive(root: Path, revision: str, target: Path, paths: list[str] | None = None) -> None:
+    command = ["archive", "--format=tar", revision]
+    if paths:
+        command.extend(["--", *paths])
+    archive = _git(root, *command, text=False)
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
         resolved_target = target.resolve()
         for member in bundle.getmembers():
@@ -169,6 +171,7 @@ def _verify_increment(
         "transaction_id": transaction_record.get("id"),
         "operations": len(operations),
         "messages_only": is_messages_only(operations),
+        "delta_by_stream": actual_by_stream,
     }
 
 
@@ -186,6 +189,66 @@ def _check_append_only(
         _appended_json(old, new, relative)
     transaction_path = Path("transactions/transactions.jsonl")
     _appended_json(transaction_bytes[0], transaction_bytes[1], transaction_path)
+
+
+def _base_records_from_bytes(
+    profile: Profile,
+    bytes_by_stream: dict[str, tuple[bytes, bytes]],
+) -> dict[str, list[dict[str, object]]]:
+    """Parse the base (HEAD) JSONL bytes with strict envelope validation.
+
+    This is the cheap historical guard for structured incremental validation:
+    only envelope shape is checked, matching the transaction-side hot path.
+    Schema/revision correctness of history is owned by the append-only guard,
+    `mem git verify`, `mem doctor`, and `mem profile validate`.
+    """
+    base_records: dict[str, list[dict[str, object]]] = {}
+    for stream_name, stream in profile.config.streams.items():
+        old, _new = bytes_by_stream[stream_name]
+        records: list[dict[str, object]] = []
+        for line_number, line in enumerate(old.decode("utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise MemError(
+                    "JSONL_INVALID",
+                    "envelope_validation",
+                    str(exc),
+                    stream=stream_name,
+                    path=f"{stream.path}:{line_number}",
+                ) from exc
+            try:
+                RecordEnvelope.model_validate(record)
+            except Exception as exc:
+                raise MemError(
+                    "ENVELOPE_INVALID",
+                    "envelope_validation",
+                    str(exc),
+                    stream=stream_name,
+                    record_id=record.get("id"),
+                ) from exc
+            records.append(record)
+        base_records[stream_name] = records
+    return base_records
+
+
+def _materialize_artifact_roots(
+    root: Path,
+    staged_tree: str,
+    profile: Profile,
+    target: Path,
+) -> None:
+    """Materialize only Profile artifact roots from the staged tree.
+
+    Custom Validators may read artifact files (e.g. source snapshots). Full
+    JSONL streams are not materialized; they are validated from bytes plus the
+    transaction-shaped delta instead.
+    """
+    if not profile.config.artifact_roots:
+        return
+    _extract_archive(root, staged_tree, target, list(profile.config.artifact_roots))
 
 
 def validate_repository(repo_root: Path) -> dict[str, object]:
@@ -213,11 +276,25 @@ def validate_repository(repo_root: Path) -> dict[str, object]:
         }
     else:
         staged_tree = str(_git(root, "write-tree")).strip()
+        base_records = _base_records_from_bytes(profile, bytes_by_stream)
+        delta_by_stream = increment["delta_by_stream"]
         with tempfile.TemporaryDirectory(prefix="mem-core-hook-") as temporary:
             staged_root = Path(temporary) / "staged"
             staged_root.mkdir()
-            _materialize_tree(root, staged_tree, staged_root)
-            validation = MemoryRepository(staged_root, profile).validate_all(root=staged_root)
+            _materialize_artifact_roots(root, staged_tree, profile, staged_root)
+            count = validate_structured_delta(
+                profile=profile,
+                base_records=base_records,
+                delta=delta_by_stream,
+                root=staged_root,
+            )
+        validation = {
+            "ok": True,
+            "profile": f"{profile.name}@{profile.version}",
+            "mode": "incremental",
+            "records": count,
+            "delta": {name: len(records) for name, records in delta_by_stream.items() if records},
+        }
     return {**validation, "increment": increment}
 
 

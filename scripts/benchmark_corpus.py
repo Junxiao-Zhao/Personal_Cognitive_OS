@@ -357,7 +357,7 @@ def main() -> None:
                 "delta": structured_validation.get("delta"),
             },
             "structured_commit": {
-                "mode": "incremental_validate_plus_full_hook",
+                "mode": "incremental_validate_plus_incremental_hook",
                 "seconds": structured_commit_seconds,
                 "commit": structured_commit_result["commit"],
             },
