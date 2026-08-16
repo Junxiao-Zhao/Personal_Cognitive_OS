@@ -11,7 +11,7 @@ from pco.harness import FakeHarnessAdapter, WorkerResult
 from pco.retrieval import search
 from pco.sources import SourceManager
 
-from conftest import NOW, continuation, envelope, hypothesis, meta, visible_messages
+from conftest import NOW, approval_grant, continuation, envelope, hypothesis, meta, visible_messages
 
 
 needs_loopback = pytest.mark.skipif(
@@ -116,7 +116,11 @@ def test_ac01_source_cold_start_commits_four_classes_meta_and_continuation(works
     assert proposal["status"] == "AWAITING_META_APPROVAL"
     assert not workspace.repository.current_records("meta_revisions")
 
-    result = engine.decide("yes")
+    result = engine.decide(
+        "yes",
+        approval_grant=approval_grant(proposal["proposal"]),
+        session_id=adapter.session_id,
+    )
     assert result["status"] == "DONE"
     for stream in ("events", "psychologies", "philosophies", "archetypes", "hypotheses", "meta_revisions", "continuations"):
         assert workspace.repository.current_records(stream), stream
@@ -140,8 +144,12 @@ def test_ac11_natural_language_correction_keeps_history_and_updates_current_meta
         worker=lambda _payload: WorkerResult(first_operations),
     )
     first_engine = CheckpointEngine(workspace, first_adapter)
-    first_engine.request("manual")
-    first_engine.decide("yes")
+    first_pending = first_engine.request("manual")
+    first_engine.decide(
+        "yes",
+        approval_grant=approval_grant(first_pending["proposal"]),
+        session_id=first_adapter.session_id,
+    )
 
     correction_messages = [
         {
@@ -187,7 +195,11 @@ def test_ac11_natural_language_correction_keeps_history_and_updates_current_meta
     second_engine = CheckpointEngine(workspace, second_adapter)
     pending = second_engine.request("manual")
     assert pending["approval_required"]
-    second_engine.decide("yes")
+    second_engine.decide(
+        "yes",
+        approval_grant=approval_grant(pending["proposal"]),
+        session_id=second_adapter.session_id,
+    )
 
     history = workspace.repository.record_history("hypotheses", "hyp_evaluation")
     assert [record["revision"] for record in history] == [1, 2]

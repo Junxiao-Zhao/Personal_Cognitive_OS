@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from mem_core.errors import MemError
+from mem_core.errors import MemError, ensure
 
 from .archive import ConversationArchive
 from .backlinks import build as build_backlinks
@@ -53,10 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     request = checkpoint_commands.add_parser("request")
     request.add_argument("--trigger", choices=["manual", "auto"], default="manual")
     checkpoint_commands.add_parser("auto-if-needed")
+    checkpoint_commands.add_parser("auto-probe")
     decide = checkpoint_commands.add_parser("decide")
     decide.add_argument("--decision", choices=["yes", "no"], required=True)
     decide.add_argument("--reason")
     decide.add_argument("--decision-message-id")
+    decide.add_argument("--approval-grant")
     checkpoint_commands.add_parser("status")
     checkpoint_commands.add_parser("retry")
     checkpoint_commands.add_parser("abort")
@@ -175,11 +177,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if not engine.should_auto_checkpoint():
                 return {"ok": True, "triggered": False, "context_usage": adapter.estimate_context_usage()}
             return {"triggered": True, **engine.request("auto")}
+        if args.checkpoint_command == "auto-probe":
+            return {"ok": True, "needed": engine.should_auto_checkpoint(), "context_usage": adapter.estimate_context_usage()}
         if args.checkpoint_command == "decide":
+            if args.decision == "yes":
+                ensure(args.approval_grant, "APPROVAL_GRANT_REQUIRED", "approval", "Approval must come from the host-issued approval interaction")
             return engine.decide(
                 args.decision,
                 reason=args.reason,
                 native_message_id=args.decision_message_id,
+                approval_grant=args.approval_grant,
+                session_id=args.session_id,
             )
         if args.checkpoint_command == "status":
             return engine.status()

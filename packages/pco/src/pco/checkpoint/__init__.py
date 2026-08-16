@@ -143,8 +143,17 @@ class CheckpointEngine:
         *,
         reason: str | None = None,
         native_message_id: str | None = None,
+        approval_grant: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
-        return approval_steps.decide(self, decision, reason=reason, native_message_id=native_message_id)
+        return approval_steps.decide(
+            self,
+            decision,
+            reason=reason,
+            native_message_id=native_message_id,
+            approval_grant=approval_grant,
+            session_id=session_id,
+        )
 
     def retry(self) -> dict[str, Any]:
         return recovery_steps.retry(self)

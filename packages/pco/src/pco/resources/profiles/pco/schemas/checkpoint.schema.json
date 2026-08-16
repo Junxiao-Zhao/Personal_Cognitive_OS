@@ -49,7 +49,10 @@
           }
         },
         "transaction_id": {"type": "string", "minLength": 1},
+        "audit_transaction_id": {"type": ["string", "null"]},
         "git_commit": {"type": ["string", "null"]},
+        "content_commit": {"type": ["string", "null"]},
+        "derivation_source_commit": {"type": ["string", "null"]},
         "operation_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
         "proposal_hash": {"type": "string", "pattern": "^sha256:"},
         "promotion_proposal_hash": {"type": ["string", "null"], "pattern": "^sha256:"},

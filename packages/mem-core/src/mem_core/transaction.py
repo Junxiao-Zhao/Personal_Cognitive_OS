@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .approval import verify_approval_receipt
-from .delta import is_messages_only, latest_base_by_id, show_bytes, validate_delta_records, validate_structured_delta
+from .delta import is_fast_path, latest_base_by_id, show_bytes, validate_delta_records, validate_structured_delta
 from .errors import MemError, ensure
 from .models import (
     ApprovalReceipt,
@@ -141,6 +141,8 @@ class TransactionManager:
         proposal_hash_value: str,
         decision_message_id: str | None = None,
         receipt_id: str | None = None,
+        authorization_id: str | None = None,
+        authorization_source: str | None = None,
     ) -> ApprovalReceipt:
         state = self.load(transaction_id)
         protected = self.protected_streams(state)
@@ -163,6 +165,8 @@ class TransactionManager:
             protected_operations_hash=protected_operations_hash(state.operations, protected),
             decided_at=utc_now(),
             decision_message_id=decision_message_id,
+            authorization_id=authorization_id,
+            authorization_source=authorization_source,
         )
         state.approval_receipt = receipt
         self._save(state)
@@ -217,12 +221,17 @@ class TransactionManager:
         for op in state.operations:
             if op.op == "append" and op.stream:
                 delta.setdefault(op.stream, []).append(op.record)
-        if is_messages_only(state.operations):
-            messages_path = profile.stream("messages").path
-            base_bytes = show_bytes(self.repository.root, state.base_commit, messages_path)
-            current, baseline_reliable = latest_base_by_id(base_bytes.decode("utf-8").splitlines())
-            # 基线不可靠（历史含损坏行）时跳过 revision 连续性断言，避免误拒合法 delta（D6）
-            count = validate_delta_records(profile, delta, {"messages": current} if baseline_reliable else None)
+        if is_fast_path(profile, state.operations):
+            current: dict[str, dict[str, dict[str, Any]]] = {}
+            for stream_name in delta:
+                stream_path = profile.stream(stream_name).path
+                base_bytes = show_bytes(self.repository.root, state.base_commit, stream_path)
+                stream_current, baseline_reliable = latest_base_by_id(base_bytes.decode("utf-8").splitlines())
+                # 基线不可靠（历史含损坏行）时跳过该 stream 的 revision
+                # 连续性断言，避免误拒合法 delta（D6）。
+                if baseline_reliable:
+                    current[stream_name] = stream_current
+            count = validate_delta_records(profile, delta, current)
             validation = {"ok": True, "profile": f"{profile.name}@{profile.version}", "mode": "incremental",
                           "records": count, "delta": {name: len(records) for name, records in delta.items()}}
         else:

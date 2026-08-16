@@ -10,7 +10,7 @@ from typing import Any
 from mem_core.errors import ensure
 from mem_core.models import Operation, proposal_hash
 
-from ..harness import WORKER_RESULT_SCHEMA, WorkerResult
+from ..harness import WORKER_RESULT_SCHEMA, WorkerResult, normalize_external_url, receipt_result_urls
 from . import finalize as finalize_steps
 from . import state as state_store
 from .state import CheckpointState
@@ -33,11 +33,17 @@ def worker_profile_contract(engine: Any) -> dict[str, Any]:
         "profile": f"{profile.name}@{profile.version}",
         "policy_hash": profile.policy_hash,
         "operation_contract": WORKER_RESULT_SCHEMA,
+        "source_materialization": {
+            "owner": "wrapper",
+            "reader_contract": ["locator", "reader", "normalized_content", "media_type", "read_metadata"],
+            "snapshot_write_permission": False,
+        },
         "allowed_streams": streams,
         "required_invariants": [
             "Every append operation includes an allowed stream and a record matching that stream's complete JSON Schema.",
             "Produce exactly one continuations append operation for every successful consolidate or rejection revision.",
             "Do not output messages, sources, or checkpoints operations; the wrapper owns those streams.",
+            "Do not output source snapshot write_artifact operations; source materialization and snapshots belong to the wrapper.",
             "Assistant messages are context only and cannot be used as user evidence.",
             "Only meta_revisions is protected and it is a proposal until wrapper approval.",
         ],
@@ -145,6 +151,11 @@ def effective_search_receipts(engine: Any, state: CheckpointState, result: Worke
             "Captured search receipt id was reused with different content",
             record_id=receipt_id,
         )
+        # Keep historical v1 receipts as v1.  This only enriches a receipt
+        # arriving through the current worker-result boundary so the existing
+        # v1 fixture remains readable without changing the schema identity of
+        # old canonical receipts.
+        receipt_result_urls(receipt)
         by_id[receipt_id] = receipt
     return list(by_id.values())
 
@@ -234,11 +245,11 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
         if operation.op != "append" or operation.stream not in {"psychologies", "philosophies"} or operation.record is None:
             continue
         for external_ref in operation.record.get("payload", {}).get("external_refs", []):
-            url = external_ref.get("url", "")
+            url = normalize_external_url(external_ref.get("url", ""))
             matches = [
                 receipt
                 for receipt in search_receipts
-                if url and url in json.dumps(receipt.get("payload", {}), ensure_ascii=False, sort_keys=True, default=str)
+                if url and url in receipt_result_urls(receipt)
             ]
             if matches:
                 # The wrapper, not worker-authored free text, binds the
@@ -302,6 +313,8 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
     state.transaction_fingerprint = txn_state.transaction_fingerprint
     state.proposal_hash = reviewed_proposal_hash
     state.transaction_proposal_hash = txn_state.proposal_hash
+    if protected_operations and state.approval_challenge_id is None:
+        state.approval_challenge_id = f"challenge_{uuid.uuid4().hex}"
     state.protected_streams = validation["protected_streams"]
     proposal = {
         "checkpoint_id": state.id,
@@ -316,6 +329,7 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
         "protected_streams": state.protected_streams,
         "proposal_hash": state.proposal_hash,
         "transaction_proposal_hash": state.transaction_proposal_hash,
+        "approval_challenge_id": state.approval_challenge_id,
         "transaction_fingerprint": state.transaction_fingerprint,
         "diagnostics": result.diagnostics,
         "protected_diff": protected_diff(engine, operations),

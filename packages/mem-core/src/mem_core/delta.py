@@ -21,8 +21,43 @@ def show_bytes(root: Path, commit: str, path: str) -> bytes:
     return b"" if result.returncode else result.stdout
 
 
-def is_messages_only(operations: Iterable[Operation]) -> bool:
-    return all(op.op == "append" and op.stream == "messages" for op in operations)
+def is_fast_path(profile: Profile, operations: Iterable[Operation]) -> bool:
+    """Return whether operations are covered by their Profile stream policies.
+
+    A fast-path transaction is deliberately narrow: it may only append records
+    and every affected stream must explicitly opt into delta-only validation
+    without cross-record validators.  The stream name is never part of this
+    decision.
+    """
+    operations = list(operations)
+    return bool(operations) and all(
+        operation.op == "append"
+        and operation.stream is not None
+        and profile.uses_delta_fast_path(operation.stream)
+        for operation in operations
+    )
+
+
+def is_messages_only(
+    profile_or_operations: Profile | Iterable[Operation],
+    operations: Iterable[Operation] | Profile | None = None,
+) -> bool:
+    """Compatibility name for the former fast-path predicate.
+
+    New callers should use :func:`is_fast_path`.  The two-argument forms
+    support both ``(profile, operations)`` and ``(operations, profile)`` while
+    retaining the old one-argument shape as a conservative append-only check.
+    The legacy form has no Profile policy available, so it is not used by the
+    transaction or hook paths.
+    """
+    if isinstance(profile_or_operations, Profile):
+        ensure(isinstance(operations, Iterable), "VALIDATION_POLICY_REQUIRED", "transaction_validation", "Profile operations are required")
+        return is_fast_path(profile_or_operations, operations)
+    if isinstance(operations, Profile):
+        return is_fast_path(operations, profile_or_operations)
+    if operations is not None:
+        raise TypeError("is_messages_only expects (profile, operations) or (operations, profile)")
+    return bool(profile_or_operations) and all(operation.op == "append" for operation in profile_or_operations)
 
 
 def latest_base_by_id(lines: Iterable[str]) -> tuple[dict[str, dict[str, Any]], bool]:
@@ -65,7 +100,10 @@ def validate_delta_records(
     """Envelope + schema (+ revision continuity when current is provided) for delta records only."""
     count = 0
     for stream, records in delta.items():
-        stream_current = current.get(stream, {}) if current is not None else None
+        # A missing stream entry means its tolerant historical baseline was
+        # unreliable; validate its delta without making a possibly false
+        # revision-continuity assertion.  Full validation remains strict.
+        stream_current = current.get(stream) if current is not None and stream in current else None
         for record in records:
             try:
                 envelope = RecordEnvelope.model_validate(record)

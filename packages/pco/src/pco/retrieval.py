@@ -15,7 +15,7 @@ from mem_core.repository import MemoryRepository
 from mem_core.errors import MemError
 
 from .backlinks import build as build_backlinks
-from .repo_loader import profile_for_repo, repository_for_repo
+from .repo_loader import profile_for_repo, repository_at, repository_for_repo
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]")
@@ -288,12 +288,15 @@ def _merge_no_proxy(value: str | None) -> str:
     return ",".join(entries)
 
 
-def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = False, **_: Any) -> dict[str, Any]:
+def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = False, source_commit: str | None = None, **_: Any) -> dict[str, Any]:
     repo_root = Path(repo_root)
-    repository = repository_for_repo(repo_root)
+    with repository_at(repo_root, source_commit) as repository:
+        return _build_index_repository(repository, repo_root, Path(indexes_root), force, source_commit or repository.head())
+
+
+def _build_index_repository(repository: Any, repo_root: Path, indexes_root: Path, force: bool, commit: str) -> dict[str, Any]:
     profile = repository.profile
-    commit = repository.head()
-    generation = Path(indexes_root) / "generations" / commit
+    generation = indexes_root / "generations" / commit
     manifest_path = generation / "manifest.json"
     if manifest_path.exists() and not force:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -303,7 +306,7 @@ def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = Fals
     generation.mkdir(parents=True, exist_ok=True)
     docs = _documents(repository)
     (generation / "documents.json").write_text(json.dumps(docs, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    backlink_result = build_backlinks(repo_root=repo_root, output_path=generation / "backlinks.json")
+    backlink_result = build_backlinks(repo_root=repo_root, output_path=generation / "backlinks.json", memory_commit=commit)
     try:
         _build_tantivy(generation / "tantivy", docs)
     except MemError:
@@ -337,7 +340,7 @@ def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = Fals
         "backlinks": len(backlink_result["backlinks"]),
     }
     (generation / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    active = Path(indexes_root) / "active.json"
+    active = indexes_root / "active.json"
     active.parent.mkdir(parents=True, exist_ok=True)
     temporary = active.with_suffix(".tmp")
     temporary.write_text(json.dumps({"generation": commit, "manifest": str(generation / "manifest.json")}, sort_keys=True), encoding="utf-8")

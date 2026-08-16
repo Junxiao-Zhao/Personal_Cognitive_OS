@@ -24,7 +24,7 @@ def retry(engine: Any) -> dict[str, Any]:
     state.retries += 1
     state.error = None
     state.failure_phase = None
-    if state.commit:
+    if state.content_commit or state.commit:
         state_store.transition(engine, state, "MEMORY_COMMITTED")
         return finalize_steps.finalize_committed(engine, state)
     try:
@@ -66,7 +66,9 @@ def retry(engine: Any) -> dict[str, Any]:
 
 def retry_derivations(engine: Any) -> dict[str, Any]:
     state = state_store.load(engine)
-    ensure(state.commit is not None, "CHECKPOINT_NOT_COMMITTED", "derivations", "Checkpoint has no canonical commit")
+    ensure(state.content_commit or state.commit is not None, "CHECKPOINT_NOT_COMMITTED", "derivations", "Checkpoint has no canonical commit")
+    state.retries += 1
+    state_store.save(engine, state)
     if not state.input_unlocked:
         engine.adapter.unlock_input()
         state.input_unlocked = True

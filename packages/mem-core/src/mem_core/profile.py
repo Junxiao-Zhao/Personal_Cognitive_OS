@@ -5,13 +5,27 @@ import importlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Literal
 
 import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import BaseModel, ConfigDict, Field
 
 from .errors import MemError, ensure
+
+
+class ValidationPolicy(BaseModel):
+    """Validation behavior for a stream's transaction hot path.
+
+    The defaults preserve the original behavior for Profiles that predate the
+    policy: transactions use the structured incremental path and run Profile
+    cross-record validators.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    transaction_mode: Literal["delta_only", "structured"] = "structured"
+    run_cross_validators: bool = True
 
 
 class StreamConfig(BaseModel):
@@ -22,6 +36,7 @@ class StreamConfig(BaseModel):
     schema_version: str
     write_policy: str = Field(pattern="^(auto|user_approval|read_only)$")
     approval_ref_pointer: str | None = None
+    validation: ValidationPolicy = Field(default_factory=ValidationPolicy)
 
 
 class ProfileConfig(BaseModel):
@@ -144,6 +159,11 @@ class Profile:
 
     def stream_path(self, repo_root: Path, name: str) -> Path:
         return repo_root / self._safe_relative(self.stream(name).path)
+
+    def uses_delta_fast_path(self, name: str) -> bool:
+        """Whether a stream opts into the cheap transaction validation path."""
+        policy = self.stream(name).validation
+        return policy.transaction_mode == "delta_only" and not policy.run_cross_validators
 
     def schema_validator(self, name: str) -> Draft202012Validator:
         cached = self._schema_validators.get(name)

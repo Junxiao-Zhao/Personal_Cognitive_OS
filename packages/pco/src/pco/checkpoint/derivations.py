@@ -31,11 +31,13 @@ def cleanup_worker(engine: Any, state: CheckpointState) -> None:
 
 def run_derivations(engine: Any, state: CheckpointState) -> None:
     config = engine.workspace.config.checkpoint.derivations
+    source_commit = state.content_commit or state.commit
     if config.index and not state.derivations.get("index", {}).get("ok"):
         try:
             state.derivations["index"] = build_index(
                 repo_root=engine.workspace.config.memory_root,
                 indexes_root=engine.workspace.config.indexes_root,
+                source_commit=source_commit,
             )
         except Exception as exc:
             state.derivations["index"] = {"ok": False, "pending": True, "error": str(exc)}
@@ -43,7 +45,8 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
         try:
             state.derivations["backlinks"] = build_backlinks(
                 repo_root=engine.workspace.config.memory_root,
-                output_path=engine.workspace.config.state_root / "derivations" / f"backlinks-{state.commit}.json",
+                output_path=engine.workspace.config.state_root / "derivations" / f"backlinks-{state.content_commit or state.commit}.json",
+                memory_commit=source_commit,
             )
         except Exception as exc:
             state.derivations["backlinks"] = {"ok": False, "pending": True, "error": str(exc)}
@@ -52,6 +55,7 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
             state.derivations["projection"] = project_markdown(
                 repo_root=engine.workspace.config.memory_root,
                 output_root=engine.workspace.config.projection_root,
+                source_commit=source_commit,
             )
         except Exception as exc:
             state.derivations["projection"] = {"ok": False, "pending": True, "error": str(exc)}
@@ -60,6 +64,7 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
             state.derivations["projection"] = project_affine(
                 repo_root=engine.workspace.config.memory_root,
                 state_root=engine.workspace.config.state_root,
+                source_commit=source_commit,
             )
         except Exception as exc:
             state.derivations["projection"] = {"ok": False, "pending": True, "error": str(exc)}

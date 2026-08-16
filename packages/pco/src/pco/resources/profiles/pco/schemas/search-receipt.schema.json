@@ -18,6 +18,11 @@
         "tool": {"enum": ["websearch", "webfetch"]},
         "input": {"type": "object"},
         "output_excerpt": {"type": "string", "maxLength": 4000},
+        "result_urls": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^https?://[^\\s<>\\\"'`]+$"}
+        },
         "status": {"const": "completed"}
       }
     }

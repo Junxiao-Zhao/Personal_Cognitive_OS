@@ -18,7 +18,8 @@ from .state import CheckpointState
 def commit_and_finalize(engine: Any, state: CheckpointState) -> dict[str, Any]:
     ensure(state.transaction_id is not None, "CHECKPOINT_STATE_INVALID", "commit", "Missing transaction")
     result = engine.manager.commit(state.transaction_id)
-    state.commit = result["commit"]
+    state.content_commit = result["commit"]
+    state.commit = state.content_commit
     thread = engine.workspace.thread()
     thread.last_consolidated_message_id = (
         state.decision_message_id
@@ -69,6 +70,10 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
         "transaction_proposal_hash": state.transaction_proposal_hash,
         "transaction_fingerprint": state.transaction_fingerprint,
         "git_commit": state.commit,
+        "content_commit": state.content_commit or state.commit,
+        "derivation_source_commit": state.content_commit or state.commit,
+        "audit_commit": state.audit_commit,
+        "audit_transaction_id": state.audit_transaction_id,
         "meta_updated": meta_updated,
         "meta_revision": state.meta_revision,
         "continuation_updated": counts.get("continuations", 0) > 0,
@@ -107,7 +112,7 @@ def _checkpoint_derivations(state: CheckpointState) -> dict[str, dict[str, Any]]
     return result
 
 
-def _checkpoint_payload(engine: Any, state: CheckpointState) -> dict[str, Any]:
+def _checkpoint_payload(engine: Any, state: CheckpointState, *, audit_transaction_id: str | None = None) -> dict[str, Any]:
     workspace = engine.workspace
     derivations = _checkpoint_derivations(state)
     pending = any(not item["ok"] for item in derivations.values())
@@ -125,7 +130,10 @@ def _checkpoint_payload(engine: Any, state: CheckpointState) -> dict[str, Any]:
         "status": "committed_with_pending_derivations" if pending else "committed",
         "message_range": {"after": state.after_message_id, "through": state.through_message_id},
         "transaction_id": state.transaction_id,
+        "audit_transaction_id": audit_transaction_id or state.audit_transaction_id,
         "git_commit": state.commit,
+        "content_commit": state.content_commit or state.commit,
+        "derivation_source_commit": state.content_commit or state.commit,
         "operation_counts": dict(state.operation_counts),
         "proposal_hash": state.proposal_hash,
         "promotion_proposal_hash": state.promotion_proposal_hash,
@@ -148,10 +156,51 @@ def _checkpoint_payload(engine: Any, state: CheckpointState) -> dict[str, Any]:
     }
 
 
-def write_checkpoint_record(engine: Any, state: CheckpointState) -> None:
+def _restore_audit_provenance(engine: Any, state: CheckpointState, payload: dict[str, Any]) -> str:
+    """Recover audit metadata after a commit-before-state-save crash."""
+
+    audit_transaction_id = state.audit_transaction_id or payload.get("audit_transaction_id")
+    ensure(
+        isinstance(audit_transaction_id, str) and audit_transaction_id,
+        "CHECKPOINT_AUDIT_PROVENANCE_MISSING",
+        "checkpoint",
+        "Existing checkpoint record has no audit transaction ID",
+    )
+    audit_commit = state.audit_commit or payload.get("audit_commit")
+    if not audit_commit:
+        manager = TransactionManager(engine.workspace.repository, engine.workspace.config.state_root)
+        try:
+            audit_commit = manager.load(audit_transaction_id).commit
+        except Exception:
+            # The transaction state is normally durable before manager.commit
+            # returns. Keep a Git-log fallback for recovery from a partially
+            # restored state directory.
+            audit_commit = engine.workspace.repository._git(
+                "log",
+                "--all",
+                "--format=%H",
+                "--fixed-strings",
+                "--grep",
+                f"memory transaction {audit_transaction_id}",
+                "-1",
+            )
+    ensure(
+        isinstance(audit_commit, str) and audit_commit,
+        "CHECKPOINT_AUDIT_PROVENANCE_MISSING",
+        "checkpoint",
+        "Existing audit transaction has no commit hash",
+    )
+    state.audit_transaction_id = audit_transaction_id
+    state.audit_commit = audit_commit
+    state_store.save(engine, state)
+    return audit_commit
+
+
+def write_checkpoint_record(engine: Any, state: CheckpointState) -> str | None:
     workspace = engine.workspace
     current = workspace.repository.current_records("checkpoints").get(state.id)
-    payload = _checkpoint_payload(engine, state)
+    audit_transaction_id = f"txn_checkpoint_{state.id[5:17]}_{uuid.uuid4().hex[:8]}"
+    payload = _checkpoint_payload(engine, state, audit_transaction_id=audit_transaction_id)
     if current is not None:
         current_payload = current.get("payload", {})
         # Runtime timestamps and retry counters are not canonical state
@@ -160,8 +209,9 @@ def write_checkpoint_record(engine: Any, state: CheckpointState) -> None:
         if (
             current_payload.get("status") == payload["status"]
             and current_payload.get("derivations") == payload["derivations"]
+            and current_payload.get("audit_transaction_id")
         ):
-            return
+            return _restore_audit_provenance(engine, state, current_payload)
         revision = int(current["revision"]) + 1
     else:
         revision = 1
@@ -174,11 +224,15 @@ def write_checkpoint_record(engine: Any, state: CheckpointState) -> None:
     }
     manager = TransactionManager(workspace.repository, workspace.config.state_root)
     txn = manager.begin(
-        transaction_id=f"txn_checkpoint_{state.id[5:17]}_{uuid.uuid4().hex[:8]}",
+        transaction_id=audit_transaction_id,
         fingerprint_context={"kind": "checkpoint_result", "checkpoint_id": state.id},
     )
     manager.append(txn.id, Operation(op="append", stream="checkpoints", record=record))
-    manager.commit(txn.id)
+    result = manager.commit(txn.id)
+    state.audit_transaction_id = txn.id
+    state.audit_commit = result["commit"]
+    state_store.save(engine, state)
+    return state.audit_commit
 
 
 def finalize_committed(engine: Any, state: CheckpointState) -> dict[str, Any]:
@@ -203,6 +257,22 @@ def finalize_committed(engine: Any, state: CheckpointState) -> dict[str, Any]:
         state.status = "COMMITTED_CONTEXT_PENDING"
         state_store.recover(engine, state, exc, preserve_status=True)
         raise
+    state_store.transition(engine, state, "DERIVATIONS_RUNNING")
+    derivations_steps.run_derivations(engine, state)
+    # Cleanup is deliberately performed after the first runtime receipt so the
+    # user-input unlock ordering remains stable. Mark it pending now so the
+    # first audit revision truthfully advertises the replaceable boundary.
+    if state.worker_handle and "worker_cleanup" not in state.derivations:
+        state.derivations["worker_cleanup"] = {"ok": False, "pending": True}
+        state_store.save(engine, state)
+    pending = any(not item.get("ok", False) for item in state.derivations.values())
+    state.completed_at = utc_now()
+    final_status = "COMMITTED_WITH_PENDING_DERIVATIONS" if pending else "DONE"
+    state_store.transition(engine, state, final_status)
+    # The audit record is written after derivations have observed the content
+    # commit, but before the harness receipt is emitted. This makes the
+    # runtime receipt and the durable receipt agree on audit_commit.
+    write_checkpoint_record(engine, state)
     try:
         if not state.receipt_inserted:
             state_store.transition(engine, state, "RECEIPT_INSERTED")
@@ -213,18 +283,21 @@ def finalize_committed(engine: Any, state: CheckpointState) -> dict[str, Any]:
         if not state.input_unlocked:
             engine.adapter.unlock_input()
             state.input_unlocked = True
-            state_store.transition(engine, state, "INPUT_UNLOCKED")
+        state_store.transition(engine, state, final_status)
     except Exception as exc:
         state.status = "COMMITTED_CONTEXT_PENDING"
         state_store.recover(engine, state, exc, preserve_status=True)
         raise
-    state_store.transition(engine, state, "DERIVATIONS_RUNNING")
-    derivations_steps.run_derivations(engine, state)
+    # Worker cleanup is a replaceable post-commit housekeeping step. Keeping it
+    # after unlock preserves the historical receipt/lock ordering while the
+    # generated derivations above remain pinned to content_commit.
     derivations_steps.cleanup_worker(engine, state)
-    pending = any(not item.get("ok", False) for item in state.derivations.values())
-    state.completed_at = utc_now()
-    state_store.transition(engine, state, "COMMITTED_WITH_PENDING_DERIVATIONS" if pending else "DONE")
-    write_checkpoint_record(engine, state)
+    cleanup_pending = any(not item.get("ok", False) for item in state.derivations.values())
+    cleanup_status = "COMMITTED_WITH_PENDING_DERIVATIONS" if cleanup_pending else "DONE"
+    if cleanup_status != final_status:
+        state.completed_at = utc_now()
+        state_store.transition(engine, state, cleanup_status)
+        write_checkpoint_record(engine, state)
     current_receipt = receipt(engine, state)
     workspace.save_json(f"checkpoints/{state.id}/receipt.json", current_receipt)
     return {"ok": True, "checkpoint_id": state.id, "status": state.status, "receipt": current_receipt}

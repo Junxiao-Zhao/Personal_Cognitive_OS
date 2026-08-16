@@ -59,12 +59,17 @@ class CheckpointState(BaseModel):
     transaction_fingerprint: str | None = None
     proposal_hash: str | None = None
     transaction_proposal_hash: str | None = None
+    approval_challenge_id: str | None = None
     protected_streams: list[str] = Field(default_factory=list)
     promotion_proposal_hash: str | None = None
     promotion_protected_streams: list[str] = Field(default_factory=list)
     worker_handle: dict[str, str] | None = None
     decision: Literal["yes", "no"] | None = None
     decision_message_id: str | None = None
+    # ``commit`` is retained as a compatibility alias for content_commit.
+    content_commit: str | None = None
+    audit_commit: str | None = None
+    audit_transaction_id: str | None = None
     commit: str | None = None
     context_bundle: dict[str, Any] | None = None
     context_published: bool = False
@@ -111,11 +116,15 @@ def status(engine: Any) -> dict[str, Any]:
     if not active_path(engine).exists():
         return {"ok": True, "active": False}
     state = load(engine)
-    return {
+    result = {
         "ok": True,
         "active": state.status not in TERMINAL_STATUSES,
         "checkpoint": state.model_dump(mode="json"),
     }
+    proposal_path = checkpoint_dir(engine, state.id) / "proposal.json"
+    if proposal_path.is_file() and state.status == "AWAITING_META_APPROVAL":
+        result["proposal"] = engine.workspace.load_json(f"checkpoints/{state.id}/proposal.json")
+    return result
 
 
 def should_auto_checkpoint(engine: Any) -> bool:

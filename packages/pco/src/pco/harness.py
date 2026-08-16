@@ -2,17 +2,101 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from json_repair import repair_json
 
 from mem_core.errors import MemError, ensure
 from mem_core.models import Operation
+
+
+_EXTERNAL_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
+
+
+def normalize_external_url(value: Any) -> str | None:
+    """Return the comparison form used for external-reference provenance."""
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().rstrip(".,;:!?)]}")
+    if not candidate:
+        return None
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+            return None
+        port = parsed.port
+    except ValueError:
+        return None
+    netloc = hostname.lower()
+    if parsed.username is not None or parsed.password is not None:
+        credentials = parsed.username or ""
+        if parsed.password is not None:
+            credentials += f":{parsed.password}"
+        netloc = f"{credentials}@{netloc}"
+    if port is not None and not ((parsed.scheme.lower() == "http" and port == 80) or (parsed.scheme.lower() == "https" and port == 443)):
+        netloc = f"{netloc}:{port}"
+    path = parsed.path or "/"
+    return urlunsplit((parsed.scheme.lower(), netloc, path, parsed.query, ""))
+
+
+def extract_result_urls(tool: str, tool_input: Any, tool_output: Any, *, status: str, error: Any = None) -> list[str]:
+    """Extract only wrapper-observed result URLs from a completed tool call.
+
+    Search results come exclusively from the tool output.  Fetch results use
+    only the requested target URL, and only after a successful completion.
+    """
+    if status != "completed" or error:
+        return []
+    if tool == "websearch":
+        if isinstance(tool_output, str):
+            output_text = tool_output
+        else:
+            output_text = json.dumps(tool_output, ensure_ascii=False, sort_keys=True, default=str)
+        candidates = _EXTERNAL_URL_RE.findall(output_text)
+    elif tool == "webfetch":
+        candidates = [tool_input.get("url")] if isinstance(tool_input, dict) else []
+    else:
+        candidates = []
+    normalized = {url for candidate in candidates if (url := normalize_external_url(candidate))}
+    return sorted(normalized)
+
+
+def receipt_result_urls(receipt: dict[str, Any]) -> list[str]:
+    """Read or minimally backfill result_urls on a newly captured receipt.
+
+    v1 receipts already in the repository are not re-versioned.  The fallback
+    is only for an incoming wrapper capture whose output fields predate the
+    result_urls extension; it records the derived list while retaining v1.
+    """
+    payload = receipt.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    if "result_urls" in payload:
+        raw_urls = payload["result_urls"]
+        if not isinstance(raw_urls, list):
+            return []
+        urls = [url for item in raw_urls if (url := normalize_external_url(item))]
+        if len(urls) != len(raw_urls):
+            return []
+        payload["result_urls"] = sorted(set(urls))
+        return payload["result_urls"]
+    urls = extract_result_urls(
+        str(payload.get("tool", "")),
+        payload.get("input", {}),
+        payload.get("output_excerpt", ""),
+        status=str(payload.get("status", "")),
+    )
+    if urls:
+        payload["result_urls"] = urls
+    return urls
 
 
 WORKER_RESULT_SCHEMA: dict[str, Any] = {
@@ -477,6 +561,13 @@ class OpenCodeAdapter:
             call_id = str(part.get("callID") or part.get("id") or "")
             tool_input = state.get("input", {})
             tool_output = state.get("output", "")
+            result_urls = extract_result_urls(
+                tool_name,
+                tool_input,
+                tool_output,
+                status=str(state.get("status", "")),
+                error=state.get("error"),
+            )
             digest = hashlib.sha256(
                 json.dumps(
                     {"call_id": call_id, "tool": tool_name, "input": tool_input, "output": tool_output},
@@ -497,6 +588,7 @@ class OpenCodeAdapter:
                         "tool": tool_name,
                         "input": tool_input,
                         "output_excerpt": str(tool_output)[:4000],
+                        "result_urls": result_urls,
                         "status": "completed",
                     },
                 }

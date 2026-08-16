@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from .approval import verify_approval_receipt
-from .delta import is_messages_only, validate_delta_records, validate_structured_delta
+from .delta import is_fast_path, validate_delta_records, validate_structured_delta
 from .errors import MemError, ensure
 from .models import ApprovalReceipt, Operation, RecordEnvelope, proposal_hash, transaction_fingerprint
 from .profile import Profile
@@ -106,6 +106,11 @@ def _verify_increment(
         relative = Path(stream.path)
         old, new = bytes_by_stream.get(name, (b"", b""))
         actual_by_stream[name] = _appended_json(old, new, relative)
+        if actual_by_stream[name] and profile.uses_delta_fast_path(name):
+            # Preserve the cheap, useful error for malformed fast-path
+            # records even when a caller bypasses the transaction receipt.
+            # The same policy is applied later to the authorized delta.
+            validate_delta_records(profile, {name: actual_by_stream[name]})
     transaction_path = Path("transactions/transactions.jsonl")
     transaction_records = _appended_json(transaction_bytes[0], transaction_bytes[1], transaction_path)
     ensure(len(transaction_records) == 1, "TRANSACTION_RECEIPT_REQUIRED", "pre_commit", "A commit must append exactly one transaction receipt")
@@ -170,7 +175,10 @@ def _verify_increment(
     return {
         "transaction_id": transaction_record.get("id"),
         "operations": len(operations),
-        "messages_only": is_messages_only(operations),
+        # Keep the old result key for consumers that inspect hook diagnostics;
+        # its value is now Profile-driven and domain-neutral.
+        "fast_path": is_fast_path(profile, operations),
+        "messages_only": is_fast_path(profile, operations),
         "delta_by_stream": actual_by_stream,
     }
 
@@ -262,17 +270,19 @@ def validate_repository(repo_root: Path) -> dict[str, object]:
     transaction_path = "transactions/transactions.jsonl"
     transaction_bytes = (_old_bytes(root, transaction_path), _staged_bytes(root, transaction_path))
     _check_append_only(profile, bytes_by_stream, transaction_bytes)
-    if "messages" in profile.config.streams:
-        messages_path = profile.stream("messages").path
-        if messages_path in changed:
-            appended = _appended_json(bytes_by_stream["messages"][0], bytes_by_stream["messages"][1], Path(messages_path))
-            validate_delta_records(profile, {"messages": appended})
     increment = _verify_increment(root, profile, changed, bytes_by_stream, transaction_bytes)
-    if increment.get("messages_only"):
+    if increment.get("fast_path"):
+        delta_by_stream = increment["delta_by_stream"]
+        count = validate_delta_records(
+            profile,
+            {name: records for name, records in delta_by_stream.items() if records},
+        )
         validation: dict[str, object] = {
             "ok": True,
             "profile": f"{profile.name}@{profile.version}",
             "mode": "incremental",
+            "records": count,
+            "delta": {name: len(records) for name, records in delta_by_stream.items() if records},
         }
     else:
         staged_tree = str(_git(root, "write-tree")).strip()

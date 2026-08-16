@@ -6,6 +6,8 @@ from urllib.parse import urlparse
 
 from mem_core.models import latest_by_id
 
+from .harness import normalize_external_url
+
 
 def _problem(
     code: str,
@@ -76,13 +78,21 @@ def validate_profile(
                 parsed = urlparse(ref.get("url", ""))
                 receipt_id = ref.get("search_receipt")
                 receipt = search_receipts.get(receipt_id) if isinstance(receipt_id, str) else None
-                receipt_text = str(receipt.get("payload", {})) if receipt else ""
+                receipt_payload = receipt.get("payload", {}) if receipt else {}
+                result_urls = receipt_payload.get("result_urls") if isinstance(receipt_payload, dict) else None
+                normalized_result_urls = {
+                    normalized
+                    for item in result_urls or []
+                    if (normalized := normalize_external_url(item))
+                } if isinstance(result_urls, list) else set()
+                normalized_ref = normalize_external_url(ref.get("url", ""))
                 if (
                     parsed.scheme not in {"http", "https"}
                     or not parsed.netloc
                     or receipt is None
-                    or receipt["payload"].get("status") != "completed"
-                    or ref.get("url", "") not in receipt_text
+                    or receipt_payload.get("status") != "completed"
+                    or normalized_ref is None
+                    or normalized_ref not in normalized_result_urls
                 ):
                     yield _problem(
                         "EXTERNAL_REFERENCE_INVALID",

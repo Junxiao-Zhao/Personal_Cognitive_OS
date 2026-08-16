@@ -15,7 +15,7 @@ from pco.harness import FakeHarnessAdapter, WorkerResult
 from pco.projections import _page, _projection_path, project_affine, project_markdown
 from pco.retrieval import _chunks, build_index, search, tokenize
 
-from conftest import NOW, continuation, envelope, event, hypothesis, meta, visible_messages
+from conftest import NOW, approval_grant, continuation, envelope, event, hypothesis, meta, visible_messages
 
 
 needs_loopback = pytest.mark.skipif(
@@ -41,7 +41,11 @@ def _seed(workspace, *, with_meta: bool = False):
     result = engine.request("manual")
     if with_meta:
         assert result["approval_required"]
-        result = engine.decide("yes")
+        result = engine.decide(
+            "yes",
+            approval_grant=approval_grant(result["proposal"]),
+            session_id=adapter.session_id,
+        )
     return adapter, result
 
 

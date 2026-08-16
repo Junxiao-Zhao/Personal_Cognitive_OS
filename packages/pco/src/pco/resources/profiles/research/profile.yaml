@@ -6,6 +6,9 @@ streams:
     schema: schemas/observation.schema.json
     schema_version: research/observation/v1
     write_policy: auto
+    validation:
+      transaction_mode: delta_only
+      run_cross_validators: false
   claims:
     path: research/claims.jsonl
     schema: schemas/claim.schema.json

@@ -88,6 +88,8 @@ class ApprovalReceipt(BaseModel):
     protected_operations_hash: str
     decided_at: str
     decision_message_id: str | None = None
+    authorization_id: str | None = None
+    authorization_source: str | None = None
 
 
 class TransactionState(BaseModel):

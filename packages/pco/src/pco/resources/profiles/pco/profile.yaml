@@ -1,11 +1,14 @@
 name: pco
-version: 0.3.2
+version: 0.3.3
 streams:
   messages:
     path: raw/conversations/messages.jsonl
     schema: schemas/conversation-message.schema.json
     schema_version: conversation-message/v1
     write_policy: auto
+    validation:
+      transaction_mode: delta_only
+      run_cross_validators: false
   sources:
     path: sources/registry.jsonl
     schema: schemas/source.schema.json

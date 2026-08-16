@@ -5,9 +5,10 @@ import pytest
 from mem_core.errors import MemError
 from mem_core.models import Operation, proposal_hash
 from pco.checkpoint import CheckpointEngine
+from pco.checkpoint import finalize as finalize_steps
 from pco.harness import FakeHarnessAdapter, WorkerResult
 
-from conftest import NOW, continuation, envelope, event, hypothesis, meta, visible_messages
+from conftest import NOW, approval_grant, continuation, envelope, event, hypothesis, meta, visible_messages
 
 
 def basic_worker(_payload) -> WorkerResult:
@@ -71,7 +72,16 @@ def test_meta_proposal_cannot_commit_until_yes(workspace) -> None:
     ]
     assert proposal_hash(reviewed) == pending["proposal"]["proposal_hash"]
 
-    result = engine.decide("yes")
+    with pytest.raises(MemError) as error:
+        engine.decide("yes")
+    assert error.value.detail.code == "APPROVAL_PROVENANCE_REQUIRED"
+    assert workspace.repository.current_records("meta_revisions") == {}
+
+    result = engine.decide(
+        "yes",
+        approval_grant=approval_grant(pending["proposal"]),
+        session_id=adapter.session_id,
+    )
     assert result["ok"]
     assert adapter.resume_calls == 1
     assert result["receipt"]["proposal_hash"] == pending["proposal"]["proposal_hash"]
@@ -371,11 +381,37 @@ def test_checkpoint_record_carries_real_commit_and_derivations(workspace) -> Non
     adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
     result = CheckpointEngine(workspace, adapter).request("manual")
     record = workspace.repository.current_records("checkpoints")[result["checkpoint_id"]]
-    assert record["revision"] == 1
+    # Cleanup completion is an observable post-commit derivation transition,
+    # so the final canonical audit state is an append-only revision.
+    assert record["revision"] == 2
     assert record["payload"]["git_commit"] == result["receipt"]["git_commit"]
+    assert record["payload"]["audit_transaction_id"] == result["receipt"]["audit_transaction_id"]
     assert record["payload"]["status"] in {"committed", "committed_with_pending_derivations"}
     assert record["payload"]["derivations"] != {
         "index": "scheduled",
         "backlinks": "scheduled",
         "projection": "scheduled",
     }
+
+
+def test_idempotent_audit_write_recovers_missing_runtime_provenance(workspace) -> None:
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
+    engine = CheckpointEngine(workspace, adapter)
+    result = engine.request("manual")
+    checkpoint_id = result["checkpoint_id"]
+    expected_audit_commit = result["receipt"]["audit_commit"]
+    expected_audit_transaction = result["receipt"]["audit_transaction_id"]
+
+    persisted = workspace.load_json("active-checkpoint.json")
+    persisted["audit_commit"] = None
+    persisted["audit_transaction_id"] = None
+    workspace.save_json("active-checkpoint.json", persisted)
+    state = engine._load()
+    assert state.audit_commit is None
+    assert state.audit_transaction_id is None
+
+    assert finalize_steps.write_checkpoint_record(engine, state) == expected_audit_commit
+    restored = engine._load()
+    assert restored.audit_commit == expected_audit_commit
+    assert restored.audit_transaction_id == expected_audit_transaction
+    assert finalize_steps.receipt(engine, restored)["audit_commit"] == expected_audit_commit

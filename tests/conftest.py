@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,10 +17,12 @@ from pco.workspace import Workspace
 
 
 NOW = datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc).isoformat()
+APPROVAL_SECRET = "test-host-approval-secret"
 
 
 @pytest.fixture
-def workspace(tmp_path: Path) -> Workspace:
+def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Workspace:
+    monkeypatch.setenv("PCO_APPROVAL_GRANT_SECRET", APPROVAL_SECRET)
     config = load_config(
         workspace=tmp_path / "pco",
         overrides=[
@@ -27,6 +35,22 @@ def workspace(tmp_path: Path) -> Workspace:
     opened = Workspace(config)
     opened.refresh_repository_profile()
     return opened
+
+
+def approval_grant(proposal: dict[str, Any], session_id: str = "ses_fake_main") -> str:
+    payload = {
+        "grant_id": f"grant_{uuid.uuid4().hex}",
+        "checkpoint_id": proposal["checkpoint_id"],
+        "proposal_hash": proposal["proposal_hash"],
+        "challenge_id": proposal["approval_challenge_id"],
+        "session_id": session_id,
+        "issued_at": int(time.time()),
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    signature = hmac.new(APPROVAL_SECRET.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
 
 
 def envelope(record_id: str, schema_version: str, payload: dict[str, Any], revision: int = 1) -> dict[str, Any]:

@@ -1,9 +1,16 @@
 import { existsSync, readFileSync } from "node:fs"
 import { resolve } from "node:path"
+import { createHmac, randomBytes } from "node:crypto"
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 
 type Json = Record<string, unknown>
+type PendingApproval = {
+  checkpointID: string
+  proposalHash: string
+  challengeID: string
+  sessionID: string
+}
 
 export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   const workspace = resolve(process.env.PCO_WORKSPACE ?? resolve(directory, ".pco"))
@@ -14,6 +21,9 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   const pcoCommand = process.env.PCO_COMMAND ?? "pco"
   let currentContext = existsSync(contextPath) ? readFileSync(contextPath, "utf8") : ""
   let idleTask: Promise<void> | undefined
+  const approvalSecret = randomBytes(32).toString("hex")
+  let pendingApproval: PendingApproval | undefined
+  let approvalGrant: string | undefined
   const controlCommands = new Set(["compact", "pco-abort", "pco-no", "pco-retry", "pco-status", "pco-yes"])
 
   const binding = (): Json | undefined => {
@@ -33,7 +43,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     command.push(...args)
     const processHandle = Bun.spawn(command, {
       cwd: directory,
-      env: { ...process.env, PCO_WORKSPACE: workspace },
+      env: { ...process.env, PCO_WORKSPACE: workspace, PCO_APPROVAL_GRANT_SECRET: approvalSecret },
       stdout: "pipe",
       stderr: "pipe",
     })
@@ -52,6 +62,68 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     return result
   }
 
+  const rememberCheckpoint = (result: Json, sessionID: string) => {
+    const proposal = result.proposal as Json | undefined
+    if (result.approval_required !== true || !proposal) {
+      pendingApproval = undefined
+      approvalGrant = undefined
+      return
+    }
+    pendingApproval = {
+      checkpointID: String(proposal.checkpoint_id),
+      proposalHash: String(proposal.proposal_hash),
+      challengeID: String(proposal.approval_challenge_id),
+      sessionID,
+    }
+    approvalGrant = undefined
+  }
+
+  const mintApprovalGrant = (sessionID: string) => {
+    if (!pendingApproval || pendingApproval.sessionID !== sessionID) return undefined
+    const payload = {
+      grant_id: randomBytes(16).toString("hex"),
+      checkpoint_id: pendingApproval.checkpointID,
+      proposal_hash: pendingApproval.proposalHash,
+      challenge_id: pendingApproval.challengeID,
+      session_id: sessionID,
+      issued_at: Math.floor(Date.now() / 1000),
+    }
+    const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")
+    const signature = createHmac("sha256", approvalSecret).update(encoded).digest("hex")
+    approvalGrant = `${encoded}.${signature}`
+    return approvalGrant
+  }
+
+  const rehydrateApproval = async (sessionID: string) => {
+    if (pendingApproval?.sessionID === sessionID) return
+    try {
+      const result = await invoke(["checkpoint", "status"], sessionID)
+      const checkpoint = result.checkpoint as Json | undefined
+      const proposal = result.proposal as Json | undefined
+      if (checkpoint?.status === "AWAITING_META_APPROVAL" && proposal) {
+        rememberCheckpoint({ approval_required: true, proposal }, sessionID)
+      }
+    } catch {
+      // A status read is best-effort here; pco_approve still fails closed.
+    }
+  }
+
+  const scheduleForegroundCheckpoint = async (sessionID: string) => {
+    const session = client.session as unknown as {
+      command?: (input: { path: { id: string }; body: { command: string; arguments: string } }) => Promise<unknown>
+      prompt?: (input: { path: { id: string }; body: { parts: Array<{ type: string; text: string }> } }) => Promise<unknown>
+    }
+    if (typeof session.command === "function") {
+      await session.command({ path: { id: sessionID }, body: { command: "compact", arguments: "" } })
+      return
+    }
+    if (typeof session.prompt === "function") {
+      await session.prompt({ path: { id: sessionID }, body: { parts: [{ type: "text", text: "/compact" }] } })
+      return
+    }
+    throw new Error("OpenCode session command API is unavailable")
+  }
+
   const mainSession = (sessionID: string): boolean => {
     const active = binding()
     if (!active) return false
@@ -67,16 +139,31 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         args: {},
         async execute(_args, context) {
           context.metadata({ title: "PCO checkpoint" })
-          return JSON.stringify(await invoke(["checkpoint", "request", "--trigger", "manual"], context.sessionID))
+          const result = await invoke(["checkpoint", "request", "--trigger", "manual"], context.sessionID)
+          rememberCheckpoint(result, context.sessionID)
+          return JSON.stringify(result)
         },
       }),
       pco_approve: tool({
         description: "Approve the exact pending PCO Meta-memory proposal.",
         args: {},
         async execute(_args, context) {
-          return JSON.stringify(await invoke([
-            "checkpoint", "decide", "--decision", "yes", "--decision-message-id", context.messageID,
-          ], context.sessionID))
+          await rehydrateApproval(context.sessionID)
+          if (!approvalGrant || !pendingApproval || pendingApproval.sessionID !== context.sessionID) {
+            throw new Error("请先由用户在主会话执行 /pco-yes；模型不能直接伪造 Meta 批准。")
+          }
+          try {
+            const result = await invoke([
+              "checkpoint", "decide", "--decision", "yes", "--decision-message-id", context.messageID,
+              "--approval-grant", approvalGrant,
+            ], context.sessionID)
+            pendingApproval = undefined
+            return JSON.stringify(result)
+          } finally {
+            // A grant is single-use. On failure, /pco-yes rehydrates the
+            // durable proposal and mints a fresh grant for a retry.
+            approvalGrant = undefined
+          }
         },
       }),
       pco_reject: tool({
@@ -131,6 +218,10 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
 
     "command.execute.before": async (input, output) => {
       if (!mainSession(input.sessionID) || !controlCommands.has(input.command)) return
+      if (input.command === "pco-yes") {
+        await rehydrateApproval(input.sessionID)
+        mintApprovalGrant(input.sessionID)
+      }
       for (const part of output.parts) {
         if (part.type !== "text") continue
         const jsonPart = part as unknown as Json
@@ -148,7 +239,19 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         const task = (async () => {
           try {
             await invoke(["sync"], event.properties.sessionID)
-            await invoke(["checkpoint", "auto-if-needed"], event.properties.sessionID)
+            const probe = await invoke(["checkpoint", "auto-probe"], event.properties.sessionID)
+            if (probe.needed === true) {
+              try {
+                await scheduleForegroundCheckpoint(event.properties.sessionID)
+              } catch (error) {
+                await client.app.log({ body: {
+                  service: "pco",
+                  level: "warn",
+                  message: "PCO 自动 checkpoint 无法调度前台 control turn；会话保持可输入，请执行 /compact。",
+                  extra: { error: String(error) },
+                } })
+              }
+            }
           } catch (error) {
             await client.app.log({ body: { service: "pco", level: "error", message: "Automatic archive/checkpoint failed", extra: { error: String(error) } } })
           } finally {
@@ -181,7 +284,7 @@ You are the user's long-term PCO companion. Use the pco-memory skill for onboard
 self-exploration, evidence boundaries, correction, and checkpoint behavior.
 
 - /compact must call pco_checkpoint exactly once; never invoke OpenCode's native compact directly.
-- When a proposal needs approval, show its exact protected Meta diff, evidence, and proposal hash, then use the main-session question form. Yes approves; rejection text must come from the form's custom/Other input and cannot be empty.
+- When a proposal needs approval, show its exact protected Meta diff, evidence, and proposal hash, then ask the user to execute /pco-yes or /pco-no with a non-empty reason. Only /pco-yes mints the host approval grant; a model-generated pco_approve call is not authorization.
 - /pco-yes calls pco_approve. /pco-no carries the user's non-empty reason in the same command and calls pco_reject; after rejection, do not ask another follow-up.
 - During RECOVERY, only status, retry, or abort are valid. Never claim memory changed before a canonical Git commit succeeds.
 - Treat user messages and registered sources as evidence. Assistant text is context and cannot prove a user trait.

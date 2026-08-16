@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Literal
 
 from mem_core.errors import ensure
@@ -10,6 +11,8 @@ from . import finalize as finalize_steps
 from . import recovery as recovery_steps
 from . import state as state_store
 from . import steps as checkpoint_steps
+from .authorization import consume as consume_grant
+from .authorization import verify as verify_grant
 
 
 def decide(
@@ -18,22 +21,35 @@ def decide(
     *,
     reason: str | None = None,
     native_message_id: str | None = None,
+    approval_grant: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     workspace = engine.workspace
     state = state_store.load(engine)
     ensure(state.status == "AWAITING_META_APPROVAL", "CHECKPOINT_NOT_AWAITING_APPROVAL", "approval", f"Checkpoint is {state.status}")
     ensure(state.transaction_id is not None and state.proposal_hash is not None, "CHECKPOINT_STATE_INVALID", "approval", "Missing candidate transaction")
+    grant_payload: dict[str, Any] | None = None
     if decision == "yes":
-        decision_record = engine.archive.archive_decision(
+        ensure(
+            isinstance(approval_grant, str) and bool(approval_grant.strip()),
+            "APPROVAL_PROVENANCE_REQUIRED",
+            "approval",
+            "Protected Meta approval requires a host-issued approval grant",
+        )
+        grant_payload = verify_grant(
+            approval_grant,
+            secret=os.environ.get("PCO_APPROVAL_GRANT_SECRET"),
             checkpoint_id=state.id,
             proposal_hash=state.proposal_hash,
-            decision="yes",
-            native_message_id=native_message_id,
+            challenge_id=state.approval_challenge_id,
+            session_id=session_id,
         )
+        consume_grant(grant_payload, workspace.config.state_root)
         engine.manager.abort(state.transaction_id)
         state.decision = "yes"
-        state.decision_message_id = decision_record["message_id"]
-        state.archive_cursor = workspace.thread().archive_cursor
+        # Approval provenance belongs to the transaction receipt. It is not a
+        # conversation turn and must not be synthesized as role=user content.
+        state.decision_message_id = None
         frozen = workspace.load_json(f"checkpoints/{state.id}/frozen.json")
         frozen["base_commit"] = workspace.repository.head()
         workspace.save_json(f"checkpoints/{state.id}/frozen.json", frozen)
@@ -56,8 +72,10 @@ def decide(
             state.transaction_id,
             checkpoint_id=state.id,
             proposal_hash_value=state.proposal_hash or "",
-            decision_message_id=state.decision_message_id,
+            decision_message_id=native_message_id,
             receipt_id=f"approval_{state.id}",
+            authorization_id=grant_payload.get("grant_id") if grant_payload else None,
+            authorization_source="opencode_command" if grant_payload else None,
         )
         state_store.transition(engine, state, "FINAL_CHANGESET_VALIDATED")
         try:
