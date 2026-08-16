@@ -6,7 +6,7 @@ from typing import Any
 
 from mem_core.repository import MemoryRepository
 
-from .repo_loader import profile_for_repo
+from .repo_loader import profile_for_repo, repository_at, resolve_derivation_source_commit
 
 
 SECTION_LABELS = {
@@ -20,9 +20,28 @@ SECTION_LABELS = {
 }
 
 
-def render(*, repo_root: Path, output_path: str | Path, checkpoint_id: str | None = None, **_: Any) -> dict[str, Any]:
+def render(
+    *,
+    repo_root: Path,
+    output_path: str | Path,
+    checkpoint_id: str | None = None,
+    source_commit: str | None = None,
+    **_: Any,
+) -> dict[str, Any]:
     repo_root = Path(repo_root)
+    source_commit = resolve_derivation_source_commit(
+        repo_root,
+        state_root=Path(output_path).parent.parent,
+        source_commit=source_commit,
+    )
     repository = MemoryRepository(repo_root, profile_for_repo(repo_root))
+    if source_commit != repository.head():
+        with repository_at(repo_root, source_commit) as snapshot:
+            return _render_repository(snapshot, Path(output_path), checkpoint_id, source_commit)
+    return _render_repository(repository, Path(output_path), checkpoint_id, source_commit)
+
+
+def _render_repository(repository: MemoryRepository, target: Path, checkpoint_id: str | None, source_commit: str) -> dict[str, Any]:
     meta = repository.current_records("meta_revisions").get("meta_current")
     continuation = repository.current_records("continuations").get("continuation_current")
     lines = [
@@ -58,14 +77,14 @@ def render(*, repo_root: Path, output_path: str | Path, checkpoint_id: str | Non
     else:
         lines.extend(["## Continuation", "", "尚无 continuation；从当前用户输入自然开始。", ""])
     content = "\n".join(lines).rstrip() + "\n"
-    target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     digest = "sha256:" + hashlib.sha256(content.encode("utf-8")).hexdigest()
     return {
         "ok": True,
         "checkpoint_id": checkpoint_id,
-        "memory_commit": repository.head(),
+        "memory_commit": source_commit,
+        "source_commit": source_commit,
         "meta_revision": meta["revision"] if meta else None,
         "continuation_revision": continuation["revision"] if continuation else None,
         "rendered_context_path": str(target),

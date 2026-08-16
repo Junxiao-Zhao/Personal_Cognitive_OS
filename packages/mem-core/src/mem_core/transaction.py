@@ -143,6 +143,7 @@ class TransactionManager:
         receipt_id: str | None = None,
         authorization_id: str | None = None,
         authorization_source: str | None = None,
+        authorization_provenance: dict[str, Any] | None = None,
     ) -> ApprovalReceipt:
         state = self.load(transaction_id)
         protected = self.protected_streams(state)
@@ -167,6 +168,7 @@ class TransactionManager:
             decision_message_id=decision_message_id,
             authorization_id=authorization_id,
             authorization_source=authorization_source,
+            authorization_provenance=authorization_provenance,
         )
         state.approval_receipt = receipt
         self._save(state)

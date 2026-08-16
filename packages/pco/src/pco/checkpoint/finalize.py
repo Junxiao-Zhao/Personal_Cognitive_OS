@@ -5,12 +5,12 @@ import uuid
 from collections import Counter
 from typing import Any
 
-from mem_core.errors import ensure
+from mem_core.errors import MemError, ensure
 from mem_core.models import Operation, utc_now
 from mem_core.transaction import TransactionManager
 
-from ..context import render as render_context
 from . import derivations as derivations_steps
+from .errors import failed_attempt, structured_error, successful_attempt
 from . import state as state_store
 from .state import CheckpointState
 
@@ -34,6 +34,7 @@ def commit_and_finalize(engine: Any, state: CheckpointState) -> dict[str, Any]:
 def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
     workspace = engine.workspace
     proposal = workspace.load_json(f"checkpoints/{state.id}/proposal.json")
+    derivations = _checkpoint_derivations(state)
     counts = Counter(
         operation.get("stream", "artifacts")
         for operation in proposal["operations"]
@@ -65,6 +66,10 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
         "promotion_proposal": bool(promotion_streams),
         "protected_streams": promotion_streams,
         "approval_decision": approval,
+        "authorization_id": state.decision_authorization_id,
+        "authorization_provenance": {
+            "question_request_id": state.decision_question_request_id,
+        } if state.decision_question_request_id else None,
         "proposal_hash": promotion_hash,
         "final_proposal_hash": state.proposal_hash,
         "transaction_proposal_hash": state.transaction_proposal_hash,
@@ -79,6 +84,7 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
         "continuation_updated": counts.get("continuations", 0) > 0,
         "continuation_revision": state.continuation_revision,
         "runtime": state.harness_runtime,
+        "context_bundle": state.context_bundle,
         "versions": {
             "profile": f"{workspace.profile.name}@{workspace.profile.version}",
             "policy_hash": workspace.profile.policy_hash,
@@ -87,27 +93,41 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
         },
         "retry_count": state.retries,
         "error": state.error,
-        "derivations": state.derivations,
+        "derivations": derivations,
         "summary": summary,
     }
+
+
+def _json_compatible(value: Any) -> Any:
+    """Convert derivation output to JSON without flattening structured errors."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    try:
+        json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+    return value
 
 
 def _checkpoint_derivations(state: CheckpointState) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for name, item in state.derivations.items():
-        entry: dict[str, Any] = {"ok": bool(item.get("ok", False))}
+        raw = item if isinstance(item, dict) else {"value": item}
+        entry = _json_compatible(raw)
+        if not isinstance(entry, dict):
+            entry = {"value": entry}
+        entry["ok"] = bool(raw.get("ok", False))
         if not entry["ok"]:
-            entry["pending"] = True
-        if item.get("error"):
-            error = item["error"]
-            # Keep structured MemError details queryable in canonical memory
-            # (for example code/recovery/pointer), while retaining a safe
-            # fallback for arbitrary exception values.
-            try:
-                json.dumps(error, ensure_ascii=False)
-            except (TypeError, ValueError):
-                error = str(error)
-            entry["error"] = error
+            entry.setdefault("pending", True)
+        # Keep the normalized schema in runtime state too: receipt, state and
+        # canonical checkpoint records must expose the same result fields,
+        # structured error details, and recovery attempt history.
+        state.derivations[name] = entry
         result[name] = entry
     return result
 
@@ -138,6 +158,10 @@ def _checkpoint_payload(engine: Any, state: CheckpointState, *, audit_transactio
         "proposal_hash": state.proposal_hash,
         "promotion_proposal_hash": state.promotion_proposal_hash,
         "approval_decision": approval,
+        "authorization_id": state.decision_authorization_id,
+        "authorization_provenance": {
+            "question_request_id": state.decision_question_request_id,
+        } if state.decision_question_request_id else None,
         "protected_streams": state.protected_streams,
         "promotion_protected_streams": state.promotion_protected_streams,
         "meta_revision": state.meta_revision,
@@ -154,6 +178,19 @@ def _checkpoint_payload(engine: Any, state: CheckpointState, *, audit_transactio
         "ended_at": utc_now(),
         "retry_count": state.retries,
     }
+
+
+def _raise_capability_error(value: Any, phase: str) -> None:
+    error = structured_error(value, phase)
+    details = {key: error[key] for key in ("stream", "record_id", "path", "value") if key in error}
+    raise MemError(
+        str(error["code"]),
+        str(error["phase"]),
+        str(error["message"]),
+        retryable=bool(error.get("retryable", True)),
+        recovery=list(error.get("recovery", [])),
+        **details,
+    )
 
 
 def _restore_audit_provenance(engine: Any, state: CheckpointState, payload: dict[str, Any]) -> str:
@@ -239,15 +276,24 @@ def finalize_committed(engine: Any, state: CheckpointState) -> dict[str, Any]:
     workspace = engine.workspace
     try:
         if state.context_bundle is None:
-            state.context_bundle = render_context(
+            rendered_context = workspace.profile.invoke(
+                "context_renderer.render",
                 repo_root=workspace.config.memory_root,
                 output_path=workspace.config.state_root / "context" / "current.md",
                 checkpoint_id=state.id,
+                source_commit=state.content_commit,
             )
+            if isinstance(rendered_context, dict) and rendered_context.get("ok") is False:
+                _raise_capability_error(rendered_context.get("error") or rendered_context, "context")
+            state.context_bundle = rendered_context
+            workspace.save_json("context/current.json", state.context_bundle)
             state_store.save(engine, state)
         if not state.context_published:
             engine.adapter.publish_context(state.context_bundle)
             state.context_published = True
+            state.derivations["context"] = successful_attempt(
+                state.derivations.get("context", {}), state.context_bundle
+            )
             state_store.transition(engine, state, "CONTEXT_PUBLISHED")
         if not state.compacted:
             engine.adapter.compact()
@@ -255,7 +301,9 @@ def finalize_committed(engine: Any, state: CheckpointState) -> dict[str, Any]:
             state_store.transition(engine, state, "CONTEXT_COMPACTED")
     except Exception as exc:
         state.status = "COMMITTED_CONTEXT_PENDING"
-        state_store.recover(engine, state, exc, preserve_status=True)
+        state.derivations["context"] = failed_attempt(state.derivations.get("context", {}), exc, "context")
+        state.error = state.derivations["context"]["error"]
+        state_store.save(engine, state)
         raise
     state_store.transition(engine, state, "DERIVATIONS_RUNNING")
     derivations_steps.run_derivations(engine, state)

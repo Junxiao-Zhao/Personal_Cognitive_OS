@@ -6,7 +6,7 @@ from typing import Any
 
 from mem_core.repository import MemoryRepository
 
-from .repo_loader import repository_at
+from .repo_loader import repository_at, resolve_derivation_source_commit
 
 
 _BACKLINK_STREAMS = ("events", "archetypes", "hypotheses", "meta_revisions")
@@ -31,10 +31,22 @@ def _is_current(record: dict[str, Any]) -> bool:
     return record["payload"].get("status") not in _RETIRED_STATUSES
 
 
-def build(*, repo_root: Path, output_path: str | Path | None = None, memory_commit: str | None = None, **_: Any) -> dict[str, Any]:
+def build(
+    *,
+    repo_root: Path,
+    output_path: str | Path | None = None,
+    source_commit: str | None = None,
+    memory_commit: str | None = None,
+    state_root: str | Path | None = None,
+    **_: Any,
+) -> dict[str, Any]:
     repo_root = Path(repo_root)
-    with repository_at(repo_root, memory_commit) as repository:
-        source_commit = memory_commit or repository.head()
+    source_commit = resolve_derivation_source_commit(
+        Path(repo_root),
+        state_root=Path(state_root) if state_root is not None else (Path(output_path).parent.parent if output_path else None),
+        source_commit=source_commit or memory_commit,
+    )
+    with repository_at(repo_root, source_commit) as repository:
         records = repository.records_by_stream()
         current_backlinks: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = {}
         historical_backlinks: dict[str, list[dict[str, Any]]] = {}

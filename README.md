@@ -36,18 +36,17 @@ pco --workspace .pco run --project .
 日常入口：
 
 - 正常对话：完整 turn 在 session idle 时独立归档。
-- `/compact`：手动进入与自动阈值完全相同的 checkpoint；若出现 Meta 提案，会在主会话打开原生 Yes/No question 表单，拒绝时用 Tab/Other 输入非空理由。
-- `/pco-yes`：批准屏幕上展示的精确 Meta diff。
-- `/pco-no <理由或补充经历>`：同一次输入完成必填理由的拒绝。
+- `/compact`：手动进入与自动阈值完全相同的 checkpoint；若出现 Meta 提案，会在主会话打开固定的原生 question 表单，批准或用 Tab/Other 输入非空拒绝理由。
 - `/pco-status`、`/pco-retry`、`/pco-abort`：恢复控制面。
 - `pco --workspace .pco source add /path/to/journal.md`：注册只读本地来源。
+- `pco --workspace .pco source add --locator affine://workspace/document-id --reader affine-cli --provider affine`：注册由 Profile allowlist 提供的非本地来源。
 - `pco --workspace .pco search '为什么我总在公开前拖延' --mode pattern`：调用五种 Profile 检索模式之一。
 
 ## Checkpoint 保证
 
 一次 checkpoint 会锁定普通输入，冻结精确消息边界与来源哈希，在隔离的原生 OpenCode child session 中生成 proposal，并先经 Profile 校验。Meta-memory 属于 `user_approval` stream：approval receipt 同时绑定用户审阅的受保护 diff hash、完整 operation-set hash 和 transaction fingerprint。
 
-通过后，所有 canonical 变更以一个 Git commit 提交；随后发布最新 Meta + continuation，再调用一次 OpenCode compact。Milvus/Tantivy、backlinks 和投影属于可重建派生状态，失败只产生 pending receipt，不回滚 canonical commit。拒绝会先把理由作为用户 decision message 独立归档，再让同一 worker 只续跑一次；原 proposal 和 revised proposal 都保留在运行状态目录。
+通过后，结构化 memory 先以 `content_commit` 提交；派生能力基于该 commit 构建，随后以独立 `audit_commit` 记录 checkpoint outcome 和恢复状态。Milvus/Tantivy、backlinks 和投影属于可重建派生状态，失败只产生 pending receipt，不回滚 canonical commit。拒绝理由来自原生 question 的用户回答，作为 `question:<requestID>` 的 decision evidence 归档；Yes 不生成虚构的 user conversation message。
 
 ## AFFiNE
 

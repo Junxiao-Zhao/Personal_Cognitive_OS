@@ -90,6 +90,10 @@ class ApprovalReceipt(BaseModel):
     decision_message_id: str | None = None
     authorization_id: str | None = None
     authorization_source: str | None = None
+    # Harness-specific provenance remains opaque to mem-core. PCO uses this
+    # to retain the native host interaction request without importing domain
+    # concepts into the generic transaction model.
+    authorization_provenance: dict[str, Any] | None = None
 
 
 class TransactionState(BaseModel):

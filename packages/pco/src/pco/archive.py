@@ -19,7 +19,7 @@ class ConversationArchive:
         binding = self.workspace.binding()
         role = message["role"]
         reasoning = message.get("reasoning") if self.workspace.config.archive_reasoning and role == "assistant" else None
-        return {
+        payload = {
             "id": message.get("id") or f"msg_{uuid.uuid4().hex}",
             "revision": 1,
             "recorded_at": message.get("recorded_at") or utc_now(),
@@ -28,7 +28,7 @@ class ConversationArchive:
                 "thread_id": thread.thread_id,
                 "epoch_id": thread.active_epoch_id,
                 "harness": binding.harness,
-                "native_session_id": binding.native_session_id or message.get("native_session_id") or "unbound",
+                "native_session_id": message.get("native_session_id") or binding.native_session_id or "unbound",
                 "native_message_id": message["native_message_id"],
                 "role": role,
                 "kind": message.get("kind", "conversation"),
@@ -38,6 +38,9 @@ class ConversationArchive:
                 "created_at": message.get("created_at") or utc_now(),
             },
         }
+        if "decision_provenance" in message:
+            payload["payload"]["decision_provenance"] = message["decision_provenance"]
+        return payload
 
     def archive(self, messages: Iterable[dict[str, Any]]) -> dict[str, Any]:
         allowed = [message for message in messages if message.get("role") in {"user", "assistant"} and message.get("kind", "conversation") in {"conversation", "checkpoint_decision"}]
@@ -133,24 +136,108 @@ class ConversationArchive:
         *,
         checkpoint_id: str,
         proposal_hash: str,
-        decision: Literal["yes", "no"] = "no",
-        reason: str | None = None,
+        decision: Literal["no"] = "no",
+        reason: str,
+        question_request_id: str,
+        authorization_id: str,
+        session_id: str | None = None,
+        # Retained only so older callers fail closed through the new request
+        # identity instead of accidentally reusing an assistant message ID.
         native_message_id: str | None = None,
     ) -> dict[str, Any]:
-        if decision == "no" and (reason is None or not reason.strip()):
+        if decision != "no":
+            raise ValueError("archive_decision only accepts a native question rejection")
+        if not reason.strip():
             raise ValueError("A rejection reason or supplemental experience is required")
-        content = reason.strip() if reason is not None and reason.strip() else "Yes — approve this exact Meta-memory proposal."
+        if native_message_id is not None:
+            # The argument is deliberately ignored. The canonical identity
+            # must be derived from the verified native question request.
+            native_message_id = None
+        if not question_request_id.strip():
+            raise ValueError("A native question request ID is required for a rejection")
+        if not authorization_id.strip():
+            raise ValueError("A grant ID is required for a rejection")
+        canonical_native_id = f"question:{question_request_id}"
+        binding = self.workspace.binding()
+        decision_session_id = session_id or binding.native_session_id or "unbound"
+        provenance = {
+            "checkpoint_id": checkpoint_id,
+            "proposal_hash": proposal_hash,
+            "question_request_id": question_request_id,
+            "decision": "no",
+            "authorization_id": authorization_id,
+        }
+        existing = next(
+            (
+                record
+                for record in self.workspace.repository.iter_records("messages")
+                if record["payload"].get("harness") == binding.harness
+                and record["payload"].get("native_session_id") == decision_session_id
+                and record["payload"].get("native_message_id") == canonical_native_id
+            ),
+            None,
+        )
+        if existing is not None:
+            existing_provenance = existing["payload"].get("decision_provenance", {})
+            immutable_provenance = ("checkpoint_id", "proposal_hash", "question_request_id", "decision")
+            if any(existing_provenance.get(key) != provenance[key] for key in immutable_provenance) or existing["payload"].get("content") != reason:
+                raise ValueError("A question request ID is already bound to a different decision")
+            # A process may have crashed after archive() persisted the
+            # decision and its synthetic cursor, but before the outer method
+            # restored the real harness cursor.  A retry may legitimately use
+            # a freshly issued one-shot grant; the canonical decision is
+            # already authoritative, so recover the cursor from the messages
+            # that precede this decision instead of treating the new grant as
+            # a conflicting duplicate.
+            self._restore_cursor_after_decision(existing, session_id=decision_session_id)
+            return {"ok": True, "archived": 0, "commit": None, "message_id": existing["id"], "record": existing}
+        content = reason
         message_id = f"msg_{uuid.uuid4().hex}"
+        # The decision is canonical evidence, but its synthetic native ID is
+        # not present in the harness transcript. Preserve the adapter cursor
+        # while appending it so the next sync starts after a real message.
+        thread_before = self.workspace.thread()
         result = self.archive(
             [
                 {
                     "id": message_id,
-                    "native_message_id": native_message_id or f"decision_{uuid.uuid4().hex}",
+                    "native_session_id": decision_session_id,
+                    "native_message_id": canonical_native_id,
                     "role": "user",
                     "kind": "checkpoint_decision",
                     "content": content,
                     "refs": [f"checkpoint:{checkpoint_id}", f"proposal:{proposal_hash}", f"decision:{decision}"],
+                    "decision_provenance": provenance,
                 }
             ]
         )
+        thread_after = self.workspace.thread()
+        thread_after.archive_cursor = thread_before.archive_cursor
+        thread_after.last_archived_message_id = thread_before.last_archived_message_id
+        self.workspace.save_thread(thread_after)
         return {**result, "message_id": message_id}
+
+    def _restore_cursor_after_decision(self, decision: dict[str, Any], *, session_id: str) -> None:
+        thread = self.workspace.thread()
+        if thread.archive_cursor is not None and not thread.archive_cursor.startswith("question:"):
+            return
+        records = list(self.workspace.repository.iter_records("messages"))
+        harness = self.workspace.binding().harness
+        decision_index = next(
+            (index for index, record in enumerate(records) if record.get("id") == decision.get("id")),
+            len(records),
+        )
+        recovered: dict[str, Any] | None = None
+        for record in reversed(records[:decision_index]):
+            payload = record.get("payload", {})
+            if (
+                payload.get("kind") == "conversation"
+                and payload.get("harness") == harness
+                and payload.get("native_session_id") == session_id
+                and payload.get("native_message_id")
+            ):
+                recovered = record
+                break
+        thread.archive_cursor = recovered["payload"]["native_message_id"] if recovered else None
+        thread.last_archived_message_id = recovered.get("id") if recovered else None
+        self.workspace.save_thread(thread)

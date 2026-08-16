@@ -71,6 +71,8 @@ def test_meta_proposal_cannot_commit_until_yes(workspace) -> None:
         if operation.get("stream") == "meta_revisions"
     ]
     assert proposal_hash(reviewed) == pending["proposal"]["proposal_hash"]
+    assert pending["proposal"]["main_evidence"]
+    assert any("拖延" in str(item.get("content", "")) for item in pending["proposal"]["main_evidence"])
 
     with pytest.raises(MemError) as error:
         engine.decide("yes")
@@ -79,6 +81,7 @@ def test_meta_proposal_cannot_commit_until_yes(workspace) -> None:
 
     result = engine.decide(
         "yes",
+        question_request_id="question_test",
         approval_grant=approval_grant(pending["proposal"]),
         session_id=adapter.session_id,
     )
@@ -127,7 +130,14 @@ def test_no_requires_reason_and_reuses_worker_once(workspace) -> None:
         engine.decide("no", reason=" ")
     assert error.value.detail.code == "REJECTION_REASON_REQUIRED"
 
-    result = engine.decide("no", reason="更准确的是厌恶被评价，而不是害怕失败。")
+    pending = engine.status()["proposal"]
+    result = engine.decide(
+        "no",
+        reason="更准确的是厌恶被评价，而不是害怕失败。",
+        question_request_id="question_rejection_1",
+        approval_grant=approval_grant(pending, decision="no", question_request_id="question_rejection_1", reason="更准确的是厌恶被评价，而不是害怕失败。"),
+        session_id=adapter.session_id,
+    )
     assert result["ok"]
     assert result["receipt"]["promotion_proposal"] is True
     assert result["receipt"]["approval_decision"] == "no"
@@ -168,8 +178,15 @@ def test_rejection_requires_disputed_hypothesis_with_decision_evidence(workspace
     adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=worker)
     engine = CheckpointEngine(workspace, adapter)
     engine.request("manual")
+    pending = engine.status()["proposal"]
     with pytest.raises(MemError) as error:
-        engine.decide("no", reason="这个解释不准确。")
+        engine.decide(
+            "no",
+            reason="这个解释不准确。",
+            question_request_id="question_rejection_2",
+            approval_grant=approval_grant(pending, decision="no", question_request_id="question_rejection_2", reason="这个解释不准确。"),
+            session_id=adapter.session_id,
+        )
     assert error.value.detail.code == "REJECTION_HYPOTHESIS_REVISION_REQUIRED"
     with pytest.raises(MemError) as retry_error:
         engine.retry()
@@ -234,7 +251,14 @@ def test_rejection_reuses_initial_wrapper_search_receipts(workspace) -> None:
     adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=worker)
     engine = CheckpointEngine(workspace, adapter)
     assert engine.request("manual")["approval_required"]
-    result = engine.decide("no", reason="用户否定了初始解释。")
+    pending = engine.status()["proposal"]
+    result = engine.decide(
+        "no",
+        reason="用户否定了初始解释。",
+        question_request_id="question_rejection_3",
+        approval_grant=approval_grant(pending, decision="no", question_request_id="question_rejection_3", reason="用户否定了初始解释。"),
+        session_id=adapter.session_id,
+    )
     assert result["ok"]
     stored_receipt = workspace.repository.current_records("search_receipts")[receipt["id"]]
     stored_concept = workspace.repository.current_records("psychologies")[concept["id"]]
@@ -342,7 +366,11 @@ def test_worker_cleanup_failure_is_a_retryable_derivation(workspace) -> None:
     assert [record["revision"] for record in history] == [1, 2]
     assert history[0]["payload"]["status"] == "committed_with_pending_derivations"
     assert history[1]["payload"]["status"] == "committed"
-    assert history[1]["payload"]["derivations"]["worker_cleanup"] == {"ok": True}
+    cleanup = history[1]["payload"]["derivations"]["worker_cleanup"]
+    assert cleanup["ok"] is True
+    assert len(cleanup["attempts"]) == 2
+    assert cleanup["attempts"][0]["error"]["message"] == "worker delete failed"
+    assert "recovered_from" in cleanup["attempts"][1]
 
     # A retry after the successful revision is idempotent and must not append
     # another canonical checkpoint revision.

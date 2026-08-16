@@ -10,7 +10,7 @@ from typing import Any
 
 from mem_core.errors import MemError
 from .backlinks import build as build_backlinks
-from .repo_loader import repository_at
+from .repo_loader import repository_at, resolve_derivation_source_commit
 
 
 STREAM_TITLES = {
@@ -156,12 +156,12 @@ def _pages(repository: MemoryRepository, backlink_map: dict[str, Any] | None = N
     return pages
 
 
-def project_markdown(*, repo_root: Path, output_root: str | Path, source_commit: str | None = None, **_: Any) -> dict[str, Any]:
+def project_markdown(*, repo_root: Path, output_root: str | Path, source_commit: str | None = None, state_root: str | Path | None = None, **_: Any) -> dict[str, Any]:
     source_root = Path(repo_root)
-    commit = source_commit
-    backlink_map = build_backlinks(repo_root=source_root, memory_commit=commit)["current_backlinks"]
-    with repository_at(source_root, source_commit) as repository:
-        return _project_markdown_repository(repository, Path(output_root), commit or repository.head(), backlink_map)
+    commit = resolve_derivation_source_commit(source_root, state_root=state_root or source_root.parent / "state", source_commit=source_commit)
+    backlink_map = build_backlinks(repo_root=source_root, source_commit=commit, state_root=state_root)["current_backlinks"]
+    with repository_at(source_root, commit) as repository:
+        return _project_markdown_repository(repository, Path(output_root), commit, backlink_map)
 
 
 def _project_markdown_repository(repository: Any, target_root: Path, commit: str, backlink_map: dict[str, Any]) -> dict[str, Any]:
@@ -207,10 +207,10 @@ def project_affine(
     CRDT/Yjs behavior outside canonical memory and mem-core.
     """
     source_root = Path(repo_root)
-    commit = source_commit
-    backlink_map = build_backlinks(repo_root=source_root, memory_commit=commit)["current_backlinks"]
-    with repository_at(source_root, source_commit) as repository:
-        return _project_affine_repository(repository, Path(state_root), command, commit or repository.head(), backlink_map)
+    commit = resolve_derivation_source_commit(source_root, state_root=state_root, source_commit=source_commit)
+    backlink_map = build_backlinks(repo_root=source_root, source_commit=commit, state_root=state_root)["current_backlinks"]
+    with repository_at(source_root, commit) as repository:
+        return _project_affine_repository(repository, Path(state_root), command, commit, backlink_map)
 
 
 def _project_affine_repository(repository: Any, state_root: Path, command: str | None, commit: str, backlink_map: dict[str, Any]) -> dict[str, Any]:

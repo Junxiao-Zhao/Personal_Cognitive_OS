@@ -15,7 +15,7 @@ from mem_core.repository import MemoryRepository
 from mem_core.errors import MemError
 
 from .backlinks import build as build_backlinks
-from .repo_loader import profile_for_repo, repository_at, repository_for_repo
+from .repo_loader import profile_for_repo, repository_at, repository_for_repo, resolve_derivation_source_commit
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]")
@@ -290,8 +290,13 @@ def _merge_no_proxy(value: str | None) -> str:
 
 def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = False, source_commit: str | None = None, **_: Any) -> dict[str, Any]:
     repo_root = Path(repo_root)
+    source_commit = resolve_derivation_source_commit(
+        repo_root,
+        state_root=Path(indexes_root).parent / "state",
+        source_commit=source_commit,
+    )
     with repository_at(repo_root, source_commit) as repository:
-        return _build_index_repository(repository, repo_root, Path(indexes_root), force, source_commit or repository.head())
+        return _build_index_repository(repository, repo_root, Path(indexes_root), force, source_commit)
 
 
 def _build_index_repository(repository: Any, repo_root: Path, indexes_root: Path, force: bool, commit: str) -> dict[str, Any]:
@@ -493,6 +498,7 @@ def search(
     start: str | None = None,
     end: str | None = None,
     indexes_root: str | Path | None = None,
+    source_commit: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     if mode not in {"continuity", "current", "pattern", "historical", "change"}:
@@ -507,7 +513,12 @@ def search(
     rrf_k = float(retrieval_config.get("rrf_k", 60))
     recency_half_life_days = max(0.000001, float(retrieval_config.get("recency_half_life_days", 180)))
     indexes_root = Path(indexes_root) if indexes_root is not None else repo_root.parent / "indexes"
-    index_result = build_index(repo_root=repo_root, indexes_root=indexes_root)
+    source_commit = resolve_derivation_source_commit(
+        repo_root,
+        state_root=Path(indexes_root).parent / "state",
+        source_commit=source_commit,
+    )
+    index_result = build_index(repo_root=repo_root, indexes_root=indexes_root, source_commit=source_commit)
     generation = Path(index_result["generation_path"])
     docs_path = generation / "documents.json"
     if docs_path.is_file():
@@ -616,7 +627,11 @@ def search(
         if backlink_path.is_file():
             backlink_map = json.loads(backlink_path.read_text(encoding="utf-8"))["backlinks"]
         else:
-            backlink_map = build_backlinks(repo_root=repo_root)["backlinks"]
+            backlink_map = build_backlinks(
+                repo_root=repo_root,
+                source_commit=source_commit,
+                state_root=Path(indexes_root).parent / "state",
+            )["backlinks"]
         seeds = sorted(scored, key=lambda item: (item["rrf_score"], item["time_score"]), reverse=True)[:5]
         neighbors: set[str] = set()
         for seed in seeds:
@@ -631,7 +646,8 @@ def search(
         "ok": True,
         "query": query,
         "mode": mode,
-        "memory_commit": repository.head(),
+        "memory_commit": index_result.get("memory_commit", source_commit),
+        "derivation_source_commit": index_result.get("memory_commit", source_commit),
         "backends": {"dense": index_result["dense_backend"], "lexical": index_result["lexical_backend"]},
         "retrieval_policy": {
             "candidate_count": candidate_limit,

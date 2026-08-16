@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import pytest
 
+import pco.retrieval as retrieval_module
 from mem_core.errors import MemError
 from mem_core.models import Operation
 from mem_core.transaction import TransactionManager
@@ -43,6 +44,7 @@ def _seed(workspace, *, with_meta: bool = False):
         assert result["approval_required"]
         result = engine.decide(
             "yes",
+            question_request_id="question_test",
             approval_grant=approval_grant(result["proposal"]),
             session_id=adapter.session_id,
         )
@@ -207,7 +209,9 @@ def test_backlinks_and_replaceable_projections_are_idempotent(workspace) -> None
     assert "pco://" not in home.read_text(encoding="utf-8")
     assert (workspace.config.projection_root / "markdown" / "indexes" / "index_events.md").is_file()
     checkpoint_pages = list((workspace.config.projection_root / "markdown" / "checkpoints").glob("*.md"))
-    assert "## Continuation" in checkpoint_pages[0].read_text(encoding="utf-8")
+    # Checkpoint audit records are written after derivations and are not part
+    # of the content-commit projection source.
+    assert not checkpoint_pages
     assert project_markdown(repo_root=workspace.config.memory_root, output_root=workspace.config.projection_root / "markdown")["idempotent"]
 
     bridge = Path(__file__).parent / "fixtures" / "affine_bridge.py"
@@ -289,7 +293,11 @@ def test_affine_failure_is_reported_after_commit_and_retry_is_idempotent(workspa
     assert checkpoint_record["payload"]["git_commit"] == canonical_memory_commit
     history = workspace.repository.record_history("checkpoints", result["checkpoint_id"])
     assert history[0]["payload"]["derivations"]["projection"]["error"]["code"] == "AFFINE_BRIDGE_NOT_CONFIGURED"
-    assert history[1]["payload"]["derivations"]["projection"] == {"ok": True}
+    projection = history[1]["payload"]["derivations"]["projection"]
+    assert projection["ok"] is True
+    assert len(projection["attempts"]) == 2
+    assert projection["attempts"][0]["error"]["code"] == "AFFINE_BRIDGE_NOT_CONFIGURED"
+    assert "recovered_from" in projection["attempts"][1]
     assert [record["revision"] for record in workspace.repository.record_history("checkpoints", result["checkpoint_id"])] == [1, 2]
     assert len(adapter.receipts) == 1
     persisted = workspace.load_json(f"checkpoints/{result['checkpoint_id']}/receipt.json")
@@ -373,6 +381,45 @@ def test_search_reads_documents_from_generation_without_reload(workspace, monkey
     monkeypatch.setattr("pco.retrieval._documents", _boom)
     result = search(repo_root=workspace.config.memory_root, query="评价", indexes_root=indexes_root)
     assert result["ok"]
+
+
+def test_search_honors_explicit_source_commit(workspace, tmp_path, monkeypatch) -> None:
+    generation = tmp_path / "generation"
+    generation.mkdir()
+    (generation / "documents.json").write_text(
+        json.dumps([{
+            "stream": "events",
+            "id": "event_pinned",
+            "revision": 1,
+            "recorded_at": NOW,
+            "occurred_at": NOW,
+            "current": True,
+            "status": "active",
+            "evidence_refs": [],
+            "links": {},
+            "text": "pinned source",
+        }]),
+        encoding="utf-8",
+    )
+    calls: list[str | None] = []
+
+    def fake_build_index(**kwargs):
+        calls.append(kwargs.get("source_commit"))
+        return {
+            "generation_path": str(generation),
+            "dense_backend": "none",
+            "lexical_backend": "none",
+            "memory_commit": "content-commit",
+        }
+
+    monkeypatch.setattr(retrieval_module, "build_index", fake_build_index)
+    result = retrieval_module.search(
+        repo_root=workspace.config.memory_root,
+        query="pinned",
+        source_commit="content-commit",
+    )
+    assert calls == ["content-commit"]
+    assert result["derivation_source_commit"] == "content-commit"
 
 
 def test_index_backend_failure_is_loud(workspace, monkeypatch) -> None:

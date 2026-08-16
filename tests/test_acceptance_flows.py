@@ -118,6 +118,7 @@ def test_ac01_source_cold_start_commits_four_classes_meta_and_continuation(works
 
     result = engine.decide(
         "yes",
+        question_request_id="question_test",
         approval_grant=approval_grant(proposal["proposal"]),
         session_id=adapter.session_id,
     )
@@ -147,6 +148,7 @@ def test_ac11_natural_language_correction_keeps_history_and_updates_current_meta
     first_pending = first_engine.request("manual")
     first_engine.decide(
         "yes",
+        question_request_id="question_test",
         approval_grant=approval_grant(first_pending["proposal"]),
         session_id=first_adapter.session_id,
     )
@@ -197,6 +199,7 @@ def test_ac11_natural_language_correction_keeps_history_and_updates_current_meta
     assert pending["approval_required"]
     second_engine.decide(
         "yes",
+        question_request_id="question_test",
         approval_grant=approval_grant(pending["proposal"]),
         session_id=second_adapter.session_id,
     )

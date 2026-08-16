@@ -35,6 +35,8 @@ def retry(engine: Any) -> dict[str, Any]:
             payload = {
                 "kind": "rejection_revision",
                 "decision_message_id": state.decision_message_id,
+                "decision_question_request_id": state.decision_question_request_id,
+                "decision_authorization_id": state.decision_authorization_id,
                 "original_proposal_hash": state.proposal_hash,
                 "requirements": ["remove all user_approval operations", "append a disputed/rejected hypothesis revision", "cite the archived decision as counter-evidence", "include a non-empty revision reason", "do not ask a follow-up question"],
                 "frozen": frozen,

@@ -1,6 +1,6 @@
 # PCO MVP verification
 
-This file maps PRD v0.3.1 acceptance criteria to reproducible evidence. It deliberately separates repository conformance from deployment-specific end-to-end checks: a fake AFFiNE bridge proves the projector contract, but it is not evidence that a particular AFFiNE workspace accepted the pages. OpenCode is covered by both contract tests and a real loopback 1.17.18 model run.
+This file maps PRD v0.3.1 acceptance criteria to reproducible evidence. It deliberately separates repository conformance from deployment-specific end-to-end checks: a fake AFFiNE bridge proves the projector contract, but it is not evidence that a particular AFFiNE workspace accepted the pages. OpenCode authorization is PASS only when an executable question-lifecycle loopback proves host-issued Yes/No grants; static command text is not evidence.
 
 ## Automated acceptance matrix
 
@@ -17,7 +17,7 @@ This file maps PRD v0.3.1 acceptance criteria to reproducible evidence. It delib
 | AC-09 derivation failure | CONTRACT PASS; LIVE PENDING | `test_affine_failure_is_reported_after_commit_and_retry_is_idempotent` proves canonical commit and Meta activation survive a missing AFFiNE bridge, the main-session receipt reports pending, and retry reaches DONE without recommit. A real AFFiNE workspace remains deployment-specific. |
 | AC-10 source diff | PASS | `test_source_snapshot_and_diff_only_advance_with_transaction` covers idempotent registration, first snapshot, unchanged-source suppression, and unified diff after update. |
 | AC-11 natural-language correction | PASS | `test_ac11_natural_language_correction_keeps_history_and_updates_current_meta` retains revision 1, adds disputed revision 2, updates current Meta, and excludes the disputed portrait from current retrieval. |
-| AC-12 authorized promotion | PASS | `test_meta_proposal_cannot_commit_until_yes`, `test_no_requires_reason_and_reuses_worker_once`, and `test_protected_stream_requires_exact_approval` bind exact protected bytes to an approval receipt, reject blank reasons, archive the decision first, retain the rejected hypothesis revision, and keep Meta unchanged after `No`. The installed `/compact` command invokes OpenCode's native main-session question form with Yes/No and Tab-accessible custom rejection text; direct commands remain fallbacks. |
+| AC-12 authorized promotion | PENDING LOOPBACK | Python tests cover protected bytes, host-grant validation, exact No reason/provenance, replay/expiry, dismissal, and unchanged Meta after rejection. The remaining release evidence is an executable OpenCode question lifecycle: fixed form → `question.asked`/`question.replied` → matching one-time Yes/No grant. Legacy slash-command fallbacks are not supported and must not be installed. |
 | AC-13 historical understanding | PASS | `test_current_mode_excludes_old_meta_but_historical_includes_it` and `test_historical_mode_exposes_revision_policy_and_reason` distinguish current from old revisions and return the historical policy version and revision reason. |
 | AC-14 external concept reference | PASS | `test_concept_requires_external_search_receipt` rejects a psychology/philosophy concept whose external reference has no search receipt. |
 | AC-15 hybrid retrieval | PASS | `test_five_retrieval_modes_return_evidence_time_and_qualification`, chunk/reasoning tests, and the real-backend marker cover five modes, evidence/time/qualification fields, change windows, graph boost, turn-aware chunks, Tantivy, and Milvus Lite. |
@@ -32,7 +32,7 @@ Test names are under `tests/` and can be selected directly with `pytest -q -k <n
 - The managed Git pre-commit hook reruns Profile/schema/reference validation and rejects an invalid staged JSONL envelope; messages-only archive commits use an incremental delta fast path, structured commits still get full-tree validation.
 - Canonical transaction state, checkpoint artifact, raw decision, Meta/continuation revisions, source snapshot, and receipt are Git-tracked; derived index/projection failures never roll back them.
 - A fresh Git clone rebuilds Milvus/Tantivy (or explicit local fallbacks when those libraries fail), backlinks, Markdown, and the AFFiNE bridge batch.
-- OpenCode 1.17.18 successfully parses the installed local plugin, hidden agent, commands, permissions, and `pco-memory` skill.
+- OpenCode 1.17.18 successfully parses the installed local plugin, hidden agent, retained commands, permissions, and `pco-memory` skill. The authorization claim additionally requires the executable question lifecycle loopback described for AC-12.
 - A real loopback OpenCode 1.17.18 server completed the full checkpoint path with `opencode/north-mini-code-free`: checkpoint `ckpt_b01329d9e53f4cd98710cb295d3e42b3`, canonical commit `d03ad3a6a74a27acea869d6b7dd842b569b62abb`, `validated_json_text_repair`, native compaction, all derivations, receipt, and worker reclamation reached `DONE`. A retry after the server had already compacted detected the native summary and did not compact or commit again.
 - In that same compacted session, a new model request was asked for the second `current_topics` item. It returned the exact published-context value `Distinguishing facts from personality patterns`. The awaited idle hook archived only that post-checkpoint user/assistant turn; the native compaction marker/summary was absent from raw conversation. This live path also found and fixed awaited-idle, structured-output compatibility, worker-model propagation, control-message filtering, and the unavailable v2 compact endpoint.
 - The built wheel contains both Profiles and every OpenCode agent/command/plugin/skill resource.
@@ -71,8 +71,9 @@ opencode debug skill
 
 ## Remaining deployment gates
 
-Repository conformance is not the final operational release claim. One environment-dependent check remains before declaring the PRD's full MVP release gate complete:
+Repository conformance is not the final operational release claim. Environment-dependent checks remain before declaring the PRD's full MVP release gate complete:
 
 1. Supply a provider-specific `PCO_AFFINE_COMMAND` for an actual AFFiNE deployment, project a canonical commit, inspect the created pages/links/backlinks in AFFiNE, and repeat the same batch to prove target-side idempotence.
+2. Run the OpenCode question loopback for manual Yes, manual raw-reason No, dismissal/re-display, direct model bypass, and plugin restart. Until then, describe authorization as contract coverage, not live PASS.
 
 The repository cannot manufacture an AFFiNE workspace or its deployment credentials. Until that check is supplied, describe the result as “MVP implementation with live OpenCode acceptance and AFFiNE contract coverage,” not “production-accepted MVP.”

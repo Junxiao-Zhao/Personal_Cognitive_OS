@@ -62,10 +62,10 @@ Meta-memory contains current deep impressions, stable preferences and values, ac
 
 When proposing a change, show the exact protected diff, main evidence, and proposal hash. Approval applies only to those exact bytes and the matching transaction fingerprint.
 
-In the OpenCode main session, present the exact protected diff, evidence, and proposal hash, then ask the user to run `/pco-yes` or `/pco-no <reason>`. These main-session commands are the current host provenance boundary; a model-generated tool call or an untracked native question answer must not be treated as approval.
+In the OpenCode main session, present the exact protected diff, evidence, and proposal hash, then use the native question form with one approval option and a custom/Other field for rejection. Only the host-produced decision grant is authorization; ordinary question text and model-generated tool calls are not evidence.
 
 - `Yes`: commit without resuming the worker.
-- `No`: require the objection, self-understanding, or supplemental experience in the same decision input. Archive it first as a user-authored checkpoint decision, then resume the same worker once. Remove the Meta operation, revise the hypothesis as disputed/rejected, extract an event if appropriate, and do not ask another follow-up.
+- `No`: require the objection, self-understanding, or supplemental experience in the same native question answer. Archive the exact answer first as a checkpoint decision, then resume the same worker once. Remove the Meta operation, revise the hypothesis as disputed/rejected, extract an event if appropriate, and do not ask another follow-up.
 
 ## Natural-language correction
 

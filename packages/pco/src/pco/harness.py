@@ -300,10 +300,138 @@ class OpenCodeAdapter:
             "model": None,
             "reasoning_capability": "not_exposed_in_range",
         }
+        self._model_context_limits: dict[tuple[str | None, str | None], int] = {}
+        self._model_metadata_loaded: set[tuple[str | None, str | None]] = set()
+        self._runtime_context_limit_key: tuple[str | None, str | None] | None = None
+
+    def _set_model_identity(self, provider: Any, model: Any) -> None:
+        """Update the active model and discard a limit belonging to another model."""
+        next_provider = provider if isinstance(provider, str) and provider else None
+        next_model = model if isinstance(model, str) and model else None
+        previous = (self._runtime_info.get("provider"), self._runtime_info.get("model"))
+        current = (next_provider, next_model)
+        self._runtime_info["provider"] = next_provider
+        self._runtime_info["model"] = next_model
+        if previous != current:
+            self._runtime_info.pop("context_limit", None)
+            self._runtime_context_limit_key = None
+
+    def _active_model_key(self) -> tuple[str | None, str | None]:
+        return (self._runtime_info.get("provider"), self._runtime_info.get("model"))
+
+    def _clear_stale_runtime_context_limit(self) -> tuple[str | None, str | None]:
+        key = self._active_model_key()
+        if self._runtime_context_limit_key is not None and self._runtime_context_limit_key != key:
+            self._runtime_info.pop("context_limit", None)
+            self._runtime_context_limit_key = None
+        return key
+
+    @staticmethod
+    def _context_limit_from(value: Any) -> int | None:
+        if isinstance(value, dict):
+            model_limit = value.get("limit")
+            if isinstance(model_limit, dict):
+                candidate = model_limit.get("context")
+                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool) and candidate > 0:
+                    return int(candidate)
+            for key in (
+                "context_limit",
+                "contextLimit",
+                "context_length",
+                "contextLength",
+                "context_window",
+                "contextWindow",
+                "max_input_tokens",
+                "maxInputTokens",
+            ):
+                candidate = value.get(key)
+                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool) and candidate > 0:
+                    return int(candidate)
+            for key in ("model", "metadata", "limits", "capabilities"):
+                candidate = value.get(key)
+                found = OpenCodeAdapter._context_limit_from(candidate)
+                if found is not None:
+                    return found
+        return None
+
+    def _remember_provider_catalog(self, value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        providers = value.get("all") or value.get("providers")
+        if not isinstance(providers, list):
+            return
+        for provider in providers:
+            if not isinstance(provider, dict):
+                continue
+            provider_id = provider.get("id")
+            models = provider.get("models")
+            if not isinstance(provider_id, str) or not isinstance(models, dict):
+                continue
+            for model_id, model in models.items():
+                if not isinstance(model_id, str):
+                    continue
+                limit = self._context_limit_from(model)
+                if limit is not None:
+                    self._model_context_limits[(provider_id, model_id)] = limit
+                    if provider_id == self._runtime_info.get("provider") and model_id == self._runtime_info.get("model"):
+                        self._runtime_info["context_limit"] = limit
+                        self._runtime_context_limit_key = (provider_id, model_id)
+
+    def _load_model_metadata(self) -> None:
+        provider = self._runtime_info.get("provider")
+        model = self._runtime_info.get("model")
+        key = (provider, model)
+        if not provider or not model or key in self._model_metadata_loaded:
+            return
+        try:
+            self._remember_provider_catalog(self._request("GET", "/provider"))
+        except MemError:
+            # Older or unavailable servers retain the configured fallback.
+            pass
+        finally:
+            self._model_metadata_loaded.add(key)
+
+    def _remember_context_limit(self, value: Any) -> None:
+        limit = self._context_limit_from(value)
+        if limit is None:
+            return
+        provider = self._runtime_info.get("provider")
+        model = self._runtime_info.get("model")
+        self._model_context_limits[(provider, model)] = limit
+        self._runtime_info["context_limit"] = limit
+        self._runtime_context_limit_key = (provider, model)
+
+    @staticmethod
+    def _numeric(value: Any) -> float | None:
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+
+    @classmethod
+    def _usage_tokens(cls, value: Any) -> float | None:
+        if not isinstance(value, dict):
+            return None
+        total = cls._numeric(value.get("total"))
+        if total is not None:
+            return total
+        fields = [cls._numeric(value.get("input")), cls._numeric(value.get("output"))]
+        cache = value.get("cache")
+        if isinstance(cache, dict):
+            fields.extend([cls._numeric(cache.get("read")), cls._numeric(cache.get("write"))])
+        else:
+            fields.extend([cls._numeric(value.get("cache.read")), cls._numeric(value.get("cache.write"))])
+        usable = [field for field in fields if field is not None]
+        return sum(usable) if usable else None
+
+    @staticmethod
+    def _text_tokens(item: dict[str, Any]) -> int:
+        return sum(
+            len(str(part.get("text", ""))) // 4
+            for part in item.get("parts", [])
+            if part.get("type") == "text" and not part.get("synthetic", False)
+        )
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         params = dict(kwargs.pop("params", {}))
-        if path.startswith("/session") or path.startswith("/tui"):
+        if path.startswith("/session") or path.startswith("/tui") or path == "/provider":
             params.setdefault("directory", str(self.directory))
         try:
             response = self.client.request(method, path, params=params, **kwargs)
@@ -321,9 +449,10 @@ class OpenCodeAdapter:
         except MemError:
             self._runtime_info["harness_version"] = "unknown"
         if self.session_id:
-            self._request("GET", f"/session/{self.session_id}")
+            self._remember_context_limit(self._request("GET", f"/session/{self.session_id}"))
             return self.session_id
         session = self._request("POST", "/session", json={"title": "PCO 主会话"})
+        self._remember_context_limit(session)
         self.session_id = session["id"]
         return self.session_id
 
@@ -398,8 +527,8 @@ class OpenCodeAdapter:
             info = item.get("info", {})
             if info.get("role") != "assistant":
                 continue
-            self._runtime_info["provider"] = info.get("providerID")
-            self._runtime_info["model"] = info.get("modelID")
+            self._set_model_identity(info.get("providerID"), info.get("modelID"))
+            self._remember_context_limit(info)
             self._runtime_info["reasoning_capability"] = (
                 "exposed_in_range"
                 if any(part.get("type") == "reasoning" and part.get("text") for part in item.get("parts", []))
@@ -416,16 +545,48 @@ class OpenCodeAdapter:
 
     def estimate_context_usage(self) -> float:
         ensure(self.session_id is not None, "HARNESS_NOT_ATTACHED", "harness", "OpenCode session is not attached")
-        items = self._request("GET", f"/api/session/{self.session_id}/context")["data"]
-        tokens = 0
-        for item in items:
-            info = item.get("info", item)
-            usage = info.get("tokens", {})
-            tokens += sum(value for value in usage.values() if isinstance(value, (int, float)))
-            for part in item.get("parts", []):
-                if part.get("type") in {"text", "reasoning"}:
-                    tokens += len(part.get("text", "")) // 4
-        return min(1.0, tokens / self.model_context_tokens)
+        response = self._request("GET", f"/api/session/{self.session_id}/context")
+        items = response.get("data", []) if isinstance(response, dict) else []
+        assistant_indexes = [
+            index
+            for index, item in enumerate(items)
+            if isinstance(item, dict) and item.get("info", item).get("role") == "assistant"
+        ]
+        if not assistant_indexes:
+            # Older OpenCode fixtures omitted role while still returning usage.
+            assistant_indexes = [
+                index
+                for index, item in enumerate(items)
+                if isinstance(item, dict) and isinstance(item.get("info", item).get("tokens"), dict)
+            ]
+        latest_index = assistant_indexes[-1] if assistant_indexes else None
+        if latest_index is not None:
+            latest_info = items[latest_index].get("info", items[latest_index])
+            if latest_info.get("providerID") or latest_info.get("modelID"):
+                self._set_model_identity(latest_info.get("providerID"), latest_info.get("modelID"))
+        current_model_key = self._clear_stale_runtime_context_limit()
+        # A context response may carry the active model's limit. Associate it
+        # only after the active model has been identified; never let it remain
+        # as an unscoped runtime fallback after a model switch.
+        self._remember_context_limit(response)
+        self._load_model_metadata()
+        used: float
+        if latest_index is not None:
+            latest = items[latest_index]
+            latest_info = latest.get("info", latest)
+            usage = self._usage_tokens(latest_info.get("tokens"))
+        else:
+            usage = None
+        if usage is None:
+            used = sum(self._text_tokens(item) for item in items if isinstance(item, dict))
+        else:
+            used = usage
+            for item in items[latest_index + 1 :] if latest_index is not None else []:
+                if isinstance(item, dict) and item.get("info", item).get("role") == "user":
+                    used += self._text_tokens(item)
+        limit = self._model_context_limits.get(current_model_key) or self.model_context_tokens
+        ratio = used / float(limit) if limit else 0.0
+        return max(0.0, min(1.0, ratio))
 
     def runtime_info(self) -> dict[str, Any]:
         return dict(self._runtime_info)

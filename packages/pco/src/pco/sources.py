@@ -160,6 +160,28 @@ class SourceManager:
         _validate_locator(locator)
         for record in self.workspace.repository.current_records("sources").values():
             if record["payload"].get("locator") == locator and record["payload"].get("status") == "active":
+                existing = record["payload"]
+                same_registration = (
+                    existing.get("reader_skill") == reader_skill
+                    and existing.get("provider") == provider
+                    and existing.get("display_name") == display_name
+                )
+                ensure(
+                    same_registration,
+                    "SOURCE_LOCATOR_CONFLICT",
+                    "source",
+                    "An active source with this locator is registered with different reader, provider, or name",
+                    value={
+                        "locator": locator,
+                        "existing": {
+                            "reader": existing.get("reader_skill"),
+                            "provider": existing.get("provider"),
+                            "name": existing.get("display_name"),
+                        },
+                        "requested": {"reader": reader_skill, "provider": provider, "name": display_name},
+                    },
+                    recovery=["Reuse the existing source registration", "Choose a different locator"],
+                )
                 return {
                     "ok": True,
                     "idempotent": True,
@@ -167,6 +189,10 @@ class SourceManager:
                     "commit": None,
                     "record": record,
                 }
+        # Resolve only for a new registration. An existing active locator is
+        # intentionally idempotent even while its external reader is
+        # temporarily unavailable.
+        self.reader_registry.resolve(reader_skill)
         source_id = f"src_{uuid.uuid4().hex}"
         suffix = Path(urlparse(locator).path).suffix or ".md"
         record = {
@@ -194,7 +220,7 @@ class SourceManager:
         )
         manager.append(state.id, Operation(op="append", stream="sources", record=record))
         result = manager.commit(state.id)
-        return {"ok": True, "source_id": source_id, "commit": result["commit"], "record": record}
+        return {"ok": True, "idempotent": False, "source_id": source_id, "commit": result["commit"], "record": record}
 
     def register_local(self, path: Path, *, display_name: str | None = None) -> dict[str, Any]:
         source = path.resolve()
@@ -220,7 +246,6 @@ class SourceManager:
         _validate_locator(locator)
         parsed = urlparse(locator)
         ensure(parsed.scheme != "file", "SOURCE_USE_REGISTER_LOCAL", "source", "Use register_local for file locators", value=locator)
-        self.reader_registry.resolve(reader_skill)
         return self._register_locator(
             locator,
             reader_skill=reader_skill,

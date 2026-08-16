@@ -10,6 +10,7 @@ from typing import Iterator
 from mem_core.profile import Profile
 from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
+from mem_core.transaction import TransactionManager
 
 from .paths import bundled_profile
 
@@ -21,6 +22,37 @@ def profile_for_repo(repo_root: Path) -> Profile:
 
 def repository_for_repo(repo_root: Path) -> MemoryRepository:
     return MemoryRepository(repo_root, profile_for_repo(repo_root))
+
+
+def resolve_derivation_source_commit(
+    repo_root: Path,
+    *,
+    state_root: Path | None = None,
+    source_commit: str | None = None,
+) -> str:
+    """Map an audit HEAD back to the content commit it records."""
+
+    if source_commit:
+        return source_commit
+    repo_root = Path(repo_root)
+    repository = repository_for_repo(repo_root)
+    head = repository.head()
+    effective_state_root = Path(state_root) if state_root is not None else repo_root.parent / "state"
+    manager = TransactionManager(repository, effective_state_root)
+    for record in repository.current_records("checkpoints").values():
+        payload = record.get("payload", {})
+        transaction_id = payload.get("audit_transaction_id")
+        if not isinstance(transaction_id, str) or not transaction_id:
+            continue
+        try:
+            audit_commit = manager.load(transaction_id).commit
+        except Exception:
+            audit_commit = None
+        if audit_commit == head:
+            candidate = payload.get("content_commit") or payload.get("git_commit")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+    return head
 
 
 @contextmanager

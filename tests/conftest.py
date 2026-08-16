@@ -37,15 +37,29 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Workspace:
     return opened
 
 
-def approval_grant(proposal: dict[str, Any], session_id: str = "ses_fake_main") -> str:
+def approval_grant(
+    proposal: dict[str, Any],
+    session_id: str = "ses_fake_main",
+    *,
+    decision: str = "yes",
+    question_request_id: str = "question_test",
+    reason: str | None = None,
+) -> str:
     payload = {
         "grant_id": f"grant_{uuid.uuid4().hex}",
         "checkpoint_id": proposal["checkpoint_id"],
         "proposal_hash": proposal["proposal_hash"],
-        "challenge_id": proposal["approval_challenge_id"],
+        "approval_challenge_id": proposal["approval_challenge_id"],
         "session_id": session_id,
+        "question_request_id": question_request_id,
+        "decision": decision,
+        "reason_hash": None,
         "issued_at": int(time.time()),
+        "expires_at": int(time.time()) + 300,
     }
+    if decision == "no":
+        assert reason is not None
+        payload["reason_hash"] = "sha256:" + hashlib.sha256(reason.encode("utf-8")).hexdigest()
     encoded = base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
     ).decode("ascii").rstrip("=")

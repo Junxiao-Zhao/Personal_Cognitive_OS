@@ -20,7 +20,7 @@ def decide(
     decision: Literal["yes", "no"],
     *,
     reason: str | None = None,
-    native_message_id: str | None = None,
+    question_request_id: str | None = None,
     approval_grant: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
@@ -28,7 +28,7 @@ def decide(
     state = state_store.load(engine)
     ensure(state.status == "AWAITING_META_APPROVAL", "CHECKPOINT_NOT_AWAITING_APPROVAL", "approval", f"Checkpoint is {state.status}")
     ensure(state.transaction_id is not None and state.proposal_hash is not None, "CHECKPOINT_STATE_INVALID", "approval", "Missing candidate transaction")
-    grant_payload: dict[str, Any] | None = None
+    grant_payload: dict[str, Any]
     if decision == "yes":
         ensure(
             isinstance(approval_grant, str) and bool(approval_grant.strip()),
@@ -41,7 +41,10 @@ def decide(
             secret=os.environ.get("PCO_APPROVAL_GRANT_SECRET"),
             checkpoint_id=state.id,
             proposal_hash=state.proposal_hash,
-            challenge_id=state.approval_challenge_id,
+            approval_challenge_id=state.approval_challenge_id,
+            question_request_id=question_request_id,
+            decision="yes",
+            reason=reason,
             session_id=session_id,
         )
         consume_grant(grant_payload, workspace.config.state_root)
@@ -50,6 +53,8 @@ def decide(
         # Approval provenance belongs to the transaction receipt. It is not a
         # conversation turn and must not be synthesized as role=user content.
         state.decision_message_id = None
+        state.decision_question_request_id = question_request_id
+        state.decision_authorization_id = str(grant_payload["grant_id"])
         frozen = workspace.load_json(f"checkpoints/{state.id}/frozen.json")
         frozen["base_commit"] = workspace.repository.head()
         workspace.save_json(f"checkpoints/{state.id}/frozen.json", frozen)
@@ -72,10 +77,10 @@ def decide(
             state.transaction_id,
             checkpoint_id=state.id,
             proposal_hash_value=state.proposal_hash or "",
-            decision_message_id=native_message_id,
             receipt_id=f"approval_{state.id}",
-            authorization_id=grant_payload.get("grant_id") if grant_payload else None,
-            authorization_source="opencode_command" if grant_payload else None,
+            authorization_id=grant_payload["grant_id"],
+            authorization_source="opencode_question",
+            authorization_provenance={"question_request_id": question_request_id},
         )
         state_store.transition(engine, state, "FINAL_CHANGESET_VALIDATED")
         try:
@@ -84,16 +89,44 @@ def decide(
             state_store.recover(engine, state, exc)
             raise
     ensure(reason is not None and reason.strip(), "REJECTION_REASON_REQUIRED", "approval", "No requires a reason or supplemental experience", path="/reason")
+    ensure(
+        isinstance(approval_grant, str) and bool(approval_grant.strip()),
+        "APPROVAL_PROVENANCE_REQUIRED",
+        "approval",
+        "A native question decision requires a host-issued grant",
+    )
+    ensure(
+        isinstance(question_request_id, str) and bool(question_request_id.strip()),
+        "QUESTION_REQUEST_ID_REQUIRED",
+        "approval",
+        "A native question request ID is required for a rejection",
+    )
+    grant_payload = verify_grant(
+        approval_grant,
+        secret=os.environ.get("PCO_APPROVAL_GRANT_SECRET"),
+        checkpoint_id=state.id,
+        proposal_hash=state.proposal_hash,
+        approval_challenge_id=state.approval_challenge_id,
+        question_request_id=question_request_id,
+        decision="no",
+        reason=reason,
+        session_id=session_id,
+    )
+    consume_grant(grant_payload, workspace.config.state_root)
     try:
         decision_record = engine.archive.archive_decision(
             checkpoint_id=state.id,
             proposal_hash=state.proposal_hash,
             decision="no",
             reason=reason,
-            native_message_id=native_message_id,
+            question_request_id=question_request_id,
+            authorization_id=str(grant_payload["grant_id"]),
+            session_id=session_id,
         )
         state.decision = "no"
         state.decision_message_id = decision_record["message_id"]
+        state.decision_question_request_id = question_request_id
+        state.decision_authorization_id = str(grant_payload["grant_id"])
         state.archive_cursor = workspace.thread().archive_cursor
         state.through_message_id = decision_record["message_id"]
         engine.manager.abort(state.transaction_id)
@@ -112,7 +145,7 @@ def decide(
                 "kind": "rejection_revision",
                 "approval_decision_id": f"decision_{state.id}",
                 "decision_message_id": state.decision_message_id,
-                "reason": reason.strip(),
+                "reason": reason,
                 "original_proposal_hash": state.proposal_hash,
                 "requirements": ["remove all user_approval operations", "append a disputed/rejected hypothesis revision", "extract supplemental event evidence when applicable", "do not ask a follow-up question"],
                 "frozen": frozen,

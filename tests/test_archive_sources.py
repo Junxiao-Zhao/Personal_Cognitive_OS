@@ -57,6 +57,32 @@ def test_deduplicated_retry_recovers_archive_cursor(workspace) -> None:
     assert recovered.last_archived_message_id == "msg_assistant_1"
 
 
+def test_rejection_decision_does_not_advance_harness_archive_cursor(workspace) -> None:
+    archive = ConversationArchive(workspace)
+    archive.archive(visible_messages())
+    before = workspace.thread()
+
+    decision = archive.archive_decision(
+        checkpoint_id="ckpt_reject",
+        proposal_hash="sha256:proposal",
+        reason="补充真实经历",
+        question_request_id="request-1",
+        authorization_id="grant-1",
+    )
+
+    after_decision = workspace.thread()
+    assert decision["archived"] == 1
+    assert after_decision.archive_cursor == before.archive_cursor == "native_assistant_1"
+    assert after_decision.last_archived_message_id == before.last_archived_message_id
+
+    archive.archive([{
+        "native_message_id": "native_assistant_2",
+        "role": "assistant",
+        "content": "后续真实 assistant turn",
+    }])
+    assert workspace.thread().archive_cursor == "native_assistant_2"
+
+
 def test_archive_deduplicates_a_large_crash_recovery_batch(workspace) -> None:
     messages = [
         {
@@ -153,3 +179,126 @@ def test_source_snapshot_and_diff_only_advance_with_transaction(workspace, tmp_p
     assert len(changed["changes"]) == 1
     assert "-第一版日记" in changed["changes"][0]["diff"]
     assert "+第二版日记" in changed["changes"][0]["diff"]
+
+
+def test_native_question_rejection_identity_is_distinct_from_followup_assistant_turn(workspace) -> None:
+    archive = ConversationArchive(workspace)
+    proposal_hash = "sha256:" + "a" * 64
+    result = archive.archive_decision(
+        checkpoint_id="ckpt_question_identity",
+        proposal_hash=proposal_hash,
+        reason="  原始 Other 理由保留前后空格  ",
+        question_request_id="qreq_123",
+        authorization_id="grant_123",
+        native_message_id="assistant_tool_call_must_not_be_used",
+    )
+
+    decision = workspace.repository.current_records("messages")[result["message_id"]]
+    assert decision["payload"]["native_message_id"] == "question:qreq_123"
+    assert decision["payload"]["content"] == "  原始 Other 理由保留前后空格  "
+    assert decision["payload"]["decision_provenance"] == {
+        "checkpoint_id": "ckpt_question_identity",
+        "proposal_hash": proposal_hash,
+        "question_request_id": "qreq_123",
+        "decision": "no",
+        "authorization_id": "grant_123",
+    }
+
+    followup = archive.archive(
+        [
+            {
+                "native_message_id": "assistant_tool_call_must_not_be_used",
+                "role": "assistant",
+                "kind": "conversation",
+                "content": "继续处理 rejection revision",
+            }
+        ]
+    )
+    assert followup["archived"] == 1
+    assert len(list(workspace.repository.iter_records("messages"))) == 2
+
+    retry = archive.archive_decision(
+        checkpoint_id="ckpt_question_identity",
+        proposal_hash=proposal_hash,
+        reason="  原始 Other 理由保留前后空格  ",
+        question_request_id="qreq_123",
+        authorization_id="grant_123",
+    )
+    assert retry["archived"] == 0
+    assert retry["message_id"] == result["message_id"]
+
+
+def test_rejection_retry_recovers_cursor_after_crash_before_restore(workspace) -> None:
+    archive = ConversationArchive(workspace)
+    archive.archive(visible_messages())
+    proposal_hash = "sha256:" + "c" * 64
+    first = archive.archive_decision(
+        checkpoint_id="ckpt_crash_retry",
+        proposal_hash=proposal_hash,
+        reason="保留原始拒绝理由",
+        question_request_id="qreq_crash",
+        authorization_id="grant_old",
+    )
+
+    # Recreate the crash window: archive() persisted the decision but the
+    # outer cursor restoration did not complete.
+    thread = workspace.thread()
+    thread.archive_cursor = "question:qreq_crash"
+    thread.last_archived_message_id = first["message_id"]
+    workspace.save_thread(thread)
+
+    retry = archive.archive_decision(
+        checkpoint_id="ckpt_crash_retry",
+        proposal_hash=proposal_hash,
+        reason="保留原始拒绝理由",
+        question_request_id="qreq_crash",
+        authorization_id="grant_new",
+    )
+    assert retry["archived"] == 0
+    assert workspace.thread().archive_cursor == "native_assistant_1"
+    assert workspace.thread().last_archived_message_id == "msg_assistant_1"
+
+
+def test_rejection_deduplication_includes_harness_session(workspace) -> None:
+    archive = ConversationArchive(workspace)
+    first = archive.archive_decision(
+        checkpoint_id="ckpt_session_a",
+        proposal_hash="sha256:" + "d" * 64,
+        reason="session A reason",
+        question_request_id="same-request",
+        authorization_id="grant-a",
+        session_id="session-a",
+    )
+    second = archive.archive_decision(
+        checkpoint_id="ckpt_session_b",
+        proposal_hash="sha256:" + "e" * 64,
+        reason="session B reason",
+        question_request_id="same-request",
+        authorization_id="grant-b",
+        session_id="session-b",
+    )
+
+    assert first["archived"] == 1
+    assert second["archived"] == 1
+    records = list(workspace.repository.iter_records("messages"))
+    assert {(record["payload"]["native_session_id"], record["payload"]["content"]) for record in records} == {
+        ("session-a", "session A reason"),
+        ("session-b", "session B reason"),
+    }
+
+
+def test_archive_decision_rejects_non_rejection_decision(workspace) -> None:
+    archive = ConversationArchive(workspace)
+    try:
+        archive.archive_decision(
+            checkpoint_id="ckpt_invalid_decision",
+            proposal_hash="sha256:" + "b" * 64,
+            decision="yes",  # type: ignore[arg-type]
+            reason="not a valid yes archive",
+            question_request_id="qreq_invalid",
+            authorization_id="grant_invalid",
+        )
+    except ValueError as error:
+        assert "only accepts" in str(error)
+    else:
+        raise AssertionError("archive_decision must reject decision=yes")

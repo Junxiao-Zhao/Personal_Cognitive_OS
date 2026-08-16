@@ -23,8 +23,25 @@
         "content": {"type": "string"},
         "reasoning": {"type": ["string", "null"]},
         "refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "decision_provenance": {
+          "type": "object", "additionalProperties": false,
+          "required": ["checkpoint_id", "proposal_hash", "question_request_id", "decision", "authorization_id"],
+          "properties": {
+            "checkpoint_id": {"type": "string", "minLength": 1},
+            "proposal_hash": {"type": "string", "pattern": "^sha256:"},
+            "question_request_id": {"type": "string", "minLength": 1},
+            "decision": {"const": "no"},
+            "authorization_id": {"type": "string", "minLength": 1}
+          }
+        },
         "created_at": {"type": "string", "format": "date-time"}
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "checkpoint_decision"}}},
+          "then": {"required": ["decision_provenance"]}
+        }
+      ]
     }
   }
 }

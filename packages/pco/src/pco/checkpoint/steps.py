@@ -182,6 +182,43 @@ def validate_continuation(engine: Any, state: CheckpointState, operations: list[
     )
 
 
+def _main_evidence(engine: Any, refs: list[str]) -> list[dict[str, Any]]:
+    """Resolve the user-facing evidence behind protected Meta references."""
+
+    evidence: list[dict[str, Any]] = []
+    stream_aliases = {"message": "messages"}
+    for reference in refs:
+        prefix, separator, record_id = reference.partition(":")
+        if not separator or not record_id:
+            continue
+        stream = stream_aliases.get(prefix, prefix)
+        try:
+            record = engine.workspace.repository.current_records(stream).get(record_id)
+        except Exception:
+            record = None
+        if not record:
+            continue
+        payload = record.get("payload", {})
+        item: dict[str, Any] = {
+            "ref": reference,
+            "stream": stream,
+            "record_id": record.get("id"),
+        }
+        if stream == "messages":
+            item.update(
+                {
+                    "role": payload.get("role"),
+                    "content": payload.get("content", ""),
+                    "created_at": payload.get("created_at"),
+                    "native_message_id": payload.get("native_message_id"),
+                }
+            )
+        else:
+            item["payload"] = payload
+        evidence.append(item)
+    return evidence
+
+
 def protected_diff(engine: Any, operations: list[Operation]) -> list[dict[str, Any]]:
     diffs: list[dict[str, Any]] = []
     current = engine.workspace.repository.current_records("meta_revisions").get("meta_current")
@@ -205,6 +242,10 @@ def protected_diff(engine: Any, operations: list[Operation]) -> list[dict[str, A
                 "revision": operation.record["revision"],
                 "diff": diff,
                 "evidence_refs": operation.record["payload"].get("evidence_refs", []),
+                "main_evidence": _main_evidence(
+                    engine,
+                    operation.record["payload"].get("evidence_refs", []),
+                ),
             }
         )
     return diffs
@@ -316,6 +357,7 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
     if protected_operations and state.approval_challenge_id is None:
         state.approval_challenge_id = f"challenge_{uuid.uuid4().hex}"
     state.protected_streams = validation["protected_streams"]
+    protected_diffs = protected_diff(engine, operations)
     proposal = {
         "checkpoint_id": state.id,
         "transaction_id": transaction.id,
@@ -332,7 +374,12 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
         "approval_challenge_id": state.approval_challenge_id,
         "transaction_fingerprint": state.transaction_fingerprint,
         "diagnostics": result.diagnostics,
-        "protected_diff": protected_diff(engine, operations),
+        "protected_diff": protected_diffs,
+        "main_evidence": [
+            evidence
+            for diff in protected_diffs
+            for evidence in diff.get("main_evidence", [])
+        ],
     }
     initial_path = workspace.state_path(f"checkpoints/{state.id}/proposal-initial.json")
     if not initial_path.exists():

@@ -1,6 +1,6 @@
 # PCO MVP Closure：授权、自动 checkpoint 与 canonical 合同
 
-> 状态：实施规格（2026-08-15）；本轮代码已落地 P0 授权门禁、安全 auto-probe、P1 并行合同修复，OpenCode question provenance 暂以显式 `/pco-yes` 作为可靠 fallback
+> 状态：历史实施规格；原生 question 授权、remote source CLI、auto trigger、Profile capability 和 publication cache 的后续修复计划见 [2026-08-16-native-question-authorization-plan.md](2026-08-16-native-question-authorization-plan.md)
 > 依据：HEAD 63d96a8 的审查结论
 > 范围：本地文件输入、Markdown 投影、手动 /compact 主闭环，以及为 MVP 完成签字所需的通用合同修复
 
@@ -26,13 +26,14 @@
 ### 合同
 
     proposal
-      -> host 展示 proposal，用户显式 /pco-yes（question provenance 尚未可靠时的 MVP fallback）
-      -> OpenCode 插件铸造一次性 ApprovalGrant
-      -> pco_approve 只能消费插件闭包中的 grant
-      -> Python 校验 grant、challenge、session、proposal hash 和过期时间
+      -> host 通过固定 OpenCode question 展示 diff/evidence/hash
+      -> question.asked/question.replied 绑定 request、session 和原始答案
+      -> OpenCode 插件铸造一次性 Yes/No DecisionGrant
+      -> pco_approve/pco_reject 只能消费匹配的 grant
+      -> Python 校验 grant、challenge、session、proposal、request、decision、reason hash 和过期时间
       -> attach ApprovalReceipt
 
-permission: ask 不能作为唯一门禁，因为 OpenCode auto mode 可以自动批准 ask。优先探测当前 OpenCode 版本的 tool.execute.after question 结果和 command/permission provenance；如果 question 结果无法可靠关联用户回答，MVP fallback 是只允许用户显式 /pco-yes 铸造 grant。
+permission: ask 不能作为唯一门禁，因为 OpenCode auto mode 可以自动批准 ask。授权必须绑定原生 question 的结构化 asked/replied 生命周期；普通文本、permission 结果和模型复述均不是 provenance。
 
 ### 实施
 
@@ -41,14 +42,14 @@ permission: ask 不能作为唯一门禁，因为 OpenCode auto mode 可以自�
 - grant 使用插件进程内随机密钥签名，CLI 子进程只在本次调用中接收验证材料；
 - pco_approve 无模型可控参数，但无 grant 时必须返回 APPROVAL_PROVENANCE_REQUIRED；
 - grant 只能消费一次；proposal/session/challenge/expiry 任一不匹配都拒绝；
-- Yes 的授权不再由模型调用直接触发；当前 receipt 仍保留兼容的 decision record，后续可在 OpenCode question provenance 稳定后移除合成消息；
-- No 只归档真实 custom answer，不能使用 wrapper 合成的“用户批准文本”；
+- Yes 的授权不再由模型调用直接触发，也不生成 synthetic `role=user` conversation message；
+- No 只归档 question reply 的真实 custom answer，native ID 使用 `question:<question_request_id>`，不能使用 assistant tool-call message ID；
 - ApprovalReceipt 增加通用 opaque provenance 字段，不能把 OpenCode 领域类型泄漏进 mem-core。
 
 ### 验收
 
 - 直接调用 pco_approve、伪造 messageID、错误 hash、过期 grant、重复 grant 均失败；
-- `/pco-yes` 能完成同一 proposal；question 结果在可可靠关联用户 provenance 后再接入；
+- 固定 question 的 Yes/No reply 能完成同一 proposal；dismissal 保持 `AWAITING_META_APPROVAL` 并可由 `/pco-status` 重显；
 - canonical history 中没有合成的 Yes role=user 消息；
 - pre-commit 仍校验 proposal hash、transaction fingerprint、protected operations hash 和 approval reference。
 
@@ -57,7 +58,7 @@ permission: ask 不能作为唯一门禁，因为 OpenCode auto mode 可以自�
     session.idle
       -> sync
       -> auto-probe（只读、不锁）
-      -> 调度主会话 PCO control turn（当前 fallback 为提示用户执行 /compact）
+      -> 调度主会话 PCO control turn（与手动 /compact 共用前台路径）
       -> pco_checkpoint(trigger=auto)
       -> freeze/lock
       -> proposal/question/grant

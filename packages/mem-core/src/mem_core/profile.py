@@ -138,6 +138,22 @@ class Profile:
             self._safe_relative(root)
         for entry in self.config.validators:
             self.registry.resolve(entry)
+        source_readers = self.raw.get("source_readers", {})
+        ensure(
+            isinstance(source_readers, dict),
+            "SOURCE_READER_ALLOWLIST_INVALID",
+            "profile_load",
+            "Profile source_readers must be an explicit name-to-registry mapping",
+        )
+        for reader_name, entry in source_readers.items():
+            ensure(
+                isinstance(reader_name, str) and reader_name.strip() and isinstance(entry, str),
+                "SOURCE_READER_ALLOWLIST_INVALID",
+                "profile_load",
+                "Profile source_readers entries must map names to registry entry points",
+                value={"reader": reader_name, "entry": entry},
+            )
+            self.registry.resolve(entry)
         for entry in self.iter_capability_entrypoints():
             self.registry.resolve(entry)
 

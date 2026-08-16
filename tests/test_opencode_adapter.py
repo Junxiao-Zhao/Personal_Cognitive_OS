@@ -55,6 +55,8 @@ def test_opencode_117_http_contract_and_worker_reclamation(workspace, tmp_path) 
             )
         if path == "/api/session/ses_main/context":
             return httpx.Response(200, json={"data": [{"info": {"tokens": {"input": 3200}}, "parts": []}]})
+        if path == "/provider":
+            return httpx.Response(200, json={"all": [{"id": "fixture-provider", "models": {"fixture-model": {"limit": {"context": 6400}}}}]})
         if path == "/session" and request.method == "POST":
             return httpx.Response(200, json={"id": "ses_child"})
         if path == "/session/ses_child/message":

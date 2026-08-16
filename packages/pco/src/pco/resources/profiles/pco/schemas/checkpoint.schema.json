@@ -57,6 +57,14 @@
         "proposal_hash": {"type": "string", "pattern": "^sha256:"},
         "promotion_proposal_hash": {"type": ["string", "null"], "pattern": "^sha256:"},
         "approval_decision": {"enum": ["yes", "no", "not_required"]},
+        "authorization_id": {"type": ["string", "null"], "minLength": 1},
+        "authorization_provenance": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "question_request_id": {"type": "string", "minLength": 1}
+          }
+        },
         "protected_streams": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "promotion_protected_streams": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
         "meta_revision": {"type": ["integer", "null"], "minimum": 1},

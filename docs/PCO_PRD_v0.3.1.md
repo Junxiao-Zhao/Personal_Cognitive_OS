@@ -1471,7 +1471,7 @@ Git commit 成功但 AFFiNE 失败时 meta 立即激活，receipt 标记 pending
 
 ### AC-12 授权式晋升
 
-hypothesis 达到当前 Profile/SKILL 条件后自动生成 promotion proposal，但在用户选择 `Yes` 前无法写入 Meta-memory。选择 `No` 后必须填写理由或补充经历，空值不可提交；提交后不再出现 Agent 追问，Meta 不变，hypothesis 追加 disputed/rejected revision，理由作为用户证据进入当前 checkpoint。
+hypothesis 达到当前 Profile/SKILL 条件后自动生成 promotion proposal，但在用户通过 OpenCode 原生 question form 选择固定批准项并由 Plugin 生成匹配的一次性 host grant 前无法写入 Meta-memory。选择 Other 后必须提交非空理由或补充经历；该原文直接绑定 No grant 并作为 `question:<question_request_id>` 的用户 evidence 归档。空值、dismissal、模型直接调用 approve/reject、错误 session/proposal/challenge/request、过期或重放 grant 均 fail closed；提交后不再出现 Agent 追问，Meta 不变，hypothesis 追加 disputed/rejected revision。Yes 不生成合成的 `role=user` conversation message。
 
 ### AC-13 历史认识
 

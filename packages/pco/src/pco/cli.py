@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -11,13 +12,11 @@ from urllib.parse import urlparse
 from mem_core.errors import MemError, ensure
 
 from .archive import ConversationArchive
-from .backlinks import build as build_backlinks
 from .checkpoint import CheckpointEngine
+from .checkpoint.errors import derivation_error, structured_error
 from .config import load_config
-from .context import render as render_context
 from .harness import OpenCodeAdapter
-from .projections import project_affine, project_markdown
-from .retrieval import build_index, search
+from .repo_loader import resolve_derivation_source_commit
 from .sources import SourceManager
 from .workspace import Workspace
 
@@ -44,7 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
     source = commands.add_parser("source")
     source_commands = source.add_subparsers(dest="source_command", required=True)
     add = source_commands.add_parser("add")
-    add.add_argument("path", type=Path)
+    add.add_argument("path", type=Path, nargs="?")
+    add.add_argument("--locator")
+    add.add_argument("--reader")
+    add.add_argument("--provider")
     add.add_argument("--name")
     source_commands.add_parser("diff")
 
@@ -57,7 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     decide = checkpoint_commands.add_parser("decide")
     decide.add_argument("--decision", choices=["yes", "no"], required=True)
     decide.add_argument("--reason")
-    decide.add_argument("--decision-message-id")
+    decide.add_argument("--question-request-id")
     decide.add_argument("--approval-grant")
     checkpoint_commands.add_parser("status")
     checkpoint_commands.add_parser("retry")
@@ -105,18 +107,96 @@ def _adapter(workspace: Workspace, args: argparse.Namespace) -> OpenCodeAdapter:
     )
 
 
+def _derivation_error_as_memerror(error: dict[str, Any]) -> MemError:
+    details = {key: error[key] for key in ("stream", "record_id", "path", "value") if key in error}
+    return MemError(
+        str(error["code"]),
+        str(error["phase"]),
+        str(error["message"]),
+        retryable=bool(error.get("retryable", True)),
+        recovery=list(error.get("recovery", [])),
+        **details,
+    )
+
+
+def _invoke_derivation(workspace: Workspace, capability: str, phase: str, **kwargs: Any) -> dict[str, Any]:
+    try:
+        result = workspace.profile.invoke(capability, **kwargs)
+    except MemError:
+        raise
+    except Exception as exc:
+        raise _derivation_error_as_memerror(derivation_error(exc, phase)) from exc
+    if isinstance(result, dict) and result.get("ok") is False:
+        raise _derivation_error_as_memerror(structured_error(result.get("error") or result, phase))
+    return result
+
+
 def _install_opencode(workspace: Workspace, project: Path, *, force: bool) -> dict[str, Any]:
     from importlib.resources import files
 
     source_root = Path(str(files("pco.resources.opencode")))
     target_root = project.resolve() / ".opencode"
+    manifest_path = target_root / ".pco-managed.json"
+    legacy_paths = {"commands/pco-yes.md", "commands/pco-no.md"}
+
+    def digest(data: bytes) -> str:
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    previous_files: dict[str, str] = {}
+    if manifest_path.is_file():
+        try:
+            raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw_files = raw_manifest.get("files", {})
+            if isinstance(raw_files, dict):
+                previous_files = {str(path): str(value) for path, value in raw_files.items()}
+        except (OSError, TypeError, ValueError):
+            # A malformed manifest cannot authorize deletion. Normal file
+            # conflict handling below remains the safe fallback.
+            previous_files = {}
+
+    source_files = {
+        source.relative_to(source_root).as_posix(): source
+        for source in source_root.rglob("*")
+        if source.is_file() and source.name != "__init__.py" and "__pycache__" not in source.parts
+    }
     installed: list[str] = []
-    for source in source_root.rglob("*"):
-        if not source.is_file() or source.name == "__init__.py" or "__pycache__" in source.parts:
-            continue
-        relative = source.relative_to(source_root)
-        target = target_root / relative
-        if target.exists() and target.read_bytes() != source.read_bytes() and not force:
+    updated: list[str] = []
+    removed: list[str] = []
+
+    # A managed manifest is an authorization to remove files only inside the
+    # current .opencode tree. Reject malformed or escaping entries before any
+    # filesystem mutation; a compromised manifest must never become an
+    # arbitrary-file deletion primitive.
+    for relative_name in previous_files:
+        relative_path = Path(relative_name)
+        candidate = (target_root / relative_path).resolve()
+        if (
+            not relative_name
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or not candidate.is_relative_to(target_root)
+        ):
+            raise MemError(
+                "OPENCODE_MANIFEST_INVALID",
+                "install",
+                f"Managed manifest contains a path outside .opencode: {relative_name!r}",
+                path=relative_name,
+                recovery=["Remove or repair .opencode/.pco-managed.json and rerun installation"],
+            )
+
+    # Complete every overwrite/conflict check before deleting legacy files or
+    # stale manifest entries. A failed install must leave the prior install
+    # intact, especially when a user-owned file conflicts with a package file.
+    source_bytes: dict[str, bytes] = {}
+    changed_files: set[str] = set()
+    for relative_name, source in sorted(source_files.items()):
+        data = source.read_bytes()
+        source_bytes[relative_name] = data
+        target = target_root / relative_name
+        changed = target.exists() and target.read_bytes() != data
+        if changed:
+            changed_files.add(relative_name)
+        if changed and not force:
             raise MemError(
                 "OPENCODE_INTEGRATION_CONFLICT",
                 "install",
@@ -124,10 +204,50 @@ def _install_opencode(workspace: Workspace, project: Path, *, force: bool) -> di
                 path=str(target),
                 recovery=["Review the file and rerun with --force if replacement is intended"],
             )
+
+    # Explicit migration for the two PCO commands removed in this release.
+    # No directory scan is used, so unrelated user commands are untouched.
+    for relative_name in sorted(legacy_paths):
+        target = target_root / relative_name
+        if target.is_file():
+            previous_hash = previous_files.get(relative_name)
+            if previous_hash is None or digest(target.read_bytes()) == previous_hash:
+                target.unlink()
+                removed.append(str(target))
+
+    # Future upgrades may remove another PCO-managed file. Only delete a
+    # previous manifest entry when its on-disk bytes still match our hash.
+    for relative_name, previous_hash in previous_files.items():
+        if relative_name in source_files or relative_name in legacy_paths:
+            continue
+        target = target_root / relative_name
+        if target.is_file() and digest(target.read_bytes()) == previous_hash:
+            target.unlink()
+            removed.append(str(target))
+
+    for relative_name, source in sorted(source_files.items()):
+        target = target_root / relative_name
+        data = source_bytes[relative_name]
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
         installed.append(str(target))
-    return {"ok": True, "project": str(project.resolve()), "workspace": str(workspace.root), "installed": installed}
+        if relative_name in changed_files:
+            updated.append(str(target))
+
+    manifest = {
+        "version": 1,
+        "files": {relative_name: digest(data) for relative_name, data in sorted(source_bytes.items())},
+    }
+    target_root.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "ok": True,
+        "project": str(project.resolve()),
+        "workspace": str(workspace.root),
+        "installed": installed,
+        "updated": updated,
+        "removed_legacy": removed,
+    }
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -166,7 +286,25 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "source":
         manager = SourceManager(workspace)
         if args.source_command == "add":
-            return manager.register_local(args.path, display_name=args.name)
+            ensure(
+                not (args.path and args.locator),
+                "SOURCE_INPUT_CONFLICT",
+                "cli",
+                "source add accepts either a local path or --locator, not both",
+                recovery=["Use pco source add PATH", "Use pco source add --locator LOCATOR --reader READER"],
+            )
+            if args.path is not None:
+                ensure(args.reader is None, "SOURCE_INPUT_CONFLICT", "cli", "--reader is only valid with --locator")
+                ensure(args.provider is None, "SOURCE_INPUT_CONFLICT", "cli", "--provider is only valid with --locator")
+                return manager.register_local(args.path, display_name=args.name)
+            ensure(args.locator, "SOURCE_LOCATOR_REQUIRED", "cli", "Remote source add requires --locator")
+            ensure(args.reader, "SOURCE_READER_REQUIRED", "cli", "Remote source add requires --reader")
+            return manager.register_locator(
+                args.locator,
+                reader_skill=args.reader,
+                provider=args.provider or "remote",
+                display_name=args.name,
+            )
         result = manager.collect_diffs()
         return {"ok": True, "changes": result["changes"], "source_hashes": result["source_hashes"]}
     if args.command == "checkpoint":
@@ -180,12 +318,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.checkpoint_command == "auto-probe":
             return {"ok": True, "needed": engine.should_auto_checkpoint(), "context_usage": adapter.estimate_context_usage()}
         if args.checkpoint_command == "decide":
-            if args.decision == "yes":
-                ensure(args.approval_grant, "APPROVAL_GRANT_REQUIRED", "approval", "Approval must come from the host-issued approval interaction")
+            ensure(args.approval_grant, "APPROVAL_GRANT_REQUIRED", "approval", "Approval must come from the host-issued interaction")
+            ensure(args.question_request_id, "QUESTION_REQUEST_ID_REQUIRED", "approval", "A native question request ID is required for the decision")
             return engine.decide(
                 args.decision,
                 reason=args.reason,
-                native_message_id=args.decision_message_id,
+                question_request_id=args.question_request_id,
                 approval_grant=args.approval_grant,
                 session_id=args.session_id,
             )
@@ -197,17 +335,64 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             return engine.retry_derivations()
         return engine.abort()
     if args.command == "search":
-        return search(repo_root=workspace.config.memory_root, query=args.query, mode=args.mode, limit=args.limit, start=args.start, end=args.end)
+        source_commit = resolve_derivation_source_commit(
+            workspace.config.memory_root,
+            state_root=workspace.config.state_root,
+        )
+        return workspace.profile.invoke(
+            "retrieval.search",
+            repo_root=workspace.config.memory_root,
+            query=args.query,
+            mode=args.mode,
+            limit=args.limit,
+            start=args.start,
+            end=args.end,
+            indexes_root=workspace.config.indexes_root,
+            source_commit=source_commit,
+        )
     if args.command == "derive":
+        source_commit = resolve_derivation_source_commit(
+            workspace.config.memory_root,
+            state_root=workspace.config.state_root,
+        )
         if args.derive_command == "index":
-            return build_index(repo_root=workspace.config.memory_root, indexes_root=workspace.config.indexes_root, force=args.force)
+            return _invoke_derivation(
+                workspace,
+                "index.build",
+                "index",
+                repo_root=workspace.config.memory_root,
+                indexes_root=workspace.config.indexes_root,
+                force=args.force,
+                source_commit=source_commit,
+            )
         if args.derive_command == "backlinks":
-            return build_backlinks(repo_root=workspace.config.memory_root, output_path=workspace.config.state_root / "derivations" / "backlinks.json")
+            return _invoke_derivation(
+                workspace,
+                "backlinks.build",
+                "backlinks",
+                repo_root=workspace.config.memory_root,
+                output_path=workspace.config.state_root / "derivations" / "backlinks.json",
+                source_commit=source_commit,
+            )
         if args.derive_command == "context":
-            return render_context(repo_root=workspace.config.memory_root, output_path=workspace.config.state_root / "context" / "current.md")
-        if args.target == "markdown":
-            return project_markdown(repo_root=workspace.config.memory_root, output_root=workspace.config.projection_root)
-        return project_affine(repo_root=workspace.config.memory_root, state_root=workspace.config.state_root)
+            return _invoke_derivation(
+                workspace,
+                "context_renderer.render",
+                "context",
+                repo_root=workspace.config.memory_root,
+                output_path=workspace.config.state_root / "context" / "current.md",
+                source_commit=source_commit,
+            )
+        target = args.target
+        kwargs = {
+            "repo_root": workspace.config.memory_root,
+            "source_commit": source_commit,
+        }
+        if target == "markdown":
+            kwargs["output_root"] = workspace.config.projection_root
+        else:
+            kwargs["state_root"] = workspace.config.state_root
+        return _invoke_derivation(workspace, f"projections.{target}", "projection", **kwargs)
     raise MemError("COMMAND_INVALID", "cli", "Unsupported command")
 
 

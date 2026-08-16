@@ -66,6 +66,8 @@ class CheckpointState(BaseModel):
     worker_handle: dict[str, str] | None = None
     decision: Literal["yes", "no"] | None = None
     decision_message_id: str | None = None
+    decision_question_request_id: str | None = None
+    decision_authorization_id: str | None = None
     # ``commit`` is retained as a compatibility alias for content_commit.
     content_commit: str | None = None
     audit_commit: str | None = None
