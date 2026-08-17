@@ -417,7 +417,7 @@ CHECKPOINT_REQUESTED
 - 查看提案、证据和 Meta diff；
 - `Yes`；
 - `No` 并填写必填理由／补充经历；
-- `/pco status`、`/pco retry` 或 `/pco abort`。
+- `/pco-status`、`/pco-retry` 或 `/pco-abort`。
 
 ### 9.3 失败与重试
 
@@ -426,9 +426,9 @@ CHECKPOINT_REQUESTED
 - Git commit 后的 context snapshot 渲染或发布失败时同样不得 compact，但 canonical commit 与 cursor 已经生效，不得重复 consolidate 或回滚；
 - 该状态记为 `COMMITTED_CONTEXT_PENDING`，重试只能从 render/publish/compact 继续；
 - Recovery 状态只允许 PCO 控制命令：
-  - `/pco status`；
-  - `/pco retry`；
-  - `/pco abort`；
+  - `/pco-status`；
+  - `/pco-retry`；
+  - `/pco-abort`；
 - 普通聊天输入继续锁定；
 - `abort` 仅适用于 Git commit 前：清理本次临时事务、解锁输入，但不执行 compact；commit 后只能 retry context publication；
 - Agent 可恢复错误必须返回具体 JSON Pointer、错误码和建议动作。
@@ -1455,7 +1455,7 @@ checkpoint 锁定主输入并启动专用 `pco-consolidator` subagent；worker �
 
 ### AC-08 consolidate 失败
 
-非法引用导致 validate 失败，compact 不执行、cursor 与 canonical memory 不推进；普通输入保持锁定，使用 `/pco retry` 后以相同 checkpoint 完成。
+非法引用导致 validate 失败，compact 不执行、cursor 与 canonical memory 不推进；普通输入保持锁定，使用 `/pco-retry` 后以相同 checkpoint 完成。
 
 ### AC-09 派生失败
 

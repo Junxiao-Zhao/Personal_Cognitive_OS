@@ -1,8 +1,8 @@
 # PCO MVP Closure：原生 Question 授权与剩余合同修复计划
 
-> 状态：已实施；真实 OpenCode loopback 待环境验收（2026-08-16）  
-> Review baseline：`6b2032c511545e4129c3dc8a57de66fa62451454`  
-> 优先级：P0 授权闭环与归档身份 → P1 正式入口与触发准确性 → P2 capability、错误和 publication 合同 → release evidence  
+> 状态：已实施；真实 OpenCode loopback 待环境验收（2026-08-16）
+> Review baseline：`6b2032c511545e4129c3dc8a57de66fa62451454`
+> 优先级：P0 授权闭环与归档身份 → P1 正式入口与触发准确性 → P2 capability、错误和 publication 合同 → release evidence
 > 本计划不修改 `docs/DSH_PLUGIN_DRIVEN_HARNESS_ADAPTER_DESIGN.md`。
 
 ## 1. 目标与完成定义
@@ -189,6 +189,8 @@ installer 引入 PCO managed manifest，记录本次安装的相对路径与内�
 ## 5. P1 工作流
 
 ### 5.1 正式 remote source CLI
+
+以下是外部 reader 扩展安装完成后的合同示例，不是默认 PCO 安装即可执行的内置命令；默认 Profile 不注册 `affine-cli`。
 
 把 `pco source add` 设计为互斥入口：
 

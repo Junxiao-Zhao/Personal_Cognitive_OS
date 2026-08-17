@@ -39,7 +39,7 @@ pco --workspace .pco run --project .
 - `/compact`：手动进入与自动阈值完全相同的 checkpoint；若出现 Meta 提案，会在主会话打开固定的原生 question 表单，批准或用 Tab/Other 输入非空拒绝理由。
 - `/pco-status`、`/pco-retry`、`/pco-abort`：恢复控制面。
 - `pco --workspace .pco source add /path/to/journal.md`：注册只读本地来源。
-- `pco --workspace .pco source add --locator affine://workspace/document-id --reader affine-cli --provider affine`：注册由 Profile allowlist 提供的非本地来源。
+- 非本地 locator 由外部 reader/Skill 扩展提供；默认安装只包含本地文件 reader，不会注册 `affine-cli`。
 - `pco --workspace .pco search '为什么我总在公开前拖延' --mode pattern`：调用五种 Profile 检索模式之一。
 
 ## Checkpoint 保证
@@ -53,6 +53,8 @@ pco --workspace .pco run --project .
 AFFiNE 内容使用其前端内部的 BlockSuite/Yjs 文档模型，目前没有稳定的公共“按 Markdown upsert 文档”服务端 API。因此 PCO 把 provider-specific 逻辑隔离成一个严格的 JSON stdin/stdout bridge，而没有把 AFFiNE 私有 CRDT 协议写进 `mem-core`。配置方式、幂等合同和失败恢复见 [AFFiNE bridge](docs/AFFINE_BRIDGE.md)。
 
 没有设置 `PCO_AFFINE_COMMAND` 时，每个 commit 的完整 page batch 会写入 `.pco/state/affine/outbox/<commit>.json`，receipt 明确标记 pending；可随时设置 bridge 后执行 `/pco-retry`。Markdown 投影无需外部服务。
+
+AFFiNE 作为 source 的读取同样属于外部扩展点。只有在安装并注册 provider reader、且 Profile 的 `source_readers` allowlist 明确包含该 reader 后，才可注册 `affine://...` locator；默认 PCO 安装不会提供或发现 `affine-cli`，未注册时会返回结构化 `SOURCE_READER_REQUIRED`。
 
 ## 验证
 

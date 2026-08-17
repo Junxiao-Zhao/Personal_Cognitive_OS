@@ -97,6 +97,27 @@ def test_source_add_cli_keeps_local_path_entrypoint(workspace, monkeypatch, tmp_
     assert result["ok"] and result["record"]["payload"]["reader_skill"] == "local-readonly"
 
 
+def test_source_add_cli_rejects_unregistered_remote_reader(workspace, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "_workspace", lambda _args, init=False: workspace)
+    args = cli.build_parser().parse_args(
+        [
+            "--workspace",
+            str(workspace.root),
+            "source",
+            "add",
+            "--locator",
+            "affine://workspace/document-id",
+            "--reader",
+            "affine-cli",
+            "--provider",
+            "affine",
+        ]
+    )
+    with pytest.raises(MemError) as error:
+        cli.run(args)
+    assert error.value.detail.code == "SOURCE_READER_REQUIRED"
+
+
 def test_context_usage_uses_latest_assistant_total_and_tail_user_text(workspace) -> None:
     def response(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/provider":
@@ -207,7 +228,7 @@ def test_context_usage_without_usage_uses_visible_text_and_clamps(workspace) -> 
 def test_plugin_uses_host_auto_marker_and_does_not_accept_agent_trigger() -> None:
     plugin = Path("packages/pco/src/pco/resources/opencode/plugins/pco.ts").read_text(encoding="utf-8")
     assert "ForegroundAutoMarker" in plugin
-    assert "consumeForegroundAutoMarker(context.sessionID)" in plugin
+    assert "consumeForegroundAutoMarker(context.sessionID, contextMessageID)" in plugin
     assert '"--trigger", trigger' in plugin
     assert "issueForegroundAutoMarker(event.properties.sessionID)" in plugin
     assert "clearForegroundAutoMarker(marker.nonce)" in plugin

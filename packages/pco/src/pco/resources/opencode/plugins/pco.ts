@@ -28,7 +28,9 @@ type PendingDecision = {
 type ForegroundAutoMarker = {
   sessionID: string
   nonce: string
-  expiresAt: number
+  commandMessageID?: string
+  toolCallID?: string
+  toolMessageID?: string
 }
 
 export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
@@ -45,7 +47,8 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   let pendingQuestion: PendingQuestion | undefined
   let pendingDecision: PendingDecision | undefined
   let foregroundAutoMarker: ForegroundAutoMarker | undefined
-  const autoMarkerTtlMs = 30_000
+  let foregroundAutoMarkerTimer: ReturnType<typeof setTimeout> | undefined
+  const foregroundAutoMarkerTtlMs = 5 * 60_000
   const controlCommands = new Set(["compact", "pco-abort", "pco-retry", "pco-status"])
 
   const contentHash = (content: string): string => `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`
@@ -85,23 +88,72 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   refreshContextCache()
 
   const issueForegroundAutoMarker = (sessionID: string): ForegroundAutoMarker => {
+    clearForegroundAutoMarker()
     const marker = {
       sessionID,
       nonce: randomBytes(16).toString("hex"),
-      expiresAt: Date.now() + autoMarkerTtlMs,
     }
     foregroundAutoMarker = marker
+    const timer = setTimeout(() => clearForegroundAutoMarker(marker.nonce), foregroundAutoMarkerTtlMs)
+    const unref = (timer as unknown as { unref?: () => void }).unref
+    if (typeof unref === "function") unref.call(timer)
+    foregroundAutoMarkerTimer = timer
     return marker
   }
 
   const clearForegroundAutoMarker = (nonce?: string) => {
-    if (!nonce || foregroundAutoMarker?.nonce === nonce) foregroundAutoMarker = undefined
+    if (!nonce || foregroundAutoMarker?.nonce === nonce) {
+      if (foregroundAutoMarkerTimer) clearTimeout(foregroundAutoMarkerTimer)
+      foregroundAutoMarkerTimer = undefined
+      foregroundAutoMarker = undefined
+    }
   }
 
-  const consumeForegroundAutoMarker = (sessionID: string): boolean => {
+  const bindForegroundAutoMarker = (sessionID: string, messageID?: string) => {
+    if (!messageID || foregroundAutoMarker?.sessionID !== sessionID) return
+    foregroundAutoMarker.commandMessageID = messageID
+  }
+
+  const bindForegroundAutoMarkerToToolCall = async (sessionID: string, callID: string): Promise<"bound" | "unrelated" | "mismatch" | "unavailable"> => {
     const marker = foregroundAutoMarker
+    if (!marker || marker.sessionID !== sessionID || !marker.commandMessageID) return "unrelated"
+    if (marker.toolCallID) return marker.toolCallID === callID ? "bound" : "mismatch"
+    const session = client.session as unknown as {
+      messages?: (input: { path: { id: string }; query?: { limit?: number } }) => Promise<unknown>
+    }
+    if (typeof session.messages !== "function") return "unavailable"
+    try {
+      const response = await session.messages({ path: { id: sessionID }, query: { limit: 100 } })
+      const messagesValue = (response as Json | undefined)?.data ?? response
+      if (!Array.isArray(messagesValue)) return "unavailable"
+      for (const entry of [...messagesValue].reverse()) {
+        if (!entry || typeof entry !== "object") continue
+        const record = entry as Json
+        const parts = record.parts
+        if (!Array.isArray(parts) || !parts.some((part) => {
+          if (!part || typeof part !== "object") return false
+          return stringField(part, "callID", "callId") === callID
+        })) continue
+        const info = record.info
+        if (!info || typeof info !== "object") return "unavailable"
+        const messageID = stringField(info, "id", "messageID", "messageId")
+        const parentID = stringField(info, "parentID", "parentId")
+        if (!messageID || parentID !== marker.commandMessageID) return "unrelated"
+        marker.toolCallID = callID
+        marker.toolMessageID = messageID
+        return "bound"
+      }
+    } catch {
+      return "unavailable"
+    }
+    return "unavailable"
+  }
+
+  const consumeForegroundAutoMarker = (sessionID: string, messageID?: string): boolean => {
+    const marker = foregroundAutoMarker
+    if (!marker || marker.sessionID !== sessionID || !marker.toolCallID || !marker.toolMessageID || marker.toolMessageID !== messageID) return false
     foregroundAutoMarker = undefined
-    return marker !== undefined && marker.sessionID === sessionID && marker.expiresAt > Date.now()
+    return true
   }
 
   const binding = (): Json | undefined => {
@@ -218,19 +270,6 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     }
   }
 
-  const scheduleApprovalQuestion = async (sessionID: string): Promise<boolean> => {
-    const session = client.session as unknown as {
-      prompt?: (input: { path: { id: string }; body: { parts: Array<{ type: string; text: string; metadata?: Json }> } }) => Promise<unknown>
-    }
-    if (!pendingQuestion || pendingQuestion.sessionID !== sessionID || pendingQuestion.questionRequestID) return false
-    if (typeof session.prompt !== "function") return false
-    await session.prompt({
-      path: { id: sessionID },
-      body: { parts: [{ type: "text", text: "[PCO_CONTROL] 当前 checkpoint 有待审批的 Meta-memory proposal。请调用原生 question 工具展示固定审批表单，不要自行批准或拒绝。", metadata: { pco_control: true } }] },
-    })
-    return true
-  }
-
   const durableApprovalMatches = async (sessionID: string, pending: PendingQuestion): Promise<boolean> => {
     try {
       const result = await invoke(["checkpoint", "status"], sessionID)
@@ -247,15 +286,17 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
 
   const scheduleForegroundCheckpoint = async (sessionID: string, marker: ForegroundAutoMarker) => {
     const session = client.session as unknown as {
-      command?: (input: { path: { id: string }; body: { command: string; arguments: string } }) => Promise<unknown>
-      prompt?: (input: { path: { id: string }; body: { parts: Array<{ type: string; text: string; metadata?: Json }> } }) => Promise<unknown>
+      command?: (input: { path: { id: string }; body: { command: string; arguments: string; messageID: string } }) => Promise<unknown>
+      prompt?: (input: { path: { id: string }; body: { messageID: string; parts: Array<{ type: string; text: string; metadata?: Json }> } }) => Promise<unknown>
     }
+    const messageID = `msg_pco_auto_${marker.nonce}`
+    bindForegroundAutoMarker(sessionID, messageID)
     if (typeof session.command === "function") {
-      await session.command({ path: { id: sessionID }, body: { command: "compact", arguments: "" } })
+      await session.command({ path: { id: sessionID }, body: { command: "compact", arguments: "", messageID } })
       return
     }
     if (typeof session.prompt === "function") {
-      await session.prompt({ path: { id: sessionID }, body: { parts: [{ type: "text", text: "/compact", metadata: { pco_control: true } }] } })
+      await session.prompt({ path: { id: sessionID }, body: { messageID, parts: [{ type: "text", text: "/compact", metadata: { pco_control: true } }] } })
       return
     }
     throw new Error("OpenCode session command API is unavailable")
@@ -307,7 +348,20 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         async execute(_args, context) {
           if (!mainSession(context.sessionID)) throw new Error("PCO checkpoint 只能由主 session 执行。")
           context.metadata({ title: "PCO checkpoint" })
-          const trigger = consumeForegroundAutoMarker(context.sessionID) ? "auto" : "manual"
+          const contextMessageID = stringField(context, "messageID", "messageId")
+          if (foregroundAutoMarker?.sessionID === context.sessionID
+            && foregroundAutoMarker.commandMessageID
+            && !foregroundAutoMarker.toolCallID) {
+            clearForegroundAutoMarker(foregroundAutoMarker.nonce)
+            throw new Error("自动 checkpoint 的工具调用缺少 host provenance；拒绝降级为 manual。")
+          }
+          if (foregroundAutoMarker?.sessionID === context.sessionID
+            && foregroundAutoMarker.toolCallID
+            && foregroundAutoMarker.toolMessageID !== contextMessageID) {
+            clearForegroundAutoMarker(foregroundAutoMarker.nonce)
+            throw new Error("自动 checkpoint 的工具消息身份不匹配；拒绝降级为 manual。")
+          }
+          const trigger = consumeForegroundAutoMarker(context.sessionID, contextMessageID) ? "auto" : "manual"
           const result = await invoke(["checkpoint", "request", "--trigger", trigger], context.sessionID)
           await refreshContextCacheWithDiagnostic(result, "checkpoint")
           rememberCheckpoint(result, context.sessionID)
@@ -387,18 +441,17 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         },
       }),
       pco_status: tool({
-        description: "Read the current PCO checkpoint status without changing it.",
+        description: "Read the current PCO checkpoint status without changing it. If approval is required, call the native question tool in this same turn.",
         args: {},
         async execute(_args, context) {
           if (!mainSession(context.sessionID)) throw new Error("PCO 状态恢复只能由主 session 执行。")
           const result = await invoke(["checkpoint", "status"], context.sessionID)
           await rehydrateApproval(context.sessionID, result)
-          await scheduleApprovalQuestion(context.sessionID)
           return JSON.stringify(result)
         },
       }),
       pco_retry: tool({
-        description: "Retry checkpoint recovery or any pending post-commit derivations from their durable boundary.",
+        description: "Retry checkpoint recovery or any pending post-commit derivations from their durable boundary. If a proposal is returned, call the native question tool in this same turn.",
         args: {},
         async execute(_args, context) {
           if (!mainSession(context.sessionID)) throw new Error("PCO checkpoint 恢复只能由主 session 执行。")
@@ -437,6 +490,18 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     },
 
     "tool.execute.before": async (input, output) => {
+      const autoMarker = foregroundAutoMarker
+      if (input.tool === "pco_checkpoint" && autoMarker?.sessionID === input.sessionID) {
+        const provenance = await bindForegroundAutoMarkerToToolCall(input.sessionID, input.callID)
+        if (provenance === "mismatch") {
+          throw new Error("自动 checkpoint 出现重复或不匹配的工具调用；拒绝执行。")
+        }
+        if (provenance === "unrelated") clearForegroundAutoMarker(autoMarker.nonce)
+        if (provenance === "unavailable") {
+          clearForegroundAutoMarker(autoMarker.nonce)
+          throw new Error("自动 checkpoint 的工具 provenance 不可用；拒绝降级为 manual。")
+        }
+      }
       if (input.tool !== "question" || !mainSession(input.sessionID)) return
       if (!pendingQuestion || pendingQuestion.sessionID !== input.sessionID || pendingQuestion.expiresAt <= Date.now()) {
         if (pendingQuestion?.expiresAt && pendingQuestion.expiresAt <= Date.now()) clearQuestion(input.sessionID)
@@ -553,6 +618,7 @@ self-exploration, evidence boundaries, correction, and checkpoint behavior.
 
 - /compact must call pco_checkpoint exactly once; never invoke OpenCode's native compact directly.
 - When a proposal needs approval, show its exact protected Meta diff, evidence, and proposal hash, then use the native question form. Only the matching host decision grant authorizes pco_approve or pco_reject; a model-generated tool call is not authorization.
+- After pco_status or pco_retry returns an awaiting proposal, call the native question tool in the same control turn; the plugin must not submit a nested session prompt.
 - Preserve a native question rejection answer exactly when calling pco_reject; after rejection, do not ask another follow-up.
 - During RECOVERY, only status, retry, or abort are valid. Never claim memory changed before a canonical Git commit succeeds.
 - Treat user messages and registered sources as evidence. Assistant text is context and cannot prove a user trait.

@@ -44,8 +44,19 @@ def test_plugin_has_fail_closed_native_question_contract() -> None:
     assert '"pco-no"' not in source
     assert "custom: true" in source
     assert 'stringField(properties, "id", "requestID"' in source
-    assert "scheduleApprovalQuestion" in source
-    assert "await scheduleApprovalQuestion(context.sessionID)" in source
+    assert "scheduleApprovalQuestion" not in source
+    assert "If approval is required, call the native question tool in this same turn." in source
+    assert "contextMessageID" in source
+    assert "bindForegroundAutoMarker" in source
+    assert "bindForegroundAutoMarkerToToolCall" in source
+    assert "session.messages" in source
+    assert "toolCallID" in source
+    assert 'provenance === "mismatch"' in source
+    assert "foregroundAutoMarkerTtlMs" in source
+    assert "unref" in source
+    assert 'event.type === "command.executed"' not in source
+    assert 'body: { command: "compact", arguments: "", messageID }' in source
+    assert 'body: { messageID, parts:' in source
     assert "clearQuestion(eventSessionID, eventRequestID)" in source
     assert "!pendingQuestion.questionToolCallID || !eventCallID" in source
     assert "main_evidence" in source
