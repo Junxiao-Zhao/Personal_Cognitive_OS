@@ -217,12 +217,14 @@ Plugin 增加 session-bound、一次性的 `ForegroundAutoMarker`：
 ```text
 session.idle → auto-probe needed=true
 → 写入 ephemeral marker(sessionID, nonce, expiry)
-→ 调度同一个 /compact
+→ 调度同一个 /compact（不传自定义 messageID）
+→ command part 携带 nonce；chat.message 绑定 OpenCode 生成的 host message ID
+→ assistant parent/tool call 继续绑定到该 host message
 → pco_checkpoint 无参数地消费 marker
 → checkpoint request --trigger auto
 ```
 
-用户主动 `/compact` 没有 marker，因此为 manual。marker 在读取时先清除，并在调度失败、session 不匹配、超时、checkpoint 调用异常时清理。Agent 不能向 `pco_checkpoint` 传 trigger，也不能自行铸造 marker。
+用户主动 `/compact` 没有 marker，因此为 manual。marker 在调度失败或显式恢复时退休；消费或超时后保留有界 tombstone，绑定的迟到/重复 tool call 必须 fail closed，不能静默降级为 manual。Agent 不能向 `pco_checkpoint` 传 trigger，也不能自行铸造 marker。
 
 测试同时断言 receipt 与 canonical checkpoint record 的 trigger。两条路径除 trigger/调度来源外调用同一个 `CheckpointEngine.request()`。
 

@@ -231,4 +231,4 @@ def test_plugin_uses_host_auto_marker_and_does_not_accept_agent_trigger() -> Non
     assert "consumeForegroundAutoMarker(context.sessionID, contextMessageID)" in plugin
     assert '"--trigger", trigger' in plugin
     assert "issueForegroundAutoMarker(event.properties.sessionID)" in plugin
-    assert "clearForegroundAutoMarker(marker.nonce)" in plugin
+    assert "retireForegroundAutoMarker(marker.nonce, \"expired\")" in plugin

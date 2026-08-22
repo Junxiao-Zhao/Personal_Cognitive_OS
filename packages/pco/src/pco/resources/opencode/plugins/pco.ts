@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { createHash, createHmac, randomBytes } from "node:crypto"
 import type { Plugin } from "@opencode-ai/plugin"
@@ -28,9 +28,27 @@ type PendingDecision = {
 type ForegroundAutoMarker = {
   sessionID: string
   nonce: string
+  expiresAt?: number
   commandMessageID?: string
+  bindingToolCallID?: string
   toolCallID?: string
   toolMessageID?: string
+  // Internal-only marker used to distinguish a bound call restored after a
+  // plugin restart from a duplicate call in the same process. It is omitted
+  // from the durable mirror below.
+  restoredBoundCallID?: string
+}
+type ForegroundAutoTombstone = ForegroundAutoMarker & {
+  status: "expired" | "consumed"
+}
+type ForegroundAutoDispatch = {
+  sessionID: string
+  nonce: string
+  // This process-local token is copied into command-part metadata by the
+  // host hook. OpenCode clones parts between command execution and
+  // chat.message, so object identity cannot be used as the binding.
+  partToken: string
+  commandObserved?: boolean
 }
 
 export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
@@ -40,6 +58,8 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   const contextMetadataPath = resolve(stateRoot, "context", "current.json")
   const lockPath = resolve(stateRoot, "checkpoint-lock.json")
   const bindingPath = resolve(stateRoot, "harness-binding.json")
+  const foregroundAutoProvenancePath = resolve(stateRoot, "foreground-auto-provenance.json")
+  const foregroundAutoInvalidationPath = resolve(stateRoot, "foreground-auto-invalidation.json")
   const pcoCommand = process.env.PCO_COMMAND ?? "pco"
   let currentContext = ""
   let idleTask: Promise<void> | undefined
@@ -48,8 +68,22 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   let pendingDecision: PendingDecision | undefined
   let foregroundAutoMarker: ForegroundAutoMarker | undefined
   let foregroundAutoMarkerTimer: ReturnType<typeof setTimeout> | undefined
+  let foregroundAutoTombstones: ForegroundAutoTombstone[] = []
+  let foregroundAutoProvenanceIncompleteUntil = 0
+  let foregroundAutoProvenanceUnavailable = false
+  let foregroundAutoDispatch: ForegroundAutoDispatch | undefined
+  let manualCommandPendingSessionID: string | undefined
+  let manualControlMessageID: string | undefined
+  let manualCheckpointSessionID: string | undefined
+  let manualCheckpointCallID: string | undefined
+  let manualCheckpointMessageID: string | undefined
   const foregroundAutoMarkerTtlMs = 5 * 60_000
+  const foregroundAutoTombstoneTtlMs = 10 * 60_000
+  const foregroundAutoHistoryLimit = 10_000
+  const foregroundAutoArgumentPrefix = "--pco-auto-nonce="
+  const foregroundAutoTombstoneLimit = 64
   const controlCommands = new Set(["compact", "pco-abort", "pco-retry", "pco-status"])
+  const recoveryCommands = new Set(["pco-abort", "pco-retry"])
 
   const contentHash = (content: string): string => `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`
 
@@ -87,73 +121,237 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
 
   refreshContextCache()
 
+  const markForegroundAutoProvenanceUnavailable = () => {
+    foregroundAutoProvenanceUnavailable = true
+    foregroundAutoProvenanceIncompleteUntil = Math.max(
+      foregroundAutoProvenanceIncompleteUntil,
+      Date.now() + foregroundAutoTombstoneTtlMs,
+    )
+  }
+
+  const persistForegroundAutoProvenance = (): boolean => {
+    try {
+      writeFileSync(foregroundAutoProvenancePath, JSON.stringify({
+        marker: foregroundAutoMarker
+          ? {
+              ...foregroundAutoMarker,
+              nonce: undefined,
+              bindingToolCallID: undefined,
+              restoredBoundCallID: undefined,
+            }
+          : null,
+        tombstones: foregroundAutoTombstones.map((entry) => ({
+          ...entry,
+          nonce: undefined,
+          bindingToolCallID: undefined,
+          restoredBoundCallID: undefined,
+        })),
+        incompleteUntil: foregroundAutoProvenanceIncompleteUntil,
+      }), "utf8")
+      foregroundAutoProvenanceUnavailable = false
+      return true
+    } catch {
+      // A marker that cannot be durably mirrored must not authorize a later
+      // call as manual. Keep the current process in a fail-closed state.
+      markForegroundAutoProvenanceUnavailable()
+      return false
+    }
+  }
+
+  const writeForegroundAutoInvalidation = (marker: ForegroundAutoMarker, status: "expired" | "consumed"): boolean => {
+    try {
+      writeFileSync(foregroundAutoInvalidationPath, JSON.stringify({
+        sessionID: marker.sessionID,
+        commandMessageID: marker.commandMessageID,
+        toolCallID: marker.toolCallID,
+        toolMessageID: marker.toolMessageID,
+        status,
+        expiresAt: Date.now() + foregroundAutoTombstoneTtlMs,
+      }), "utf8")
+      return true
+    } catch {
+      markForegroundAutoProvenanceUnavailable()
+      return false
+    }
+  }
+
+  const clearForegroundAutoInvalidation = () => {
+    try {
+      if (existsSync(foregroundAutoInvalidationPath)) unlinkSync(foregroundAutoInvalidationPath)
+    } catch {
+      // Keep the sentinel when it cannot be removed; rejecting after restart
+      // is safer than restoring an invalidated active marker.
+    }
+  }
+
   const issueForegroundAutoMarker = (sessionID: string): ForegroundAutoMarker => {
-    clearForegroundAutoMarker()
+    if (foregroundAutoMarker) retireForegroundAutoMarker(foregroundAutoMarker.nonce, "expired")
     const marker = {
       sessionID,
       nonce: randomBytes(16).toString("hex"),
+      expiresAt: Date.now() + foregroundAutoMarkerTtlMs,
     }
     foregroundAutoMarker = marker
-    const timer = setTimeout(() => clearForegroundAutoMarker(marker.nonce), foregroundAutoMarkerTtlMs)
+    const timer = setTimeout(() => expireForegroundAutoMarker(marker.nonce), marker.expiresAt - Date.now())
     const unref = (timer as unknown as { unref?: () => void }).unref
     if (typeof unref === "function") unref.call(timer)
     foregroundAutoMarkerTimer = timer
+    persistForegroundAutoProvenance()
     return marker
   }
 
-  const clearForegroundAutoMarker = (nonce?: string) => {
-    if (!nonce || foregroundAutoMarker?.nonce === nonce) {
-      if (foregroundAutoMarkerTimer) clearTimeout(foregroundAutoMarkerTimer)
-      foregroundAutoMarkerTimer = undefined
-      foregroundAutoMarker = undefined
-    }
+  const scheduleForegroundAutoTombstoneExpiry = (entry: ForegroundAutoTombstone) => {
+    const delay = Math.max(0, (entry.expiresAt ?? (Date.now() + foregroundAutoTombstoneTtlMs)) - Date.now())
+    const timer = setTimeout(() => {
+      foregroundAutoTombstones = foregroundAutoTombstones.filter((candidate) => candidate.nonce !== entry.nonce)
+      persistForegroundAutoProvenance()
+    }, delay)
+    const unref = (timer as unknown as { unref?: () => void }).unref
+    if (typeof unref === "function") unref.call(timer)
   }
+
+  const rememberForegroundAutoTombstone = (marker: ForegroundAutoMarker, status: "expired" | "consumed"): boolean => {
+    const tombstone: ForegroundAutoTombstone = {
+      ...marker,
+      status,
+      expiresAt: Date.now() + foregroundAutoTombstoneTtlMs,
+    }
+    const nextTombstones = [
+      ...foregroundAutoTombstones.filter((entry) => entry.nonce !== marker.nonce),
+      tombstone,
+    ]
+    if (nextTombstones.length > foregroundAutoTombstoneLimit) {
+      foregroundAutoProvenanceIncompleteUntil = Math.max(
+        foregroundAutoProvenanceIncompleteUntil,
+        Date.now() + foregroundAutoTombstoneTtlMs,
+      )
+    }
+    foregroundAutoTombstones = nextTombstones.slice(-foregroundAutoTombstoneLimit)
+    scheduleForegroundAutoTombstoneExpiry(tombstone)
+    return persistForegroundAutoProvenance()
+  }
+
+  const retireForegroundAutoMarker = (nonce: string, status: "expired" | "consumed"): boolean => {
+    const marker = foregroundAutoMarker
+    if (!marker || marker.nonce !== nonce) return false
+    const invalidationWritten = writeForegroundAutoInvalidation(marker, status)
+    if (foregroundAutoMarkerTimer) clearTimeout(foregroundAutoMarkerTimer)
+    foregroundAutoMarkerTimer = undefined
+    foregroundAutoMarker = undefined
+    if (foregroundAutoDispatch?.nonce === nonce) foregroundAutoDispatch = undefined
+    const persisted = rememberForegroundAutoTombstone(marker, status)
+    if (invalidationWritten && persisted) clearForegroundAutoInvalidation()
+    else markForegroundAutoProvenanceUnavailable()
+    return invalidationWritten && persisted
+  }
+
+  const expireForegroundAutoMarker = (nonce: string) => retireForegroundAutoMarker(nonce, "expired")
 
   const bindForegroundAutoMarker = (sessionID: string, messageID?: string) => {
     if (!messageID || foregroundAutoMarker?.sessionID !== sessionID) return
     foregroundAutoMarker.commandMessageID = messageID
+    persistForegroundAutoProvenance()
   }
 
-  const bindForegroundAutoMarkerToToolCall = async (sessionID: string, callID: string): Promise<"bound" | "unrelated" | "mismatch" | "unavailable"> => {
+  const bindForegroundAutoMarkerToToolCall = async (sessionID: string, callID: string): Promise<"bound" | "manual" | "unrelated" | "mismatch" | "expired" | "consumed" | "unavailable"> => {
     const marker = foregroundAutoMarker
-    if (!marker || marker.sessionID !== sessionID || !marker.commandMessageID) return "unrelated"
-    if (marker.toolCallID) return marker.toolCallID === callID ? "bound" : "mismatch"
+    // Keep unbound tombstones in the evidence set. A retired auto turn whose
+    // host message was never observed is still provenance evidence, and an
+    // unresolved tool call must not fall through to a manual checkpoint.
+    const tombstones = foregroundAutoTombstones.filter((entry) => entry.sessionID === sessionID)
+    const currentMarker = marker?.sessionID === sessionID && Boolean(marker.commandMessageID) ? marker : undefined
+    const provenanceIncomplete = foregroundAutoProvenanceUnavailable
+      || foregroundAutoProvenanceIncompleteUntil > Date.now()
+    if (!currentMarker && tombstones.length === 0 && !provenanceIncomplete) return "unrelated"
+
+    // Reserve the active marker synchronously before any await. A duplicate
+    // tool call arriving while the history lookup is in flight must not see
+    // an unbound marker and later fall through as manual.
+    if (currentMarker?.bindingToolCallID) return "mismatch"
+    if (currentMarker?.toolCallID && currentMarker.toolCallID !== callID) return "mismatch"
+    if (currentMarker?.toolCallID === callID && currentMarker.restoredBoundCallID !== callID) return "mismatch"
+    if (currentMarker) {
+      // A persisted bound call may resume exactly once after plugin reload;
+      // subsequent calls with the same ID are duplicates in this process.
+      if (currentMarker.restoredBoundCallID === callID) currentMarker.restoredBoundCallID = undefined
+      currentMarker.bindingToolCallID = callID
+    }
+    const finish = (result: "bound" | "manual" | "unrelated" | "mismatch" | "expired" | "consumed" | "unavailable") => {
+      if (currentMarker?.bindingToolCallID === callID) currentMarker.bindingToolCallID = undefined
+      return result
+    }
+
+    // Resolve a tool call against tombstones before considering the active
+    // marker. A late call from an older auto turn must never be allowed to
+    // retire or bind a newer marker that happens to be active in the same
+    // session.
     const session = client.session as unknown as {
       messages?: (input: { path: { id: string }; query?: { limit?: number } }) => Promise<unknown>
     }
-    if (typeof session.messages !== "function") return "unavailable"
+    if (typeof session.messages !== "function") return finish("unavailable")
+    let matchingEntry: Json | undefined
     try {
-      const response = await session.messages({ path: { id: sessionID }, query: { limit: 100 } })
+      const response = await session.messages({ path: { id: sessionID }, query: { limit: foregroundAutoHistoryLimit } })
       const messagesValue = (response as Json | undefined)?.data ?? response
-      if (!Array.isArray(messagesValue)) return "unavailable"
-      for (const entry of [...messagesValue].reverse()) {
-        if (!entry || typeof entry !== "object") continue
-        const record = entry as Json
-        const parts = record.parts
-        if (!Array.isArray(parts) || !parts.some((part) => {
-          if (!part || typeof part !== "object") return false
-          return stringField(part, "callID", "callId") === callID
-        })) continue
-        const info = record.info
-        if (!info || typeof info !== "object") return "unavailable"
-        const messageID = stringField(info, "id", "messageID", "messageId")
-        const parentID = stringField(info, "parentID", "parentId")
-        if (!messageID || parentID !== marker.commandMessageID) return "unrelated"
-        marker.toolCallID = callID
-        marker.toolMessageID = messageID
-        return "bound"
-      }
+      if (!Array.isArray(messagesValue)) return finish("unavailable")
+      matchingEntry = [...messagesValue].reverse().find((candidate) => {
+        if (!candidate || typeof candidate !== "object") return false
+        const parts = (candidate as Json).parts
+        return Array.isArray(parts) && parts.some((part) => part && typeof part === "object" && stringField(part, "callID", "callId") === callID)
+      }) as Json | undefined
+      // A full page is only incomplete when this call is absent. The current
+      // tool can legitimately be the last item in an exactly-full page.
+      if (!matchingEntry && messagesValue.length >= foregroundAutoHistoryLimit) return finish("unavailable")
     } catch {
-      return "unavailable"
+      return finish("unavailable")
     }
-    return "unavailable"
+
+    if (matchingEntry) {
+      const info = matchingEntry.info
+      if (!info || typeof info !== "object") return finish("unavailable")
+      const parentID = stringField(info, "parentID", "parentId")
+      const lateMarker = tombstones.find((candidate) => candidate.commandMessageID === parentID)
+      if (lateMarker) return finish(lateMarker.status)
+      const knownManualParent = parentID === manualControlMessageID
+      if (!currentMarker) {
+        if (knownManualParent) manualCheckpointMessageID = stringField(info, "id", "messageID", "messageId")
+        return finish(knownManualParent ? "manual" : "unavailable")
+      }
+      if (parentID !== currentMarker.commandMessageID) {
+        if (knownManualParent) {
+          manualCheckpointMessageID = stringField(info, "id", "messageID", "messageId")
+          // A delayed manual control call wins the race with the active auto
+          // turn. Retire the auto marker before returning manual provenance so
+          // the delayed auto call cannot issue a duplicate checkpoint.
+          const retired = retireForegroundAutoMarker(currentMarker.nonce, "expired")
+          if (!retired) return finish("unavailable")
+        }
+        return finish(knownManualParent ? "manual" : "unavailable")
+      }
+    } else if (!currentMarker) {
+      // A retained tombstone exists, but the bounded history did not contain
+      // this call. Do not reinterpret an unresolvable auto call as manual.
+      return finish("unavailable")
+    }
+
+    if (!currentMarker) return finish("unrelated")
+    if (!matchingEntry) return finish("unavailable")
+    const info = matchingEntry.info
+    if (!info || typeof info !== "object") return finish("unavailable")
+    const messageID = stringField(info, "id", "messageID", "messageId")
+    const parentID = stringField(info, "parentID", "parentId")
+    if (!messageID || parentID !== currentMarker.commandMessageID) return finish("unavailable")
+    if (foregroundAutoMarker !== currentMarker || currentMarker.bindingToolCallID !== callID) return finish("mismatch")
+    currentMarker.toolCallID = callID
+    currentMarker.toolMessageID = messageID
+    persistForegroundAutoProvenance()
+    return finish("bound")
   }
 
   const consumeForegroundAutoMarker = (sessionID: string, messageID?: string): boolean => {
     const marker = foregroundAutoMarker
     if (!marker || marker.sessionID !== sessionID || !marker.toolCallID || !marker.toolMessageID || marker.toolMessageID !== messageID) return false
-    foregroundAutoMarker = undefined
-    return true
+    return retireForegroundAutoMarker(marker.nonce, "consumed")
   }
 
   const binding = (): Json | undefined => {
@@ -285,21 +483,30 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   }
 
   const scheduleForegroundCheckpoint = async (sessionID: string, marker: ForegroundAutoMarker) => {
+    if (foregroundAutoProvenanceUnavailable) {
+      throw new Error("自动 checkpoint provenance 无法持久化；拒绝调度。")
+    }
     const session = client.session as unknown as {
-      command?: (input: { path: { id: string }; body: { command: string; arguments: string; messageID: string } }) => Promise<unknown>
-      prompt?: (input: { path: { id: string }; body: { messageID: string; parts: Array<{ type: string; text: string; metadata?: Json }> } }) => Promise<unknown>
+      command?: (input: { path: { id: string }; body: { command: string; arguments: string } }) => Promise<unknown>
     }
-    const messageID = `msg_pco_auto_${marker.nonce}`
-    bindForegroundAutoMarker(sessionID, messageID)
     if (typeof session.command === "function") {
-      await session.command({ path: { id: sessionID }, body: { command: "compact", arguments: "", messageID } })
+      const dispatch = { sessionID, nonce: marker.nonce, partToken: randomBytes(32).toString("hex") }
+      foregroundAutoDispatch = dispatch
+      try {
+        await session.command({
+          path: { id: sessionID },
+          // The nonce is an ephemeral host-to-host dispatch token. It is
+          // stripped by command.execute.before and is never persisted or
+          // placed in agent-visible message metadata.
+          body: { command: "compact", arguments: `${foregroundAutoArgumentPrefix}${marker.nonce}` },
+        })
+      } catch (error) {
+        if (foregroundAutoDispatch === dispatch) foregroundAutoDispatch = undefined
+        throw error
+      }
       return
     }
-    if (typeof session.prompt === "function") {
-      await session.prompt({ path: { id: sessionID }, body: { messageID, parts: [{ type: "text", text: "/compact", metadata: { pco_control: true } }] } })
-      return
-    }
-    throw new Error("OpenCode session command API is unavailable")
+    throw new Error("OpenCode session command API is unavailable; refusing an unregistered auto prompt")
   }
 
   const mainSession = (sessionID: string): boolean => {
@@ -317,6 +524,13 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       if (typeof candidate === "string" && candidate.length > 0) return candidate
     }
     return undefined
+  }
+
+  const autoNonceFromArguments = (argumentsValue: string): string | undefined => {
+    const value = argumentsValue.trim()
+    return value.startsWith(foregroundAutoArgumentPrefix)
+      ? value.slice(foregroundAutoArgumentPrefix.length) || undefined
+      : undefined
   }
 
   const questionAnswer = (properties: Json): { decision: "yes" | "no"; reason?: string } | undefined => {
@@ -340,6 +554,144 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     pendingDecision = undefined
   }
 
+  const restoreForegroundAutoProvenance = () => {
+    const mainPresent = existsSync(foregroundAutoProvenancePath)
+    const invalidationPresent = existsSync(foregroundAutoInvalidationPath)
+    if (!mainPresent && !invalidationPresent) return
+    try {
+      // A retirement sentinel is independently authoritative when the main
+      // mirror was lost between the state mutation and its write.
+      const stored = mainPresent
+        ? JSON.parse(readFileSync(foregroundAutoProvenancePath, "utf8")) as Json
+        : { marker: null, tombstones: [], incompleteUntil: 0 } as Json
+      const now = Date.now()
+      // Load the persisted fail-closed window before any normalization write;
+      // otherwise dirty recovery can overwrite it with zero.
+      foregroundAutoProvenanceIncompleteUntil = Math.max(0, Number(stored.incompleteUntil) || 0)
+      let dirty = false
+      const restoreMarker = (value: unknown, status?: "expired" | "consumed"): ForegroundAutoMarker | ForegroundAutoTombstone | undefined => {
+        if (!value || typeof value !== "object") return undefined
+        const record = value as Json
+        const sessionID = stringField(record, "sessionID")
+        // Nonces are process-local dispatch secrets. Persisted tombstones can
+        // be rehydrated with a fresh internal nonce because they are matched
+        // by host message/tool provenance; an active marker still needs its
+        // host command message to be usable after restart.
+        const nonce = randomBytes(16).toString("hex")
+        if (!sessionID || (!status && !stringField(record, "commandMessageID"))) return undefined
+        const expiryValue = record.expiresAt
+        const validExpiry = typeof expiryValue === "number" && Number.isFinite(expiryValue) && expiryValue > 0
+        // An active marker with malformed expiry is not safe to restore: its
+        // authorization lifetime cannot be established. Compatibility TTL
+        // fallback is limited to already-retired tombstones.
+        if (!status && !validExpiry) return undefined
+        const expiresAt = validExpiry
+          ? expiryValue as number
+          : now + foregroundAutoTombstoneTtlMs
+        const marker: ForegroundAutoMarker = {
+          sessionID,
+          nonce,
+          expiresAt,
+          commandMessageID: stringField(record, "commandMessageID"),
+          toolCallID: stringField(record, "toolCallID"),
+          toolMessageID: stringField(record, "toolMessageID"),
+          restoredBoundCallID: !status ? stringField(record, "toolCallID") : undefined,
+        }
+        return status ? { ...marker, status } : marker
+      }
+      let invalidStructure = false
+      const hasOwn = (key: string) => Object.prototype.hasOwnProperty.call(stored, key)
+      if (mainPresent && (!hasOwn("marker") || !hasOwn("tombstones") || !Array.isArray(stored.tombstones))) invalidStructure = true
+      const storedMarker = stored.marker === null
+        ? undefined
+        : restoreMarker(stored.marker)
+      if (mainPresent && stored.marker !== null && !storedMarker) invalidStructure = true
+      let restoredInvalidation: ForegroundAutoTombstone | undefined
+      let invalidationExpired = false
+      if (existsSync(foregroundAutoInvalidationPath)) {
+        try {
+          const invalidation = JSON.parse(readFileSync(foregroundAutoInvalidationPath, "utf8")) as Json
+          const status = invalidation.status
+          if (status !== "expired" && status !== "consumed") invalidStructure = true
+          else {
+            const restored = restoreMarker(invalidation, status)
+            if (!restored || !("status" in restored)) invalidStructure = true
+            else if ((restored.expiresAt ?? 0) > now) restoredInvalidation = restored
+            else invalidationExpired = true
+          }
+        } catch {
+          invalidStructure = true
+        }
+      }
+      const invalidatesStoredMarker = Boolean(
+        restoredInvalidation
+        && storedMarker
+        && !("status" in storedMarker)
+        && restoredInvalidation.sessionID === storedMarker.sessionID
+        && ((restoredInvalidation.commandMessageID && restoredInvalidation.commandMessageID === storedMarker.commandMessageID)
+          || (restoredInvalidation.toolCallID && restoredInvalidation.toolCallID === storedMarker.toolCallID)),
+      )
+      if (storedMarker && !("status" in storedMarker) && (storedMarker.expiresAt ?? 0) > now && !invalidatesStoredMarker) {
+        foregroundAutoMarker = storedMarker
+        const timer = setTimeout(() => expireForegroundAutoMarker(storedMarker.nonce), (storedMarker.expiresAt ?? now) - now)
+        const unref = (timer as unknown as { unref?: () => void }).unref
+        if (typeof unref === "function") unref.call(timer)
+        foregroundAutoMarkerTimer = timer
+      } else if (storedMarker) {
+        // An active marker that expired while the plugin was offline is still
+        // evidence of an auto control turn. Preserve it as a tombstone so a
+        // delayed tool call cannot be reinterpreted as manual.
+        dirty = true
+      }
+      const storedTombstones = Array.isArray(stored.tombstones) ? stored.tombstones : []
+      const hasPersistedNonce = (value: unknown): boolean => Boolean(
+        value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "nonce"),
+      )
+      const restoredExpiredMarker = storedMarker && !("status" in storedMarker) && (storedMarker.expiresAt ?? 0) <= now
+        ? { ...storedMarker, status: "expired" as const, expiresAt: now + foregroundAutoTombstoneTtlMs }
+        : undefined
+      const restoredTombstones = storedTombstones
+        .map((entry) => {
+          const status = entry && typeof entry === "object" && (entry as Json).status
+          if (status !== "expired" && status !== "consumed") {
+            invalidStructure = true
+            return undefined
+          }
+          const restored = restoreMarker(entry, status)
+          if (!restored || !("status" in restored)) invalidStructure = true
+          return restored
+        })
+        .filter((entry): entry is ForegroundAutoTombstone => Boolean(entry && "status" in entry && (entry.expiresAt ?? 0) > now))
+      foregroundAutoTombstones = [
+        ...(restoredInvalidation ? [restoredInvalidation] : []),
+        ...(restoredExpiredMarker ? [restoredExpiredMarker] : []),
+        ...restoredTombstones,
+      ].filter((entry, index, entries) => entries.findIndex((candidate) => candidate.nonce === entry.nonce) === index)
+        .slice(-foregroundAutoTombstoneLimit)
+      if (!mainPresent
+        || foregroundAutoTombstones.length !== storedTombstones.length
+        || restoredExpiredMarker
+        || restoredInvalidation
+        || invalidationExpired
+        || hasPersistedNonce(stored.marker)
+        || storedTombstones.some(hasPersistedNonce)
+        || invalidStructure) dirty = true
+      for (const entry of foregroundAutoTombstones) scheduleForegroundAutoTombstoneExpiry(entry)
+      if (invalidStructure) markForegroundAutoProvenanceUnavailable()
+      const persisted = dirty ? persistForegroundAutoProvenance() : true
+      if ((restoredInvalidation || invalidationExpired) && persisted) clearForegroundAutoInvalidation()
+      // persistForegroundAutoProvenance clears the transient flag on success;
+      // malformed state must remain unavailable after the normalization write.
+      if (invalidStructure) foregroundAutoProvenanceUnavailable = true
+    } catch {
+      // A malformed or unavailable mirror cannot authorize a call. The
+      // absence of restored provenance therefore remains fail-closed.
+      markForegroundAutoProvenanceUnavailable()
+    }
+  }
+
+  restoreForegroundAutoProvenance()
+
   return {
     tool: {
       pco_checkpoint: tool({
@@ -349,19 +701,40 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
           if (!mainSession(context.sessionID)) throw new Error("PCO checkpoint 只能由主 session 执行。")
           context.metadata({ title: "PCO checkpoint" })
           const contextMessageID = stringField(context, "messageID", "messageId")
-          if (foregroundAutoMarker?.sessionID === context.sessionID
-            && foregroundAutoMarker.commandMessageID
+          const contextCallID = stringField(context, "callID", "callId", "toolCallID", "toolCallId")
+          const knownManualProvenance = manualCheckpointSessionID === context.sessionID
+            && ((contextCallID && manualCheckpointCallID === contextCallID)
+              || (contextMessageID && manualCheckpointMessageID === contextMessageID))
+          if (!knownManualProvenance && foregroundAutoMarker?.sessionID === context.sessionID
             && !foregroundAutoMarker.toolCallID) {
-            clearForegroundAutoMarker(foregroundAutoMarker.nonce)
+            retireForegroundAutoMarker(foregroundAutoMarker.nonce, "expired")
             throw new Error("自动 checkpoint 的工具调用缺少 host provenance；拒绝降级为 manual。")
           }
-          if (foregroundAutoMarker?.sessionID === context.sessionID
+          if (!knownManualProvenance && foregroundAutoMarker?.sessionID === context.sessionID
             && foregroundAutoMarker.toolCallID
             && foregroundAutoMarker.toolMessageID !== contextMessageID) {
-            clearForegroundAutoMarker(foregroundAutoMarker.nonce)
+            retireForegroundAutoMarker(foregroundAutoMarker.nonce, "expired")
             throw new Error("自动 checkpoint 的工具消息身份不匹配；拒绝降级为 manual。")
           }
-          const trigger = consumeForegroundAutoMarker(context.sessionID, contextMessageID) ? "auto" : "manual"
+          const autoRetirementExpected = !knownManualProvenance
+            && foregroundAutoMarker?.sessionID === context.sessionID
+            && Boolean(foregroundAutoMarker.toolCallID)
+            && foregroundAutoMarker.toolMessageID === contextMessageID
+          let trigger: "auto" | "manual"
+          if (knownManualProvenance) {
+            trigger = "manual"
+          } else {
+            const consumed = consumeForegroundAutoMarker(context.sessionID, contextMessageID)
+            if (autoRetirementExpected && !consumed) {
+              throw new Error("自动 checkpoint provenance retirement 未持久化；拒绝执行。")
+            }
+            trigger = consumed ? "auto" : "manual"
+          }
+          if (knownManualProvenance) {
+            manualCheckpointSessionID = undefined
+            manualCheckpointCallID = undefined
+            manualCheckpointMessageID = undefined
+          }
           const result = await invoke(["checkpoint", "request", "--trigger", trigger], context.sessionID)
           await refreshContextCacheWithDiagnostic(result, "checkpoint")
           rememberCheckpoint(result, context.sessionID)
@@ -491,14 +864,26 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
 
     "tool.execute.before": async (input, output) => {
       const autoMarker = foregroundAutoMarker
-      if (input.tool === "pco_checkpoint" && autoMarker?.sessionID === input.sessionID) {
+      const hasAutoProvenance = autoMarker?.sessionID === input.sessionID
+        || foregroundAutoTombstones.some((entry) => entry.sessionID === input.sessionID)
+        || foregroundAutoProvenanceUnavailable
+        || foregroundAutoProvenanceIncompleteUntil > Date.now()
+      if (input.tool === "pco_checkpoint" && hasAutoProvenance) {
         const provenance = await bindForegroundAutoMarkerToToolCall(input.sessionID, input.callID)
-        if (provenance === "mismatch") {
+        if (foregroundAutoProvenanceUnavailable && provenance !== "manual") {
+          throw new Error("自动 checkpoint provenance 无法持久化；拒绝执行。")
+        }
+        if (provenance === "mismatch" || provenance === "expired" || provenance === "consumed") {
           throw new Error("自动 checkpoint 出现重复或不匹配的工具调用；拒绝执行。")
         }
-        if (provenance === "unrelated") clearForegroundAutoMarker(autoMarker.nonce)
+        if (provenance === "manual") {
+          manualCheckpointSessionID = input.sessionID
+          manualCheckpointCallID = input.callID
+        }
         if (provenance === "unavailable") {
-          clearForegroundAutoMarker(autoMarker.nonce)
+          // The lookup may belong to an older tombstone while a newer marker
+          // is active. Keep the marker intact; the call is rejected, and a
+          // later retry can still establish the newer marker's provenance.
           throw new Error("自动 checkpoint 的工具 provenance 不可用；拒绝降级为 manual。")
         }
       }
@@ -521,6 +906,63 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
 
     "command.execute.before": async (input, output) => {
       if (!mainSession(input.sessionID) || !controlCommands.has(input.command)) return
+      const commandAutoNonce = autoNonceFromArguments(input.arguments)
+      const scheduledAutoDispatch = commandAutoNonce
+        && foregroundAutoDispatch?.sessionID === input.sessionID
+        && foregroundAutoDispatch.nonce === commandAutoNonce
+        && foregroundAutoMarker?.sessionID === input.sessionID
+        && foregroundAutoMarker.nonce === commandAutoNonce
+        ? foregroundAutoDispatch
+        : undefined
+      if (commandAutoNonce && !scheduledAutoDispatch) {
+        throw new Error("自动 checkpoint provenance 已过期或不匹配；拒绝执行。")
+      }
+      if (input.command === "compact" || recoveryCommands.has(input.command)) {
+        const marker = foregroundAutoMarker
+        if (marker?.sessionID === input.sessionID) {
+          if (recoveryCommands.has(input.command)) {
+            // Explicit recovery commands cancel any delayed auto control turn
+            // before they can mutate the checkpoint again.
+            retireForegroundAutoMarker(marker.nonce, "expired")
+          } else {
+            const autoPart = Boolean(scheduledAutoDispatch) && scheduledAutoDispatch === foregroundAutoDispatch
+            if (autoPart) {
+              scheduledAutoDispatch.commandObserved = true
+              for (const part of output.parts) {
+                if (part.type !== "text") continue
+                const jsonPart = part as unknown as Json
+                jsonPart.metadata = {
+                  ...((jsonPart.metadata as Json | undefined) ?? {}),
+                  pco_auto_control: true,
+                  // Unlike the scheduler nonce, this token is never placed
+                  // in command text or persisted. It exists only for the
+                  // host-to-host command/message binding and survives the
+                  // SDK's part cloning boundary.
+                  pco_auto_dispatch_token: scheduledAutoDispatch.partToken,
+                }
+                if (typeof jsonPart.text === "string") {
+                  jsonPart.text = jsonPart.text.split(`${foregroundAutoArgumentPrefix}${marker.nonce}`).join("")
+                }
+              }
+            } else if (marker.commandMessageID) {
+              if (marker.toolCallID) throw new Error("自动 checkpoint control turn 已经绑定工具调用。")
+              // A later, explicit /compact is a manual recovery command. Keep a
+              // tombstone for the old auto message so a late tool call cannot be
+              // reinterpreted as manual, then let this command proceed.
+              retireForegroundAutoMarker(marker.nonce, "expired")
+            } else {
+              // A user command raced the plugin's pending auto command. Do not
+              // attach the auto nonce to it; retire the nonce so the eventual
+              // stale auto command is rejected instead of becoming manual.
+              retireForegroundAutoMarker(marker.nonce, "expired")
+            }
+          }
+        }
+        if (input.command === "compact" && !scheduledAutoDispatch) {
+          manualCommandPendingSessionID = input.sessionID
+          manualControlMessageID = undefined
+        }
+      }
       for (const part of output.parts) {
         if (part.type !== "text") continue
         const jsonPart = part as unknown as Json
@@ -577,7 +1019,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
               try {
                 await scheduleForegroundCheckpoint(event.properties.sessionID, marker)
               } catch (error) {
-                clearForegroundAutoMarker(marker.nonce)
+                retireForegroundAutoMarker(marker.nonce, "expired")
                 await client.app.log({ body: {
                   service: "pco",
                   level: "warn",
@@ -598,6 +1040,63 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     },
 
     "chat.message": async (input, output) => {
+      const marker = foregroundAutoMarker
+      const autoControlPart = output.parts.find((part) => {
+        if (part.type !== "text") return false
+        const metadata = (part as unknown as Json).metadata as Json | undefined
+        return metadata?.pco_auto_control === true
+      })
+      const messageID = stringField(output.message, "id", "messageID", "messageId")
+      const autoDispatch = foregroundAutoDispatch?.sessionID === input.sessionID
+        && foregroundAutoDispatch.commandObserved
+        ? foregroundAutoDispatch
+        : undefined
+      const dispatchPart = autoDispatch && output.parts.some((part) => {
+        if (part.type !== "text") return false
+        const metadata = (part as unknown as Json).metadata as Json | undefined
+        return metadata?.pco_auto_dispatch_token === autoDispatch.partToken
+      })
+      const activeAuto = Boolean(autoControlPart)
+        && Boolean(autoDispatch)
+        && Boolean(dispatchPart)
+        && marker?.sessionID === input.sessionID
+        && marker.nonce === autoDispatch?.nonce
+      const staleAuto = autoControlPart
+        ? foregroundAutoTombstones.find((entry) => entry.sessionID === input.sessionID && entry.commandMessageID === messageID)
+        : undefined
+      if (staleAuto) {
+        throw new Error(`自动 checkpoint provenance 已${staleAuto.status === "consumed" ? "消费" : "过期"}；拒绝该 control turn。`)
+      }
+      if (autoControlPart && !activeAuto) {
+        // Auto control metadata is host-produced. Without the matching
+        // in-memory scheduler dispatch, it is either a replay or a forged
+        // message and must never be treated as a manual turn.
+        throw new Error("自动 checkpoint provenance nonce 未知或已失效；拒绝该 control turn。")
+      }
+      // A delayed manual command may overlap an auto control message. The
+      // auto message must not consume the pending manual binding; otherwise
+      // the real manual message will be rejected when its tool call arrives.
+      if (manualCommandPendingSessionID === input.sessionID && !autoControlPart) {
+        manualControlMessageID = stringField(output.message, "id", "messageID", "messageId")
+        manualCommandPendingSessionID = undefined
+      }
+      if (marker?.sessionID === input.sessionID && !marker.commandMessageID) {
+        const autoPart = activeAuto
+        if (autoPart) {
+          if (!messageID) {
+            retireForegroundAutoMarker(marker.nonce, "expired")
+            throw new Error("自动 checkpoint 的 host message provenance 不可用；拒绝降级为 manual。")
+          }
+          bindForegroundAutoMarker(input.sessionID, messageID)
+          foregroundAutoDispatch = undefined
+        } else {
+          // A host message without the nonce won the race with the pending
+          // auto prompt. Retire the auto attempt and let the real user turn
+          // remain manual; a later stale auto prompt is rejected by its
+          // tombstone above.
+          retireForegroundAutoMarker(marker.nonce, "expired")
+        }
+      }
       if (!mainSession(input.sessionID) || !existsSync(lockPath)) return
       const authorized = output.parts.some((part) => {
         if (part.type !== "text") return false

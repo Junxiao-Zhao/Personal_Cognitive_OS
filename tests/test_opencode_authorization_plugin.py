@@ -53,10 +53,18 @@ def test_plugin_has_fail_closed_native_question_contract() -> None:
     assert "toolCallID" in source
     assert 'provenance === "mismatch"' in source
     assert "foregroundAutoMarkerTtlMs" in source
+    assert "foregroundAutoTombstoneTtlMs" in source
+    assert "foregroundAutoHistoryLimit" in source
+    assert "foregroundAutoTombstoneLimit" in source
     assert "unref" in source
     assert 'event.type === "command.executed"' not in source
-    assert 'body: { command: "compact", arguments: "", messageID }' in source
-    assert 'body: { messageID, parts:' in source
+    assert 'body: { command: "compact", arguments:' in source
+    assert "pco_auto_control" in source
+    assert "nonce: undefined" in source
+    assert "output.message" in source
+    assert "unbound tombstones" in source
+    assert 'if (!matchingEntry && messagesValue.length >= foregroundAutoHistoryLimit) return finish("unavailable")' in source
+    assert "自动 checkpoint provenance nonce 未知或已失效" in source
     assert "clearQuestion(eventSessionID, eventRequestID)" in source
     assert "!pendingQuestion.questionToolCallID || !eventCallID" in source
     assert "main_evidence" in source

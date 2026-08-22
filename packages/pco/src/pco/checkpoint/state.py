@@ -147,7 +147,7 @@ def recover(engine: Any, state: CheckpointState, exc: Exception, *, preserve_sta
             "phase": str(state.status).lower(),
             "message": str(exc),
             "retryable": True,
-            "recovery": ["Run /pco retry with the same checkpoint"],
+            "recovery": ["Run /pco-retry with the same checkpoint"],
         }
     if not preserve_status:
         state.status = "RECOVERY"
