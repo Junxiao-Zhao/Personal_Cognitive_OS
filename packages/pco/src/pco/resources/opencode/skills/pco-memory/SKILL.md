@@ -15,7 +15,7 @@ When no Meta-memory exists, briefly offer two equal paths:
 1. Register journals, essays, prior AI conversations, analysis notes, or interview material as read-only sources.
 2. Begin with a normal self-exploration conversation and provide no files.
 
-Check only sources the user explicitly registers. Do not force initialization after a source is added. Let the user keep adding context, recommend `/compact` when the material is useful, and allow the automatic threshold to create the first checkpoint.
+Check only sources the user explicitly registers. Do not force initialization after a source is added. Let the user keep adding context, recommend `/consolidate` when the material is useful, and allow the independent automatic consolidation threshold to create the first checkpoint. Recommend `/compact` only when the user also wants the Harness conversation context compressed.
 
 ## Evidence boundary
 
@@ -45,6 +45,8 @@ Before creating a psychology or philosophy concept, actually search a reliable s
 
 ## Consolidate one frozen boundary
 
+`consolidate` and `compact` are related but distinct intents. `/consolidate` commits memory and publishes the latest context without invoking native Harness compact. `/compact` must first complete or safely reuse that same memory checkpoint and context publication, then invokes native compact exactly once. Never call a native compact command directly. The Host, not the Agent, supplies the trusted `trigger` and `intent`; call `pco_checkpoint` without arguments and fail closed if the Host has not provided valid command/auto provenance.
+
 Process only the provided `after`/`through` message range and source diffs.
 
 1. Extract or revise evidence-grounded events.
@@ -53,6 +55,8 @@ Process only the provided `after`/`through` message range and source diffs.
 4. Add hypotheses with evidence, counter-evidence, confidence, status, and policy version.
 5. Generate exactly one new continuation revision describing the current topic rather than the user's identity.
 6. Generate a full Meta-memory snapshot only when the current policy supports a meaningful promotion. Treat it as a protected proposal, never as an automatic promotion.
+
+For a no-op compact immediately after a successful consolidate, do not create a worker run, empty canonical commit, new Meta-memory, or new continuation. Reuse the matching published context and let the Host perform the one native compact side effect. A source-only hash change still requires consolidate even when no new conversation message exists.
 
 The continuation records current topics, unanswered questions, active tensions, recent decisions, and natural next directions. Keep transient conversation out of long-term Meta-memory unless promotion evidence supports it.
 
@@ -84,6 +88,17 @@ Choose the mode that matches the question:
 - `change`: compare time windows and avoid treating missing records as proof that something did not exist.
 
 Every recalled item retains its ID, time, revision, evidence links, current-status flag, and user-evidence qualification.
+
+## Checkpoint result language
+
+Keep receipts and user-facing status precise:
+
+- consolidate success: “记忆已更新，对话上下文未压缩。”
+- compact success: “记忆已更新，对话上下文已压缩。”
+- `compaction.status=not_requested` means compact was not requested; it is not a skipped failed attempt.
+- `consolidation.status=no_op` means the latest published context was safely reused.
+
+When recovery is needed, preserve the original durable `trigger` and `intent`. Retry only the failed phase: a publication failure retries publication, a native compact failure retries native compact, and an abort is valid only before canonical commit. A committed memory checkpoint cannot be aborted or rolled back.
 
 ## Safety and tone
 

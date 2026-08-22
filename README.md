@@ -36,17 +36,20 @@ pco --workspace .pco run --project .
 日常入口：
 
 - 正常对话：完整 turn 在 session idle 时独立归档。
-- `/compact`：手动进入与自动阈值完全相同的 checkpoint；若出现 Meta 提案，会在主会话打开固定的原生 question 表单，批准或用 Tab/Other 输入非空拒绝理由。
-- `/pco-status`、`/pco-retry`、`/pco-abort`：恢复控制面。
+- `/consolidate`：执行 memory checkpoint，提交并发布最新认知上下文；不压缩原始对话上下文。
+- `/compact`：先完成或复用 `/consolidate` 的 memory checkpoint；context publication 成功后再执行一次 Harness native compact。若出现 Meta 提案，会在主会话打开固定的原生 question 表单，批准或用 Tab/Other 输入非空拒绝理由。
+- `/pco-status`：只读展示同一 durable checkpoint 的 `trigger`、`intent`、consolidation、publication、derivation、compaction 和恢复状态。
+- `/pco-retry`：从最近持久化失败边界恢复；native compact 失败只重试 compact，不重复记忆提交或 context publication。
+- `/pco-abort`：仅能中止尚未 canonical commit 的 checkpoint；commit 后不能回滚，即使 compact 仍失败。
 - `pco --workspace .pco source add /path/to/journal.md`：注册只读本地来源。
 - 非本地 locator 由外部 reader/Skill 扩展提供；默认安装只包含本地文件 reader，不会注册 `affine-cli`。
 - `pco --workspace .pco search '为什么我总在公开前拖延' --mode pattern`：调用五种 Profile 检索模式之一。
 
 ## Checkpoint 保证
 
-一次 checkpoint 会锁定普通输入，冻结精确消息边界与来源哈希，在隔离的原生 OpenCode child session 中生成 proposal，并先经 Profile 校验。Meta-memory 属于 `user_approval` stream：approval receipt 同时绑定用户审阅的受保护 diff hash、完整 operation-set hash 和 transaction fingerprint。
+一次 checkpoint 会锁定普通输入，冻结精确消息边界与来源哈希，在隔离的原生 OpenCode child session 中生成 proposal，并先经 Profile 校验。`/consolidate` 只完成 memory checkpoint；`/compact` 复用同一流程，并以 context publication 成功作为 native compact 的硬门禁。Meta-memory 属于 `user_approval` stream：approval receipt 同时绑定用户审阅的受保护 diff hash、完整 operation-set hash 和 transaction fingerprint。
 
-通过后，结构化 memory 先以 `content_commit` 提交；派生能力基于该 commit 构建，随后以独立 `audit_commit` 记录 checkpoint outcome 和恢复状态。Milvus/Tantivy、backlinks 和投影属于可重建派生状态，失败只产生 pending receipt，不回滚 canonical commit。拒绝理由来自原生 question 的用户回答，作为 `question:<requestID>` 的 decision evidence 归档；Yes 不生成虚构的 user conversation message。
+通过后，结构化 memory 先以 `content_commit` 提交并发布 `currentContext`；派生能力基于该 commit 构建，只有 `intent=compact` 才在 publication 成功后调用一次 Harness native compact，随后以独立 `audit_commit` 记录 checkpoint outcome 和恢复状态。Milvus/Tantivy、backlinks 和投影属于可重建派生状态，失败只产生 pending receipt，不回滚 canonical commit。拒绝理由来自原生 question 的用户回答，作为 `question:<requestID>` 的 decision evidence 归档；Yes 不生成虚构的 user conversation message。
 
 ## AFFiNE
 
@@ -70,4 +73,4 @@ Tantivy 与 Milvus Lite 是硬依赖。后端不可用时 `pco derive index` 与
 降级到本地简化索引。PRD 规模（10 万消息）的性能基准与当前差距见
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
 
-产品与验收基线见 [MRD](docs/PCO_MRD_v0.3.md) 与 [PRD](docs/PCO_PRD_v0.3.1.md)。实现验收矩阵见 [MVP verification](docs/MVP_VERIFICATION.md)。
+产品与验收基线见 [MRD](docs/PCO_MRD_v0.3.md) 与 [PRD v0.4.0](docs/PCO_PRD_v0.4.0.md)；v0.3.1 保留为历史基线。实现验收矩阵见 [MVP verification](docs/MVP_VERIFICATION.md)。
