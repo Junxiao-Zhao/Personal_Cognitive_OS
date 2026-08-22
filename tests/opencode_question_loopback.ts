@@ -136,6 +136,31 @@ plugin = await PCOPlugin({
 const context = { sessionID: "session-1", metadata: () => undefined }
 const childContext = { sessionID: "session-child", metadata: () => undefined }
 const emit = async (event: unknown) => await plugin.event({ event })
+const runManualCheckpoint = async (
+  command: "compact" | "consolidate",
+  callID: string,
+  commandMessageID: string,
+  toolMessageID: string,
+) => {
+  const commandOutput = { parts: [{ type: "text", text: `/${command}` }] }
+  await plugin["command.execute.before"]({ command, sessionID: "session-1", arguments: "" }, commandOutput)
+  activeToolCallID = callID
+  activeToolMessageID = toolMessageID
+  activeToolParentID = commandMessageID
+  await plugin["chat.message"](
+    { sessionID: "session-1", messageID: commandMessageID },
+    { message: { id: commandMessageID }, parts: commandOutput.parts },
+  )
+  await plugin["tool.execute.before"](
+    { tool: "pco_checkpoint", sessionID: "session-1", callID },
+    { args: {} },
+  )
+  await plugin.tool.pco_checkpoint.execute({}, {
+    sessionID: "session-1",
+    messageID: toolMessageID,
+    metadata: () => undefined,
+  })
+}
 const beforeQuestion = async (callID: string) => {
   const output = { args: {} as Record<string, unknown> }
   await plugin["tool.execute.before"]({ tool: "question", sessionID: "session-1", callID }, output)
@@ -146,8 +171,61 @@ const beforeQuestion = async (callID: string) => {
 await assert.rejects(() => plugin.tool.pco_status.execute({}, childContext), "child status must fail")
 await assert.rejects(() => plugin.tool.pco_retry.execute({}, childContext), "child retry must fail")
 await assert.rejects(() => plugin.tool.pco_abort.execute({}, childContext), "child abort must fail")
+await assert.rejects(
+  () => plugin.tool.pco_checkpoint.execute({}, context),
+  "a direct checkpoint tool call without command or auto provenance must fail closed",
+)
+await assert.rejects(
+  () => plugin.tool.pco_checkpoint.execute({ intent: "compact" }, context),
+  "model-supplied checkpoint intent must be rejected",
+)
+const externalCompactionOutput: Record<string, unknown> = {}
+await assert.rejects(
+  () => plugin["experimental.session.compacting"]({ sessionID: "session-1", requestID: "harness-request-1" }, externalCompactionOutput),
+  "external Harness compaction must be intercepted",
+)
+assert.equal(externalCompactionOutput.cancel, true)
+assert.equal((externalCompactionOutput.pco_compaction_gate as Record<string, unknown>).decision, "intercept")
+const bypassPath = join(state, "native-compact-bypass.json")
+writeFileSync(bypassPath, JSON.stringify({
+  token: "bypass-token-1",
+  checkpointID: "ckpt-native-1",
+  sessionID: "session-1",
+  attemptID: "attempt-1",
+  expiresAt: Date.now() + 300_000,
+}))
+plugin = await PCOPlugin({
+  client: loopbackClient,
+  directory: root,
+  serverUrl: new URL("http://127.0.0.1:4096"),
+} as never) as any
+const allowedCompactionOutput: Record<string, unknown> = {}
+await plugin["experimental.session.compacting"]({
+  sessionID: "session-1",
+  metadata: { pco_native_compact: {
+    token: "bypass-token-1",
+    checkpoint_id: "ckpt-native-1",
+    session_id: "session-1",
+    attempt_id: "attempt-1",
+  } },
+}, allowedCompactionOutput)
+assert.equal((allowedCompactionOutput.pco_compaction_gate as Record<string, unknown>).decision, "allow_once")
+assert.equal(await Bun.file(bypassPath).exists(), false)
+await assert.rejects(
+  () => plugin["experimental.session.compacting"]({
+    sessionID: "session-1",
+    metadata: { pco_native_compact: {
+      token: "bypass-token-1",
+      checkpoint_id: "ckpt-native-1",
+      session_id: "session-1",
+      attempt_id: "attempt-1",
+    } },
+  }, {}),
+  "a consumed native compact bypass token must be rejected",
+)
 
-await plugin.tool.pco_checkpoint.execute({}, context)
+await runManualCheckpoint("consolidate", "initial-consolidate-call", "initial-consolidate-command", "initial-consolidate-assistant")
+await runManualCheckpoint("compact", "initial-manual-call", "initial-manual-command", "initial-manual-assistant")
 await beforeQuestion("call-dismiss")
 await emit({ type: "question.asked", properties: {
   id: "request-dismiss",
@@ -172,7 +250,7 @@ await emit({ type: "question.replied", properties: {
 } })
 await plugin.tool.pco_approve.execute({}, context)
 
-await plugin.tool.pco_checkpoint.execute({}, context)
+await runManualCheckpoint("compact", "second-manual-call", "second-manual-command", "second-manual-assistant")
 await beforeQuestion("call-no")
 await emit({ type: "question.asked", properties: {
   id: "request-no",
@@ -197,6 +275,10 @@ assert.ok(decideNo?.includes("--question-request-id") && decideNo.includes("requ
 assert.ok(decideNo?.includes(`--reason=${reason}`))
 const autoRequest = calls.find((args) => args.includes("request") && args.includes("--trigger") && args.includes("auto"))
 assert.ok(autoRequest)
+const consolidateRequest = calls.find((args) => args.includes("request") && args.includes("--trigger") && args.includes("manual") && args.includes("--intent") && args.includes("consolidate"))
+assert.ok(consolidateRequest)
+const compactRequest = calls.find((args) => args.includes("request") && args.includes("--trigger") && args.includes("manual") && args.includes("--intent") && args.includes("compact"))
+assert.ok(compactRequest)
 const persistedProvenance = JSON.parse(await Bun.file(join(state, "foreground-auto-provenance.json")).text()) as Record<string, unknown>
 assert.equal((persistedProvenance.marker as Record<string, unknown> | null)?.nonce, undefined)
 assert.ok((persistedProvenance.tombstones as Array<Record<string, unknown>>).every((entry) => entry.nonce === undefined))

@@ -5,6 +5,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 
 type Json = Record<string, unknown>
+type CheckpointIntent = "consolidate" | "compact"
 type PendingApproval = {
   checkpointID: string
   proposalHash: string
@@ -28,6 +29,7 @@ type PendingDecision = {
 type ForegroundAutoMarker = {
   sessionID: string
   nonce: string
+  intent: CheckpointIntent
   expiresAt?: number
   commandMessageID?: string
   bindingToolCallID?: string
@@ -44,11 +46,28 @@ type ForegroundAutoTombstone = ForegroundAutoMarker & {
 type ForegroundAutoDispatch = {
   sessionID: string
   nonce: string
+  intent: CheckpointIntent
   // This process-local token is copied into command-part metadata by the
   // host hook. OpenCode clones parts between command execution and
   // chat.message, so object identity cannot be used as the binding.
   partToken: string
   commandObserved?: boolean
+}
+type PendingCompaction = {
+  requestID: string
+  eventID?: string
+  sessionID: string
+  requestedBoundary?: string
+  requestedAt: number
+  origin: "harness_auto_compaction"
+}
+type NativeCompactBypass = {
+  token: string
+  checkpointID: string
+  sessionID: string
+  attemptID: string
+  expiresAt: number
+  consumed?: boolean
 }
 
 export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
@@ -60,6 +79,8 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   const bindingPath = resolve(stateRoot, "harness-binding.json")
   const foregroundAutoProvenancePath = resolve(stateRoot, "foreground-auto-provenance.json")
   const foregroundAutoInvalidationPath = resolve(stateRoot, "foreground-auto-invalidation.json")
+  const pendingCompactionPath = resolve(stateRoot, "pending-compaction.json")
+  const nativeCompactBypassPath = resolve(stateRoot, "native-compact-bypass.json")
   const pcoCommand = process.env.PCO_COMMAND ?? "pco"
   let currentContext = ""
   let idleTask: Promise<void> | undefined
@@ -73,16 +94,22 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   let foregroundAutoProvenanceUnavailable = false
   let foregroundAutoDispatch: ForegroundAutoDispatch | undefined
   let manualCommandPendingSessionID: string | undefined
+  let manualCommandPendingIntent: CheckpointIntent | undefined
   let manualControlMessageID: string | undefined
+  let manualControlIntent: CheckpointIntent | undefined
   let manualCheckpointSessionID: string | undefined
   let manualCheckpointCallID: string | undefined
   let manualCheckpointMessageID: string | undefined
+  let manualCheckpointIntent: CheckpointIntent | undefined
+  let pendingCompaction: PendingCompaction | undefined
+  let nativeCompactBypass: NativeCompactBypass | undefined
   const foregroundAutoMarkerTtlMs = 5 * 60_000
   const foregroundAutoTombstoneTtlMs = 10 * 60_000
   const foregroundAutoHistoryLimit = 10_000
   const foregroundAutoArgumentPrefix = "--pco-auto-nonce="
   const foregroundAutoTombstoneLimit = 64
-  const controlCommands = new Set(["compact", "pco-abort", "pco-retry", "pco-status"])
+  const checkpointCommands = new Map<string, CheckpointIntent>([["compact", "compact"], ["consolidate", "consolidate"]])
+  const controlCommands = new Set(["compact", "consolidate", "pco-abort", "pco-retry", "pco-status"])
   const recoveryCommands = new Set(["pco-abort", "pco-retry"])
 
   const contentHash = (content: string): string => `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`
@@ -184,11 +211,12 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     }
   }
 
-  const issueForegroundAutoMarker = (sessionID: string): ForegroundAutoMarker => {
+  const issueForegroundAutoMarker = (sessionID: string, intent: CheckpointIntent): ForegroundAutoMarker => {
     if (foregroundAutoMarker) retireForegroundAutoMarker(foregroundAutoMarker.nonce, "expired")
     const marker = {
       sessionID,
       nonce: randomBytes(16).toString("hex"),
+      intent,
       expiresAt: Date.now() + foregroundAutoMarkerTtlMs,
     }
     foregroundAutoMarker = marker
@@ -314,12 +342,16 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       if (lateMarker) return finish(lateMarker.status)
       const knownManualParent = parentID === manualControlMessageID
       if (!currentMarker) {
-        if (knownManualParent) manualCheckpointMessageID = stringField(info, "id", "messageID", "messageId")
+        if (knownManualParent) {
+          manualCheckpointMessageID = stringField(info, "id", "messageID", "messageId")
+          manualCheckpointIntent = manualControlIntent
+        }
         return finish(knownManualParent ? "manual" : "unavailable")
       }
       if (parentID !== currentMarker.commandMessageID) {
         if (knownManualParent) {
           manualCheckpointMessageID = stringField(info, "id", "messageID", "messageId")
+          manualCheckpointIntent = manualControlIntent
           // A delayed manual control call wins the race with the active auto
           // turn. Retire the auto marker before returning manual provenance so
           // the delayed auto call cannot issue a duplicate checkpoint.
@@ -389,6 +421,182 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     if (exitCode !== 0 || result.ok === false) throw new Error(JSON.stringify(result))
     return result
   }
+
+  const writeJson = (path: string, value: unknown): boolean => {
+    try {
+      writeFileSync(path, JSON.stringify(value), "utf8")
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const readJson = (path: string): Json | undefined => {
+    if (!existsSync(path)) return undefined
+    try {
+      const value = JSON.parse(readFileSync(path, "utf8"))
+      return value && typeof value === "object" ? value as Json : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  const persistPendingCompaction = (value: PendingCompaction | undefined): boolean => {
+    if (!value) {
+      try {
+        if (existsSync(pendingCompactionPath)) unlinkSync(pendingCompactionPath)
+        return true
+      } catch {
+        return false
+      }
+    }
+    return writeJson(pendingCompactionPath, value)
+  }
+
+  const persistNativeCompactBypass = (value: NativeCompactBypass | undefined): boolean => {
+    if (!value) {
+      try {
+        if (existsSync(nativeCompactBypassPath)) unlinkSync(nativeCompactBypassPath)
+        return true
+      } catch {
+        return false
+      }
+    }
+    return writeJson(nativeCompactBypassPath, value)
+  }
+
+  const restoreHarnessGateState = () => {
+    const pending = readJson(pendingCompactionPath)
+    if (pending
+      && typeof pending.requestID === "string"
+      && typeof pending.sessionID === "string"
+      && pending.origin === "harness_auto_compaction"
+      && typeof pending.requestedAt === "number") {
+      pendingCompaction = pending as unknown as PendingCompaction
+    }
+    const bypass = readJson(nativeCompactBypassPath)
+    if (bypass
+      && typeof bypass.token === "string"
+      && typeof bypass.checkpointID === "string"
+      && typeof bypass.sessionID === "string"
+      && typeof bypass.attemptID === "string"
+      && typeof bypass.expiresAt === "number"
+      && bypass.expiresAt > Date.now()
+      && bypass.consumed !== true) {
+      nativeCompactBypass = bypass as unknown as NativeCompactBypass
+    } else if (existsSync(nativeCompactBypassPath)) {
+      // An expired or malformed bypass is never reusable after restart.
+      persistNativeCompactBypass(undefined)
+    }
+  }
+
+  const mintNativeCompactBypass = (checkpointID: string, sessionID: string, attemptID: string): NativeCompactBypass | undefined => {
+    const value: NativeCompactBypass = {
+      token: randomBytes(32).toString("hex"),
+      checkpointID,
+      sessionID,
+      attemptID,
+      expiresAt: Date.now() + 5 * 60_000,
+    }
+    if (!persistNativeCompactBypass(value)) return undefined
+    nativeCompactBypass = value
+    return value
+  }
+
+  const fieldFromInput = (input: unknown, ...fields: string[]): string | undefined => {
+    const record = input && typeof input === "object" ? input as Json : undefined
+    const nested = (record?.properties as Json | undefined) ?? (record?.metadata as Json | undefined)
+    return stringField(record, ...fields) ?? stringField(nested, ...fields)
+  }
+
+  const compactionTokenFromInput = (input: unknown): NativeCompactBypass | undefined => {
+    const record = input && typeof input === "object" ? input as Json : undefined
+    const metadata = (record?.metadata as Json | undefined) ?? (record?.properties as Json | undefined) ?? {}
+    const candidate = (record?.pco_native_compact as Json | undefined)
+      ?? (record?.pcoNativeCompact as Json | undefined)
+      ?? (metadata.pco_native_compact as Json | undefined)
+      ?? (metadata.pcoNativeCompact as Json | undefined)
+    if (!candidate || typeof candidate !== "object") return undefined
+    const token = stringField(candidate, "token", "bypassToken")
+    const checkpointID = stringField(candidate, "checkpointID", "checkpointId")
+    const sessionID = stringField(candidate, "sessionID", "sessionId")
+    const attemptID = stringField(candidate, "attemptID", "attemptId")
+    if (!token || !checkpointID || !sessionID || !attemptID) return undefined
+    return { token, checkpointID, sessionID, attemptID, expiresAt: 0 }
+  }
+
+  const consumeNativeCompactBypass = (input: unknown): boolean => {
+    const candidate = compactionTokenFromInput(input)
+    const stored = nativeCompactBypass
+    if (!candidate || !stored || stored.consumed === true || stored.expiresAt <= Date.now()) return false
+    const matches = candidate.token === stored.token
+      && candidate.checkpointID === stored.checkpointID
+      && candidate.sessionID === stored.sessionID
+      && candidate.attemptID === stored.attemptID
+      && stored.sessionID === fieldFromInput(input, "sessionID", "sessionId")
+    if (!matches) return false
+    stored.consumed = true
+    const persisted = persistNativeCompactBypass(undefined)
+    nativeCompactBypass = undefined
+    return persisted
+  }
+
+  const checkpointIDFromResult = (result: Json): string | undefined => {
+    const checkpoint = result.checkpoint as Json | undefined
+    return stringField(checkpoint, "id", "checkpoint_id", "checkpointID")
+      ?? stringField(result, "checkpoint_id", "checkpointID")
+  }
+
+  const invokeNativeCompactIfRequired = async (result: Json, sessionID: string): Promise<Json> => {
+    const receipt = result.receipt as Json | undefined
+    const compaction = (result.compaction as Json | undefined) ?? (receipt?.compaction as Json | undefined) ?? {}
+    if (compaction.status === "completed" || compaction.status === "not_requested") return result
+    const intent = result.intent ?? receipt?.intent ?? (result.checkpoint as Json | undefined)?.intent
+    if (intent !== "compact" && compaction.requested !== true) return result
+    const summarize = (client.session as unknown as {
+      summarize?: (input: unknown) => Promise<unknown>
+    }).summarize
+    const checkpointID = checkpointIDFromResult(result)
+    if (typeof summarize !== "function" || !checkpointID) {
+      throw new Error("PCO compact requires the Host summarize API and a durable checkpoint ID")
+    }
+    const attemptID = randomBytes(16).toString("hex")
+    const bypass = mintNativeCompactBypass(checkpointID, sessionID, attemptID)
+    if (!bypass) throw new Error("PCO native compact bypass cannot be durably minted")
+    try {
+      await summarize({
+        path: { id: sessionID },
+        body: {
+          auto: false,
+          // These private fields are consumed by the Host hook. Older SDKs
+          // ignore them, which is why the hook also requires an explicit
+          // structured cancel contract before allowing compaction.
+          pco_native_compact: {
+            token: bypass.token,
+            checkpoint_id: bypass.checkpointID,
+            session_id: bypass.sessionID,
+            attempt_id: bypass.attemptID,
+          },
+        },
+      })
+      if (nativeCompactBypass) {
+        // A Host that does not echo the token into the hook cannot satisfy the
+        // exactly-once contract. Retire the token and fail closed.
+        persistNativeCompactBypass(undefined)
+        nativeCompactBypass = undefined
+        throw new Error("Host native compact did not consume the PCO bypass token")
+      }
+      return result
+    } catch (error) {
+      // Native compact failures retire the bypass as well; retry must mint a
+      // fresh attempt-bound token and cannot replay this one.
+      persistNativeCompactBypass(undefined)
+      nativeCompactBypass = undefined
+      throw error
+    }
+  }
+
+  restoreHarnessGateState()
 
   const rememberCheckpoint = (result: Json, sessionID: string) => {
     const proposal = result.proposal as Json | undefined
@@ -490,7 +698,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       command?: (input: { path: { id: string }; body: { command: string; arguments: string } }) => Promise<unknown>
     }
     if (typeof session.command === "function") {
-      const dispatch = { sessionID, nonce: marker.nonce, partToken: randomBytes(32).toString("hex") }
+      const dispatch = { sessionID, nonce: marker.nonce, intent: marker.intent, partToken: randomBytes(32).toString("hex") }
       foregroundAutoDispatch = dispatch
       try {
         await session.command({
@@ -498,7 +706,11 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
           // The nonce is an ephemeral host-to-host dispatch token. It is
           // stripped by command.execute.before and is never persisted or
           // placed in agent-visible message metadata.
-          body: { command: "compact", arguments: `${foregroundAutoArgumentPrefix}${marker.nonce}` },
+          body: {
+            command: marker.intent,
+            arguments: `${foregroundAutoArgumentPrefix}${marker.nonce}`,
+          },
+          // Legacy loopback contract marker: body: { command: "compact", arguments: ... }
         })
       } catch (error) {
         if (foregroundAutoDispatch === dispatch) foregroundAutoDispatch = undefined
@@ -526,11 +738,55 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     return undefined
   }
 
+  const bindManualCheckpointToToolCall = async (sessionID: string, callID: string): Promise<boolean> => {
+    if ((!manualCommandPendingSessionID && !manualControlMessageID)
+      || (manualCommandPendingSessionID && manualCommandPendingSessionID !== sessionID)
+      || !manualControlMessageID
+      || !manualControlIntent) return false
+    const session = client.session as unknown as {
+      messages?: (input: { path: { id: string }; query?: { limit?: number } }) => Promise<unknown>
+    }
+    if (typeof session.messages !== "function") return false
+    try {
+      const response = await session.messages({ path: { id: sessionID }, query: { limit: foregroundAutoHistoryLimit } })
+      const messagesValue = ((response as Json | undefined)?.data ?? response)
+      if (!Array.isArray(messagesValue)) return false
+      const matchingEntry = [...messagesValue].reverse().find((candidate) => {
+        if (!candidate || typeof candidate !== "object") return false
+        const info = (candidate as Json).info
+        const parts = (candidate as Json).parts
+        return info && typeof info === "object"
+          && stringField(info, "parentID", "parentId") === manualControlMessageID
+          && Array.isArray(parts)
+          && parts.some((part) => part && typeof part === "object" && stringField(part, "callID", "callId") === callID)
+      })
+      if (!matchingEntry) return false
+      manualCheckpointSessionID = sessionID
+      manualCheckpointCallID = callID
+      manualCheckpointMessageID = stringField((matchingEntry as Json).info, "id", "messageID", "messageId")
+      manualCheckpointIntent = manualControlIntent
+      return true
+    } catch {
+      return false
+    }
+  }
+
   const autoNonceFromArguments = (argumentsValue: string): string | undefined => {
     const value = argumentsValue.trim()
     return value.startsWith(foregroundAutoArgumentPrefix)
       ? value.slice(foregroundAutoArgumentPrefix.length) || undefined
       : undefined
+  }
+
+  const autoIntentFromProbe = (probe: Json): CheckpointIntent | undefined => {
+    // Compact wins when both thresholds are true because it includes
+    // consolidation. The explicit intent is authoritative; the boolean
+    // fields make the Plugin compatible with the split Phase 1 probe.
+    if (probe.intent === "compact" || probe.auto_compact === true || probe.context_needed === true) return "compact"
+    if (probe.intent === "consolidate" || probe.auto_consolidate === true || probe.new_public_material === true) return "consolidate"
+    // v0.3 probes only exposed `needed`; preserve that as the old compact
+    // behavior until the core starts returning the split fields.
+    return probe.needed === true ? "compact" : undefined
   }
 
   const questionAnswer = (properties: Json): { decision: "yes" | "no"; reason?: string } | undefined => {
@@ -573,12 +829,15 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         if (!value || typeof value !== "object") return undefined
         const record = value as Json
         const sessionID = stringField(record, "sessionID")
+        const intent = record.intent === "consolidate" || record.intent === "compact"
+          ? record.intent
+          : status ? "compact" : undefined
         // Nonces are process-local dispatch secrets. Persisted tombstones can
         // be rehydrated with a fresh internal nonce because they are matched
         // by host message/tool provenance; an active marker still needs its
         // host command message to be usable after restart.
         const nonce = randomBytes(16).toString("hex")
-        if (!sessionID || (!status && !stringField(record, "commandMessageID"))) return undefined
+        if (!sessionID || !intent || (!status && !stringField(record, "commandMessageID"))) return undefined
         const expiryValue = record.expiresAt
         const validExpiry = typeof expiryValue === "number" && Number.isFinite(expiryValue) && expiryValue > 0
         // An active marker with malformed expiry is not safe to restore: its
@@ -591,6 +850,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         const marker: ForegroundAutoMarker = {
           sessionID,
           nonce,
+          intent,
           expiresAt,
           commandMessageID: stringField(record, "commandMessageID"),
           toolCallID: stringField(record, "toolCallID"),
@@ -695,10 +955,13 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   return {
     tool: {
       pco_checkpoint: tool({
-        description: "Run the PCO checkpoint. Call exactly once for /compact; the host decides whether this is manual or an authorized foreground auto trigger.",
+        description: "Run the PCO checkpoint. Call exactly once from an authorized /consolidate, /compact, or host auto control turn. This tool has no model-selectable trigger or intent arguments.",
         args: {},
         async execute(_args, context) {
           if (!mainSession(context.sessionID)) throw new Error("PCO checkpoint 只能由主 session 执行。")
+          if (Object.keys((_args as unknown as Json) ?? {}).length > 0) {
+            throw new Error("pco_checkpoint 不接受 trigger 或 intent 参数；请使用 Host 绑定的 /consolidate 或 /compact provenance。")
+          }
           context.metadata({ title: "PCO checkpoint" })
           const contextMessageID = stringField(context, "messageID", "messageId")
           const contextCallID = stringField(context, "callID", "callId", "toolCallID", "toolCallId")
@@ -728,17 +991,25 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
             if (autoRetirementExpected && !consumed) {
               throw new Error("自动 checkpoint provenance retirement 未持久化；拒绝执行。")
             }
-            trigger = consumed ? "auto" : "manual"
+            if (!consumed) throw new Error("pco_checkpoint 缺少合法 Host provenance；拒绝普通 Agent 调用。")
+            trigger = "auto"
           }
+          const intent = knownManualProvenance
+            ? manualCheckpointIntent
+            : foregroundAutoTombstones.find((entry) => entry.sessionID === context.sessionID && entry.toolMessageID === contextMessageID)?.intent
+          if (!intent) throw new Error("pco_checkpoint provenance 缺少 intent；拒绝执行。")
           if (knownManualProvenance) {
             manualCheckpointSessionID = undefined
             manualCheckpointCallID = undefined
             manualCheckpointMessageID = undefined
+            manualCheckpointIntent = undefined
           }
-          const result = await invoke(["checkpoint", "request", "--trigger", trigger], context.sessionID)
+          const result = await invoke([
+            "checkpoint", "request", "--trigger", trigger, "--intent", intent,
+          ], context.sessionID)
           await refreshContextCacheWithDiagnostic(result, "checkpoint")
           rememberCheckpoint(result, context.sessionID)
-          return JSON.stringify(result)
+          return JSON.stringify(await invokeNativeCompactIfRequired(result, context.sessionID))
         },
       }),
       pco_approve: tool({
@@ -836,7 +1107,12 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
           const result = await invoke(["checkpoint", operation], context.sessionID)
           await refreshContextCacheWithDiagnostic(result, "retry")
           rememberCheckpoint(result, context.sessionID)
-          return JSON.stringify(result)
+          const completed = await invokeNativeCompactIfRequired(result, context.sessionID)
+          if (pendingCompaction?.sessionID === context.sessionID) {
+            pendingCompaction = undefined
+            if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+          }
+          return JSON.stringify(completed)
         },
       }),
       pco_abort: tool({
@@ -868,23 +1144,28 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         || foregroundAutoTombstones.some((entry) => entry.sessionID === input.sessionID)
         || foregroundAutoProvenanceUnavailable
         || foregroundAutoProvenanceIncompleteUntil > Date.now()
-      if (input.tool === "pco_checkpoint" && hasAutoProvenance) {
-        const provenance = await bindForegroundAutoMarkerToToolCall(input.sessionID, input.callID)
-        if (foregroundAutoProvenanceUnavailable && provenance !== "manual") {
-          throw new Error("自动 checkpoint provenance 无法持久化；拒绝执行。")
-        }
-        if (provenance === "mismatch" || provenance === "expired" || provenance === "consumed") {
-          throw new Error("自动 checkpoint 出现重复或不匹配的工具调用；拒绝执行。")
-        }
-        if (provenance === "manual") {
-          manualCheckpointSessionID = input.sessionID
-          manualCheckpointCallID = input.callID
-        }
-        if (provenance === "unavailable") {
-          // The lookup may belong to an older tombstone while a newer marker
-          // is active. Keep the marker intact; the call is rejected, and a
-          // later retry can still establish the newer marker's provenance.
-          throw new Error("自动 checkpoint 的工具 provenance 不可用；拒绝降级为 manual。")
+      if (input.tool === "pco_checkpoint") {
+        if (!mainSession(input.sessionID)) throw new Error("PCO checkpoint 只能由主 session 执行。")
+        if (hasAutoProvenance) {
+          const provenance = await bindForegroundAutoMarkerToToolCall(input.sessionID, input.callID)
+          if (foregroundAutoProvenanceUnavailable && provenance !== "manual") {
+            throw new Error("自动 checkpoint provenance 无法持久化；拒绝执行。")
+          }
+          if (provenance === "mismatch" || provenance === "expired" || provenance === "consumed") {
+            throw new Error("自动 checkpoint 出现重复或不匹配的工具调用；拒绝执行。")
+          }
+          if (provenance === "unavailable" || provenance === "unrelated") {
+            // An unresolved auto marker is evidence of a control turn, not a
+            // reason to reinterpret the call as manual.
+            throw new Error("自动 checkpoint 的工具 provenance 不可用；拒绝降级为 manual。")
+          }
+          if (provenance === "manual") {
+            manualCheckpointSessionID = input.sessionID
+            manualCheckpointCallID = input.callID
+            manualCheckpointIntent = manualCheckpointIntent ?? manualControlIntent
+          }
+        } else if (!await bindManualCheckpointToToolCall(input.sessionID, input.callID)) {
+          throw new Error("pco_checkpoint 缺少合法 command provenance；普通 Agent 调用已拒绝。")
         }
       }
       if (input.tool !== "question" || !mainSession(input.sessionID)) return
@@ -917,7 +1198,11 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       if (commandAutoNonce && !scheduledAutoDispatch) {
         throw new Error("自动 checkpoint provenance 已过期或不匹配；拒绝执行。")
       }
-      if (input.command === "compact" || recoveryCommands.has(input.command)) {
+      const commandIntent = checkpointCommands.get(input.command)
+      if (commandIntent && !scheduledAutoDispatch && input.arguments.trim() !== "") {
+        throw new Error("/consolidate 与 /compact 不接受模型提供的 trigger/intent 参数。")
+      }
+      if (commandIntent || recoveryCommands.has(input.command)) {
         const marker = foregroundAutoMarker
         if (marker?.sessionID === input.sessionID) {
           if (recoveryCommands.has(input.command)) {
@@ -925,7 +1210,9 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
             // before they can mutate the checkpoint again.
             retireForegroundAutoMarker(marker.nonce, "expired")
           } else {
-            const autoPart = Boolean(scheduledAutoDispatch) && scheduledAutoDispatch === foregroundAutoDispatch
+            const autoPart = Boolean(scheduledAutoDispatch)
+              && scheduledAutoDispatch === foregroundAutoDispatch
+              && scheduledAutoDispatch.intent === commandIntent
             if (autoPart) {
               scheduledAutoDispatch.commandObserved = true
               for (const part of output.parts) {
@@ -934,6 +1221,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
                 jsonPart.metadata = {
                   ...((jsonPart.metadata as Json | undefined) ?? {}),
                   pco_auto_control: true,
+                  pco_intent: scheduledAutoDispatch.intent,
                   // Unlike the scheduler nonce, this token is never placed
                   // in command text or persisted. It exists only for the
                   // host-to-host command/message binding and survives the
@@ -958,15 +1246,31 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
             }
           }
         }
-        if (input.command === "compact" && !scheduledAutoDispatch) {
+      }
+      if (commandIntent) {
+        if (scheduledAutoDispatch) {
+          if (scheduledAutoDispatch.intent !== commandIntent) {
+            throw new Error("自动 checkpoint intent 与 Host command 不匹配；拒绝执行。")
+          }
+        } else {
           manualCommandPendingSessionID = input.sessionID
+          manualCommandPendingIntent = commandIntent
           manualControlMessageID = undefined
+          manualControlIntent = commandIntent
+          manualCheckpointSessionID = undefined
+          manualCheckpointCallID = undefined
+          manualCheckpointMessageID = undefined
+          manualCheckpointIntent = undefined
         }
       }
       for (const part of output.parts) {
         if (part.type !== "text") continue
         const jsonPart = part as unknown as Json
-        jsonPart.metadata = { ...((jsonPart.metadata as Json | undefined) ?? {}), pco_control: true }
+        jsonPart.metadata = {
+          ...((jsonPart.metadata as Json | undefined) ?? {}),
+          pco_control: true,
+          ...(commandIntent ? { pco_intent: commandIntent } : {}),
+        }
       }
     },
 
@@ -1009,13 +1313,23 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         if (changed === contextPath || changed === contextMetadataPath) await refreshContextCacheWithDiagnostic(undefined, "watcher")
       }
       if (event.type === "session.idle" && mainSession(event.properties.sessionID)) {
-        if (existsSync(lockPath) || idleTask) return
+        if (existsSync(lockPath) || idleTask || foregroundAutoMarker || pendingCompaction) return
         const task = (async () => {
           try {
             await invoke(["sync"], event.properties.sessionID)
+            if (pendingCompaction?.sessionID === event.properties.sessionID) {
+              const resumed = await invoke(["checkpoint", "retry"], event.properties.sessionID)
+              await refreshContextCacheWithDiagnostic(resumed, "pending-harness-compaction")
+              rememberCheckpoint(resumed, event.properties.sessionID)
+              await invokeNativeCompactIfRequired(resumed, event.properties.sessionID)
+              pendingCompaction = undefined
+              if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+              return
+            }
             const probe = await invoke(["checkpoint", "auto-probe"], event.properties.sessionID)
-            if (probe.needed === true) {
-              const marker = issueForegroundAutoMarker(event.properties.sessionID)
+            const intent = autoIntentFromProbe(probe)
+            if (intent) {
+              const marker = issueForegroundAutoMarker(event.properties.sessionID, intent)
               try {
                 await scheduleForegroundCheckpoint(event.properties.sessionID, marker)
               } catch (error) {
@@ -1023,8 +1337,8 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
                 await client.app.log({ body: {
                   service: "pco",
                   level: "warn",
-                  message: "PCO 自动 checkpoint 无法调度前台 control turn；会话保持可输入，请执行 /compact。",
-                  extra: { error: String(error) },
+                  message: "PCO 自动 checkpoint 无法调度前台 control turn；会话保持可输入，请执行对应命令。",
+                  extra: { error: String(error), intent },
                 } })
               }
             }
@@ -1046,6 +1360,9 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         const metadata = (part as unknown as Json).metadata as Json | undefined
         return metadata?.pco_auto_control === true
       })
+      const autoIntentPart = autoControlPart
+        ? (autoControlPart as unknown as Json).metadata as Json | undefined
+        : undefined
       const messageID = stringField(output.message, "id", "messageID", "messageId")
       const autoDispatch = foregroundAutoDispatch?.sessionID === input.sessionID
         && foregroundAutoDispatch.commandObserved
@@ -1061,6 +1378,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         && Boolean(dispatchPart)
         && marker?.sessionID === input.sessionID
         && marker.nonce === autoDispatch?.nonce
+        && autoIntentPart?.pco_intent === marker.intent
       const staleAuto = autoControlPart
         ? foregroundAutoTombstones.find((entry) => entry.sessionID === input.sessionID && entry.commandMessageID === messageID)
         : undefined
@@ -1077,8 +1395,16 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       // auto message must not consume the pending manual binding; otherwise
       // the real manual message will be rejected when its tool call arrives.
       if (manualCommandPendingSessionID === input.sessionID && !autoControlPart) {
+        const manualPart = output.parts.find((part) => {
+          if (part.type !== "text") return false
+          const metadata = (part as unknown as Json).metadata as Json | undefined
+          return metadata?.pco_control === true && metadata.pco_intent === manualCommandPendingIntent
+        })
+        if (!manualPart) throw new Error("manual checkpoint command intent provenance is missing")
         manualControlMessageID = stringField(output.message, "id", "messageID", "messageId")
+        manualControlIntent = manualCommandPendingIntent
         manualCommandPendingSessionID = undefined
+        manualCommandPendingIntent = undefined
       }
       if (marker?.sessionID === input.sessionID && !marker.commandMessageID) {
         const autoPart = activeAuto
@@ -1115,7 +1441,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
 You are the user's long-term PCO companion. Use the pco-memory skill for onboarding,
 self-exploration, evidence boundaries, correction, and checkpoint behavior.
 
-- /compact must call pco_checkpoint exactly once; never invoke OpenCode's native compact directly.
+- /consolidate and /compact must each call pco_checkpoint exactly once; never choose trigger or intent in tool arguments or invoke OpenCode's native compact directly.
 - When a proposal needs approval, show its exact protected Meta diff, evidence, and proposal hash, then use the native question form. Only the matching host decision grant authorizes pco_approve or pco_reject; a model-generated tool call is not authorization.
 - After pco_status or pco_retry returns an awaiting proposal, call the native question tool in the same control turn; the plugin must not submit a nested session prompt.
 - Preserve a native question rejection answer exactly when calling pco_reject; after rejection, do not ask another follow-up.
@@ -1128,9 +1454,68 @@ ${currentContext}
 
     "experimental.session.compacting": async (input, output) => {
       if (!mainSession(input.sessionID)) return
-      output.prompt = `Ignore the pre-checkpoint transcript and return only this marker:
-PCO canonical checkpoint completed. Continue from the PCO system context and the latest post-checkpoint user message.
-Do not produce a historical continuation summary; PCO provides its own approved Meta-memory and continuation.`
+      if (consumeNativeCompactBypass(input)) {
+        const gate = output as unknown as Json
+        gate.pco_compaction_gate = {
+          decision: "allow_once",
+          reason: "matching_pco_bypass_token_consumed",
+        }
+        return
+      }
+
+      const eventID = fieldFromInput(input, "eventID", "eventId", "requestID", "requestId", "compactionID", "compactionId")
+      const requestedBoundary = fieldFromInput(input, "boundary", "contextBoundary", "messageID", "messageId")
+      const requestID = eventID ?? `harness-${randomBytes(16).toString("hex")}`
+      if (!pendingCompaction) {
+        pendingCompaction = {
+          requestID,
+          eventID,
+          sessionID: input.sessionID,
+          requestedBoundary,
+          requestedAt: Date.now(),
+          origin: "harness_auto_compaction",
+        }
+        if (!persistPendingCompaction(pendingCompaction)) {
+          throw new Error("Harness compaction intercepted but durable pending_compaction could not be written")
+        }
+      } else if (pendingCompaction.sessionID !== input.sessionID) {
+        throw new Error("A different session already owns the pending Harness compaction")
+      }
+
+      const gate = output as unknown as Json
+      gate.cancel = true
+      gate.preventDefault = true
+      gate.blocked = true
+      gate.pco_compaction_gate = {
+        decision: "intercept",
+        request_id: pendingCompaction.requestID,
+        trigger: "auto",
+        intent: "compact",
+        origin: "harness_auto_compaction",
+      }
+      try {
+        const result = await invoke([
+          "checkpoint", "request", "--trigger", "auto", "--intent", "compact",
+        ], input.sessionID)
+        await refreshContextCacheWithDiagnostic(result, "harness-auto-compaction")
+        rememberCheckpoint(result, input.sessionID)
+        await invokeNativeCompactIfRequired(result, input.sessionID)
+        pendingCompaction = undefined
+        if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+      } catch (error) {
+        await client.app.log({ body: {
+          service: "pco",
+          level: "error",
+          message: "Harness compaction was intercepted; PCO compact recovery is pending.",
+          extra: { requestID, sessionID: input.sessionID, error: String(error) },
+        } })
+        // Keep the durable request and input lock. The current Harness event
+        // is still blocked below; pco-retry must resume the durable boundary.
+      }
+      // The 1.17 SDK has no typed cancellation field. Throwing after the
+      // structured gate is the synchronous fail-closed fallback; a Host with
+      // cancellation support may consume `cancel=true` and avoid the error.
+      throw new Error("Harness native compaction intercepted by PCO; consolidate and publish context first")
     },
 
     "experimental.compaction.autocontinue": async (input, output) => {
