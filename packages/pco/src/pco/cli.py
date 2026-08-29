@@ -54,6 +54,14 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint_commands = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
     request = checkpoint_commands.add_parser("request")
     request.add_argument("--trigger", choices=["manual", "auto"], default="manual")
+    request.add_argument("--intent", choices=["consolidate", "compact"], default="compact")
+    request.add_argument("--origin", choices=["command", "idle_threshold", "harness_auto_compaction"])
+    # Private Host-to-Adapter fields. They are intentionally not exposed by
+    # the pco_checkpoint tool; the Plugin supplies them only for compact.
+    request.add_argument("--native-compact-token")
+    request.add_argument("--native-compact-attempt-id")
+    request.add_argument("--native-compact-expires-at", type=int)
+    request.add_argument("--pending-compaction-json")
     checkpoint_commands.add_parser("auto-if-needed")
     checkpoint_commands.add_parser("auto-probe")
     decide = checkpoint_commands.add_parser("decide")
@@ -97,6 +105,26 @@ def _workspace(args: argparse.Namespace, *, init: bool = False) -> Workspace:
 
 def _adapter(workspace: Workspace, args: argparse.Namespace) -> OpenCodeAdapter:
     binding = workspace.binding()
+    native_compact_bypass = None
+    native_token = getattr(args, "native_compact_token", None)
+    native_attempt = getattr(args, "native_compact_attempt_id", None)
+    native_expires = getattr(args, "native_compact_expires_at", None)
+    if native_token is not None or native_attempt is not None or native_expires is not None:
+        ensure(
+            isinstance(native_token, str) and native_token
+            and isinstance(native_attempt, str) and native_attempt
+            and isinstance(native_expires, int) and native_expires > 0,
+            "NATIVE_COMPACT_TOKEN_INVALID",
+            "cli",
+            "Native compact token fields must be supplied together",
+        )
+        native_compact_bypass = {
+            "token": native_token,
+            "checkpoint_id": "pending",
+            "session_id": args.session_id or binding.native_session_id,
+            "attempt_id": native_attempt,
+            "expires_at": native_expires,
+        }
     return OpenCodeAdapter(
         base_url=args.server_url or workspace.config.harness.base_url,
         directory=Path.cwd(),
@@ -104,7 +132,63 @@ def _adapter(workspace: Workspace, args: argparse.Namespace) -> OpenCodeAdapter:
         session_id=args.session_id or binding.native_session_id,
         model_context_tokens=workspace.config.harness.model_context_tokens,
         timeout=workspace.config.harness.request_timeout_seconds,
+        native_compact_bypass=native_compact_bypass,
     )
+
+
+def _native_compact_bypass(args: argparse.Namespace) -> dict[str, Any] | None:
+    token = getattr(args, "native_compact_token", None)
+    attempt = getattr(args, "native_compact_attempt_id", None)
+    expires = getattr(args, "native_compact_expires_at", None)
+    if token is None and attempt is None and expires is None:
+        return None
+    ensure(
+        isinstance(token, str) and token
+        and isinstance(attempt, str) and attempt
+        and isinstance(expires, int) and expires > 0,
+        "NATIVE_COMPACT_TOKEN_INVALID",
+        "cli",
+        "Native compact token fields must be supplied together",
+    )
+    return {
+        "token": token,
+        "checkpoint_id": "pending",
+        "session_id": args.session_id,
+        "attempt_id": attempt,
+        "expires_at": expires,
+    }
+
+
+def _pending_compaction(args: argparse.Namespace) -> dict[str, Any] | None:
+    raw = getattr(args, "pending_compaction_json", None)
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise MemError(
+            "PENDING_COMPACTION_INVALID",
+            "checkpoint",
+            "Pending compaction payload must be valid JSON",
+            recovery=["Retry with the durable pending-compaction payload intact"],
+        ) from exc
+    ensure(
+        isinstance(value, dict),
+        "PENDING_COMPACTION_INVALID",
+        "checkpoint",
+        "Pending compaction payload must be an object",
+    )
+    # The Plugin uses snake_case on the process boundary. Accept the legacy
+    # camelCase spelling too so a request written by an older Plugin can be
+    # imported and then normalized by Pydantic's strict model.
+    aliases = {
+        "requestID": "request_id",
+        "eventID": "event_id",
+        "sessionID": "session_id",
+        "requestedBoundary": "requested_boundary",
+        "requestedAt": "requested_at",
+    }
+    return {aliases.get(key, key): item for key, item in value.items()}
 
 
 def _derivation_error_as_memerror(error: dict[str, Any]) -> MemError:
@@ -310,13 +394,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "checkpoint":
         engine = CheckpointEngine(workspace, adapter)
         if args.checkpoint_command == "request":
-            return engine.request(args.trigger)
+            return engine.request(
+                args.trigger,
+                args.intent,
+                args.origin,
+                pending_compaction=_pending_compaction(args),
+                native_compact_bypass=_native_compact_bypass(args),
+            )
         if args.checkpoint_command == "auto-if-needed":
-            if not engine.should_auto_checkpoint():
+            intent = "compact" if engine.should_auto_checkpoint("compact") else "consolidate" if engine.should_auto_checkpoint("consolidate") else None
+            if intent is None:
                 return {"ok": True, "triggered": False, "context_usage": adapter.estimate_context_usage()}
-            return {"triggered": True, **engine.request("auto")}
+            return {"triggered": True, "intent": intent, **engine.request("auto", intent)}
         if args.checkpoint_command == "auto-probe":
-            return {"ok": True, "needed": engine.should_auto_checkpoint(), "context_usage": adapter.estimate_context_usage()}
+            compact_needed = engine.should_auto_checkpoint("compact")
+            consolidate_needed = engine.should_auto_checkpoint("consolidate")
+            return {
+                "ok": True,
+                "needed": compact_needed or consolidate_needed,
+                "intent": "compact" if compact_needed else "consolidate" if consolidate_needed else None,
+                "context_usage": adapter.estimate_context_usage(),
+            }
         if args.checkpoint_command == "decide":
             ensure(args.approval_grant, "APPROVAL_GRANT_REQUIRED", "approval", "Approval must come from the host-issued interaction")
             ensure(args.question_request_id, "QUESTION_REQUEST_ID_REQUIRED", "approval", "A native question request ID is required for the decision")

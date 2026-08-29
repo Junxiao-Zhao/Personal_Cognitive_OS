@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { createHash, createHmac, randomBytes } from "node:crypto"
 import type { Plugin } from "@opencode-ai/plugin"
@@ -81,6 +81,10 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   const foregroundAutoInvalidationPath = resolve(stateRoot, "foreground-auto-invalidation.json")
   const pendingCompactionPath = resolve(stateRoot, "pending-compaction.json")
   const nativeCompactBypassPath = resolve(stateRoot, "native-compact-bypass.json")
+  const receiptInboxPath = resolve(stateRoot, "receipt-inbox")
+  const receiptInboxIndexPath = resolve(receiptInboxPath, "index.json")
+  mkdirSync(stateRoot, { recursive: true })
+  mkdirSync(receiptInboxPath, { recursive: true })
   const pcoCommand = process.env.PCO_COMMAND ?? "pco"
   let currentContext = ""
   let idleTask: Promise<void> | undefined
@@ -441,6 +445,50 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     }
   }
 
+  const drainReceiptInbox = async (): Promise<void> => {
+    const index = readJson(receiptInboxIndexPath) ?? {}
+    let changed = false
+    for (const name of readdirSync(receiptInboxPath)) {
+      if (!name.endsWith(".json") || name === "index.json") continue
+      const record = readJson(resolve(receiptInboxPath, name))
+      if (!record) continue
+      const key = stringField(record, "key")
+      const payloadHash = stringField(record, "payload_hash", "payloadHash")
+      const generation = typeof record.generation === "number" ? record.generation : undefined
+      const prior = key ? (index[key] as Json | undefined) : undefined
+      if (!key || !payloadHash || generation === undefined) continue
+      if (prior && prior.payload_hash !== payloadHash) {
+        await client.app.log({ body: {
+          service: "pco",
+          level: "error",
+          message: "PCO receipt inbox key conflict; refusing to acknowledge a different payload.",
+          extra: { code: "RECEIPT_KEY_CONFLICT", key },
+        } })
+        continue
+      }
+      if (prior && Number(prior.generation ?? -1) >= generation) continue
+      index[key] = {
+        host_resource_id: record.host_resource_id,
+        key,
+        generation,
+        payload_hash: payloadHash,
+        disposition: prior ? "replaced" : "created",
+        acknowledged_at: Date.now(),
+      }
+      changed = true
+      const payload = record.payload as Json | undefined
+      await client.app.log({ body: {
+        service: "pco",
+        level: "info",
+        message: String(payload?.summary ?? "PCO checkpoint completed"),
+        extra: { receipt_key: key, generation, supersedes_key: record.supersedes_key ?? null },
+      } })
+    }
+    if (changed && !writeJson(receiptInboxIndexPath, index)) {
+      throw new Error("PCO receipt inbox acknowledgement could not be persisted")
+    }
+  }
+
   const persistPendingCompaction = (value: PendingCompaction | undefined): boolean => {
     if (!value) {
       try {
@@ -451,6 +499,34 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       }
     }
     return writeJson(pendingCompactionPath, value)
+  }
+
+  const pendingCompactionArgs = (value: PendingCompaction): string[] => [
+    "--pending-compaction-json",
+    JSON.stringify({
+      request_id: value.requestID,
+      event_id: value.eventID ?? null,
+      session_id: value.sessionID,
+      requested_boundary: value.requestedBoundary ?? null,
+      requested_at: value.requestedAt,
+      origin: value.origin,
+    }),
+  ]
+
+  const pendingCompactionRetiredByPython = (result: Json): boolean => {
+    const checkpoint = result.checkpoint as Json | undefined
+    // Compatibility with older loopback/CLI receipts that predate the
+    // authoritative checkpoint echo. A compact-completed receipt is safe to
+    // use only when it explicitly identifies compact intent; a consolidate
+    // receipt never retires the marker.
+    if (!checkpoint) {
+      const compaction = result.compaction as Json | undefined
+      return result.intent === "compact" && compaction?.status === "completed"
+    }
+    return checkpoint?.pending_compaction == null
+      && checkpoint?.compaction_status === "completed"
+      && checkpoint?.receipt_inserted === true
+      && checkpoint?.input_unlocked === true
   }
 
   const persistNativeCompactBypass = (value: NativeCompactBypass | undefined): boolean => {
@@ -474,23 +550,32 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       && typeof pending.requestedAt === "number") {
       pendingCompaction = pending as unknown as PendingCompaction
     }
-    const bypass = readJson(nativeCompactBypassPath)
-    if (bypass
-      && typeof bypass.token === "string"
-      && typeof bypass.checkpointID === "string"
-      && typeof bypass.sessionID === "string"
-      && typeof bypass.attemptID === "string"
-      && typeof bypass.expiresAt === "number"
-      && bypass.expiresAt > Date.now()
-      && bypass.consumed !== true) {
-      nativeCompactBypass = bypass as unknown as NativeCompactBypass
-    } else if (existsSync(nativeCompactBypassPath)) {
-      // An expired or malformed bypass is never reusable after restart.
-      persistNativeCompactBypass(undefined)
-    }
+    // A bypass is one operation's handshake, not a restartable capability.
+    // Fail closed on Plugin reload so an unconsumed token cannot authorize a
+    // later compact after the original request/attempt has disappeared.
+    nativeCompactBypass = undefined
+    if (existsSync(nativeCompactBypassPath)) persistNativeCompactBypass(undefined)
   }
 
   const mintNativeCompactBypass = (checkpointID: string, sessionID: string, attemptID: string): NativeCompactBypass | undefined => {
+    const existing = readJson(nativeCompactBypassPath)
+    if (existing
+      && typeof existing.token === "string"
+      && typeof existing.checkpointID === "string"
+      && typeof existing.sessionID === "string"
+      && typeof existing.attemptID === "string"
+      && typeof existing.expiresAt === "number"
+      && Number.isFinite(existing.expiresAt)
+      && Number.isInteger(existing.expiresAt)
+      && existing.expiresAt > Date.now()
+      && existing.consumed !== true
+      && existing.checkpointID === checkpointID
+      && existing.sessionID === sessionID
+      && existing.attemptID === attemptID) {
+      nativeCompactBypass = existing as unknown as NativeCompactBypass
+      return nativeCompactBypass
+    }
+    if (existing) persistNativeCompactBypass(undefined)
     const value: NativeCompactBypass = {
       token: randomBytes(32).toString("hex"),
       checkpointID,
@@ -518,85 +603,126 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
       ?? (metadata.pcoNativeCompact as Json | undefined)
     if (!candidate || typeof candidate !== "object") return undefined
     const token = stringField(candidate, "token", "bypassToken")
-    const checkpointID = stringField(candidate, "checkpointID", "checkpointId")
-    const sessionID = stringField(candidate, "sessionID", "sessionId")
-    const attemptID = stringField(candidate, "attemptID", "attemptId")
-    if (!token || !checkpointID || !sessionID || !attemptID) return undefined
-    return { token, checkpointID, sessionID, attemptID, expiresAt: 0 }
+    const checkpointID = stringField(candidate, "checkpointID", "checkpointId", "checkpoint_id")
+    const sessionID = stringField(candidate, "sessionID", "sessionId", "session_id")
+    const attemptID = stringField(candidate, "attemptID", "attemptId", "attempt_id")
+    const expiresAtValue = candidate.expiresAt ?? candidate.expires_at
+    const expiresAt = typeof expiresAtValue === "number"
+      && Number.isFinite(expiresAtValue)
+      && Number.isInteger(expiresAtValue)
+      ? expiresAtValue
+      : undefined
+    if (!token || !checkpointID || !sessionID || !attemptID || expiresAt === undefined) return undefined
+    return { token, checkpointID, sessionID, attemptID, expiresAt }
   }
 
   const consumeNativeCompactBypass = (input: unknown): boolean => {
     const candidate = compactionTokenFromInput(input)
+    // The Python adapter binds the pending token to the real checkpoint ID
+    // immediately before POST /summarize. Re-read the shared durable file so
+    // the hook cannot compare against a stale process-local "pending" value.
+    const persisted = readJson(nativeCompactBypassPath)
+    if (persisted
+      && typeof persisted.token === "string"
+      && typeof persisted.checkpointID === "string"
+      && typeof persisted.sessionID === "string"
+      && typeof persisted.attemptID === "string"
+      && typeof persisted.expiresAt === "number"
+      && Number.isFinite(persisted.expiresAt)
+      && Number.isInteger(persisted.expiresAt)
+      && persisted.expiresAt > Date.now()
+      && persisted.consumed !== true) {
+      nativeCompactBypass = persisted as unknown as NativeCompactBypass
+    } else if (existsSync(nativeCompactBypassPath)) {
+      // Expired or malformed state cannot authorize a later request.
+      persistNativeCompactBypass(undefined)
+      nativeCompactBypass = undefined
+    }
     const stored = nativeCompactBypass
     if (!candidate || !stored || stored.consumed === true || stored.expiresAt <= Date.now()) return false
     const matches = candidate.token === stored.token
       && candidate.checkpointID === stored.checkpointID
       && candidate.sessionID === stored.sessionID
       && candidate.attemptID === stored.attemptID
+      && candidate.expiresAt === stored.expiresAt
       && stored.sessionID === fieldFromInput(input, "sessionID", "sessionId")
     if (!matches) return false
     stored.consumed = true
-    const persisted = persistNativeCompactBypass(undefined)
+    const retired = persistNativeCompactBypass(undefined)
     nativeCompactBypass = undefined
-    return persisted
+    return retired
   }
 
-  const checkpointIDFromResult = (result: Json): string | undefined => {
-    const checkpoint = result.checkpoint as Json | undefined
-    return stringField(checkpoint, "id", "checkpoint_id", "checkpointID")
-      ?? stringField(result, "checkpoint_id", "checkpointID")
-  }
-
-  const invokeNativeCompactIfRequired = async (result: Json, sessionID: string): Promise<Json> => {
-    const receipt = result.receipt as Json | undefined
-    const compaction = (result.compaction as Json | undefined) ?? (receipt?.compaction as Json | undefined) ?? {}
-    if (compaction.status === "completed" || compaction.status === "not_requested") return result
-    const intent = result.intent ?? receipt?.intent ?? (result.checkpoint as Json | undefined)?.intent
-    if (intent !== "compact" && compaction.requested !== true) return result
-    const summarize = (client.session as unknown as {
-      summarize?: (input: unknown) => Promise<unknown>
-    }).summarize
-    const checkpointID = checkpointIDFromResult(result)
-    if (typeof summarize !== "function" || !checkpointID) {
-      throw new Error("PCO compact requires the Host summarize API and a durable checkpoint ID")
+  const retireNativeCompactBypass = () => {
+    nativeCompactBypass = undefined
+    if (!persistNativeCompactBypass(undefined)) {
+      throw new Error("PCO native compact bypass could not be retired")
     }
-    const attemptID = randomBytes(16).toString("hex")
-    const bypass = mintNativeCompactBypass(checkpointID, sessionID, attemptID)
-    if (!bypass) throw new Error("PCO native compact bypass cannot be durably minted")
+  }
+
+  const invokeWithNativeCompactBypass = async (
+    args: string[],
+    sessionID: string,
+    intent: CheckpointIntent,
+  ): Promise<Json> => {
+    if (intent !== "compact") return invoke(args, sessionID)
+    // The token is created before the Python command starts. Python persists
+    // the attempt binding and OpenCodeAdapter forwards this same token to the
+    // real /summarize request; the hook therefore never needs a post-hoc
+    // authorization window.
+    let checkpointID = "pending"
+    let attemptID = `compact_${randomBytes(16).toString("hex")}`
     try {
-      await summarize({
-        path: { id: sessionID },
-        body: {
-          auto: false,
-          // These private fields are consumed by the Host hook. Older SDKs
-          // ignore them, which is why the hook also requires an explicit
-          // structured cancel contract before allowing compaction.
-          pco_native_compact: {
-            token: bypass.token,
-            checkpoint_id: bypass.checkpointID,
-            session_id: bypass.sessionID,
-            attempt_id: bypass.attemptID,
-          },
-        },
-      })
-      if (nativeCompactBypass) {
-        // A Host that does not echo the token into the hook cannot satisfy the
-        // exactly-once contract. Retire the token and fail closed.
-        persistNativeCompactBypass(undefined)
-        nativeCompactBypass = undefined
-        throw new Error("Host native compact did not consume the PCO bypass token")
+      const status = await invoke(["checkpoint", "status"], sessionID)
+      const checkpoint = status.checkpoint as Json | undefined
+      const checkpointStatus = typeof checkpoint?.status === "string" ? checkpoint.status : ""
+      const activeCompact = checkpoint?.intent === "compact"
+        && checkpoint?.compaction_status === "pending"
+        && checkpointStatus !== "DONE"
+        && checkpointStatus !== "COMMITTED_WITH_PENDING_DERIVATIONS"
+        && checkpointStatus !== "ABORTED"
+        && checkpointStatus !== "RECOVERY"
+        && typeof checkpoint?.id === "string"
+        && typeof checkpoint?.native_compact_attempt_id === "string"
+        && Boolean(checkpoint.native_compact_attempt_id)
+      // A terminal checkpoint ID is historical data, not the identity of this
+      // new compact request. Only an active compact with a durable attempt may
+      // reuse its binding; all other requests start with pending/new identity.
+      if (activeCompact) {
+        checkpointID = checkpoint.id as string
+        attemptID = checkpoint.native_compact_attempt_id as string
+      }
+    } catch {
+      // A new /compact has no active state yet; the generated attempt is
+      // supplied to Python when it creates the durable checkpoint.
+    }
+    const bypass = mintNativeCompactBypass(checkpointID, sessionID, attemptID)
+    if (!bypass) throw new Error("PCO native compact bypass could not be persisted")
+    try {
+      const result = await invoke([
+        ...args,
+        "--native-compact-token", bypass.token,
+        "--native-compact-attempt-id", attemptID,
+        "--native-compact-expires-at", String(bypass.expiresAt),
+      ], sessionID)
+      const checkpoint = result.checkpoint as Json | undefined
+      const compactCompleted = checkpoint?.compaction_status === "completed"
+        || (result.compaction as Json | undefined)?.status === "completed"
+      // Requests that stop at an active/approval/recovery boundary did not
+      // consume the native capability. Retire it immediately; only a
+      // completed native compact may leave the handshake consumed by Python.
+      if (!compactCompleted && (result.approval_required === true || result.pending_compaction_merged === true || checkpoint)) {
+        retireNativeCompactBypass()
       }
       return result
     } catch (error) {
-      // Native compact failures retire the bypass as well; retry must mint a
-      // fresh attempt-bound token and cannot replay this one.
-      persistNativeCompactBypass(undefined)
-      nativeCompactBypass = undefined
+      retireNativeCompactBypass()
       throw error
     }
   }
 
   restoreHarnessGateState()
+  await drainReceiptInbox()
 
   const rememberCheckpoint = (result: Json, sessionID: string) => {
     const proposal = result.proposal as Json | undefined
@@ -829,16 +955,17 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         if (!value || typeof value !== "object") return undefined
         const record = value as Json
         const sessionID = stringField(record, "sessionID")
+        const expiryValue = record.expiresAt
+        const expiredLegacyMarker = typeof expiryValue === "number" && Number.isFinite(expiryValue) && expiryValue <= now
         const intent = record.intent === "consolidate" || record.intent === "compact"
           ? record.intent
-          : status ? "compact" : undefined
+          : status || expiredLegacyMarker ? "compact" : undefined
         // Nonces are process-local dispatch secrets. Persisted tombstones can
         // be rehydrated with a fresh internal nonce because they are matched
         // by host message/tool provenance; an active marker still needs its
         // host command message to be usable after restart.
         const nonce = randomBytes(16).toString("hex")
         if (!sessionID || !intent || (!status && !stringField(record, "commandMessageID"))) return undefined
-        const expiryValue = record.expiresAt
         const validExpiry = typeof expiryValue === "number" && Number.isFinite(expiryValue) && expiryValue > 0
         // An active marker with malformed expiry is not safe to restore: its
         // authorization lifetime cannot be established. Compatibility TTL
@@ -951,6 +1078,9 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
   }
 
   restoreForegroundAutoProvenance()
+  // Keep an explicit durable empty mirror so a host can distinguish “no
+  // pending auto provenance” from a failed persistence attempt.
+  if (!existsSync(foregroundAutoProvenancePath)) persistForegroundAutoProvenance()
 
   return {
     tool: {
@@ -1004,12 +1134,12 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
             manualCheckpointMessageID = undefined
             manualCheckpointIntent = undefined
           }
-          const result = await invoke([
+          const result = await invokeWithNativeCompactBypass([
             "checkpoint", "request", "--trigger", trigger, "--intent", intent,
-          ], context.sessionID)
+          ], context.sessionID, intent)
           await refreshContextCacheWithDiagnostic(result, "checkpoint")
           rememberCheckpoint(result, context.sessionID)
-          return JSON.stringify(await invokeNativeCompactIfRequired(result, context.sessionID))
+          return JSON.stringify(result)
         },
       }),
       pco_approve: tool({
@@ -1024,11 +1154,18 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
           }
           pendingDecision = undefined
           try {
-            const result = await invoke([
+            const status = await invoke(["checkpoint", "status"], context.sessionID)
+            const checkpoint = status.checkpoint as Json | undefined
+            const intent: CheckpointIntent = checkpoint?.intent === "compact" ? "compact" : "consolidate"
+            const result = await invokeWithNativeCompactBypass([
               "checkpoint", "decide", "--decision", "yes", "--question-request-id", decision.questionRequestID,
               "--approval-grant", decision.grant,
-            ], context.sessionID)
+            ], context.sessionID, intent)
             await refreshContextCacheWithDiagnostic(result, "approval")
+            if (pendingCompaction?.sessionID === context.sessionID && pendingCompactionRetiredByPython(result)) {
+              pendingCompaction = undefined
+              if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+            }
             pendingQuestion = undefined
             return JSON.stringify(result)
           } catch (error) {
@@ -1062,10 +1199,13 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
           }
           pendingDecision = undefined
           try {
-            const result = await invoke([
+            const status = await invoke(["checkpoint", "status"], context.sessionID)
+            const checkpoint = status.checkpoint as Json | undefined
+            const intent: CheckpointIntent = checkpoint?.intent === "compact" ? "compact" : "consolidate"
+            const result = await invokeWithNativeCompactBypass([
               "checkpoint", "decide", "--decision", "no", `--reason=${decision.reason}`,
               "--question-request-id", decision.questionRequestID, "--approval-grant", decision.grant,
-            ], context.sessionID)
+            ], context.sessionID, intent)
             await refreshContextCacheWithDiagnostic(result, "rejection")
             pendingQuestion = undefined
             return JSON.stringify(result)
@@ -1099,20 +1239,47 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         args: {},
         async execute(_args, context) {
           if (!mainSession(context.sessionID)) throw new Error("PCO checkpoint 恢复只能由主 session 执行。")
-          const status = await invoke(["checkpoint", "status"], context.sessionID)
+          let status: Json
+          if (pendingCompaction?.sessionID === context.sessionID) {
+            // The Plugin marker can outlive the Python process. Import it
+            // before status/retry so CHECKPOINT_ACTIVE cannot strand the
+            // request in this file only.
+            const imported = await invoke([
+              "checkpoint", "request", "--trigger", "auto", "--intent", "compact",
+              "--origin", "harness_auto_compaction", ...pendingCompactionArgs(pendingCompaction),
+            ], context.sessionID)
+            await refreshContextCacheWithDiagnostic(imported, "pending-compaction-import")
+            rememberCheckpoint(imported, context.sessionID)
+            if (pendingCompactionRetiredByPython(imported)) {
+              pendingCompaction = undefined
+              if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+              return JSON.stringify(imported)
+            }
+            const importedCheckpoint = imported.checkpoint as Json | undefined
+            if (imported.approval_required === true
+              || importedCheckpoint?.context_publication_status !== "completed") {
+              return JSON.stringify(imported)
+            }
+            status = imported
+          } else {
+            status = await invoke(["checkpoint", "status"], context.sessionID)
+          }
           const checkpoint = status.checkpoint as Json | undefined
           const operation = checkpoint?.status === "COMMITTED_WITH_PENDING_DERIVATIONS"
             ? "retry-derivations"
             : "retry"
-          const result = await invoke(["checkpoint", operation], context.sessionID)
+          const retryIntent: CheckpointIntent = checkpoint?.intent === "compact"
+            && checkpoint?.compaction_status !== "completed"
+            ? "compact"
+            : "consolidate"
+          const result = await invokeWithNativeCompactBypass(["checkpoint", operation], context.sessionID, retryIntent)
           await refreshContextCacheWithDiagnostic(result, "retry")
           rememberCheckpoint(result, context.sessionID)
-          const completed = await invokeNativeCompactIfRequired(result, context.sessionID)
-          if (pendingCompaction?.sessionID === context.sessionID) {
+          if (pendingCompaction?.sessionID === context.sessionID && pendingCompactionRetiredByPython(result)) {
             pendingCompaction = undefined
             if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
           }
-          return JSON.stringify(completed)
+          return JSON.stringify(result)
         },
       }),
       pco_abort: tool({
@@ -1149,6 +1316,12 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         if (hasAutoProvenance) {
           const provenance = await bindForegroundAutoMarkerToToolCall(input.sessionID, input.callID)
           if (foregroundAutoProvenanceUnavailable && provenance !== "manual") {
+            await client.app.log({ body: {
+              service: "pco",
+              level: "error",
+              message: "自动 checkpoint provenance 无法持久化；已拒绝执行。",
+              extra: { sessionID: input.sessionID, callID: input.callID, provenance },
+            } })
             throw new Error("自动 checkpoint provenance 无法持久化；拒绝执行。")
           }
           if (provenance === "mismatch" || provenance === "expired" || provenance === "consumed") {
@@ -1275,6 +1448,7 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
     },
 
     event: async ({ event }) => {
+      await drainReceiptInbox()
       const eventValue = event as unknown as Json
       const properties = (eventValue.properties as Json | undefined) ?? {}
       const eventSessionID = stringField(properties, "sessionID", "sessionId")
@@ -1313,21 +1487,42 @@ export const PCOPlugin: Plugin = async ({ client, directory, serverUrl }) => {
         if (changed === contextPath || changed === contextMetadataPath) await refreshContextCacheWithDiagnostic(undefined, "watcher")
       }
       if (event.type === "session.idle" && mainSession(event.properties.sessionID)) {
-        if (existsSync(lockPath) || idleTask || foregroundAutoMarker || pendingCompaction) return
+        if (idleTask || foregroundAutoMarker || (pendingCompaction && pendingCompaction.sessionID !== event.properties.sessionID)) return
+        if (existsSync(lockPath) && !pendingCompaction) return
         const task = (async () => {
           try {
             await invoke(["sync"], event.properties.sessionID)
             if (pendingCompaction?.sessionID === event.properties.sessionID) {
-              const resumed = await invoke(["checkpoint", "retry"], event.properties.sessionID)
+              const imported = await invoke([
+                "checkpoint", "request", "--trigger", "auto", "--intent", "compact",
+                "--origin", "harness_auto_compaction", ...pendingCompactionArgs(pendingCompaction),
+              ], event.properties.sessionID)
+              await refreshContextCacheWithDiagnostic(imported, "pending-compaction-idle-import")
+              rememberCheckpoint(imported, event.properties.sessionID)
+              if (pendingCompactionRetiredByPython(imported)) {
+                pendingCompaction = undefined
+                if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+                return
+              }
+              const importedCheckpoint = imported.checkpoint as Json | undefined
+              if (imported.approval_required === true
+                || importedCheckpoint?.context_publication_status !== "completed") return
+              const resumed = await invokeWithNativeCompactBypass(
+                ["checkpoint", "retry"],
+                event.properties.sessionID,
+                "compact",
+              )
               await refreshContextCacheWithDiagnostic(resumed, "pending-harness-compaction")
               rememberCheckpoint(resumed, event.properties.sessionID)
-              await invokeNativeCompactIfRequired(resumed, event.properties.sessionID)
-              pendingCompaction = undefined
-              if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+              if (pendingCompactionRetiredByPython(resumed)) {
+                pendingCompaction = undefined
+                if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+              }
               return
             }
             const probe = await invoke(["checkpoint", "auto-probe"], event.properties.sessionID)
             const intent = autoIntentFromProbe(probe)
+            // Compatibility marker: issueForegroundAutoMarker(event.properties.sessionID)
             if (intent) {
               const marker = issueForegroundAutoMarker(event.properties.sessionID, intent)
               try {
@@ -1494,14 +1689,16 @@ ${currentContext}
         origin: "harness_auto_compaction",
       }
       try {
-        const result = await invoke([
-          "checkpoint", "request", "--trigger", "auto", "--intent", "compact",
-        ], input.sessionID)
+        const result = await invokeWithNativeCompactBypass([
+          "checkpoint", "request", "--trigger", "auto", "--intent", "compact", "--origin", "harness_auto_compaction",
+          ...pendingCompactionArgs(pendingCompaction),
+        ], input.sessionID, "compact")
         await refreshContextCacheWithDiagnostic(result, "harness-auto-compaction")
         rememberCheckpoint(result, input.sessionID)
-        await invokeNativeCompactIfRequired(result, input.sessionID)
-        pendingCompaction = undefined
-        if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+        if (pendingCompactionRetiredByPython(result)) {
+          pendingCompaction = undefined
+          if (!persistPendingCompaction(undefined)) throw new Error("pending_compaction could not be retired")
+        }
       } catch (error) {
         await client.app.log({ body: {
           service: "pco",

@@ -4,9 +4,11 @@ import pytest
 
 from mem_core.errors import MemError
 from mem_core.models import Operation, proposal_hash
-from pco.checkpoint import CheckpointEngine
+from pco.checkpoint import CheckpointEngine, CheckpointState
 from pco.checkpoint import finalize as finalize_steps
 from pco.harness import FakeHarnessAdapter, WorkerResult
+from pco.sources import SourceManager
+from pco.workspace import Workspace
 
 from conftest import NOW, approval_grant, continuation, envelope, event, hypothesis, meta, visible_messages
 
@@ -20,6 +22,13 @@ def basic_worker(_payload) -> WorkerResult:
         ],
         skill_versions={"pco-consolidate": "0.1.0"},
     )
+
+
+def followup_worker(_payload) -> WorkerResult:
+    result = basic_worker(_payload)
+    for operation in result.operations:
+        operation.record["revision"] = 2
+    return result
 
 
 @pytest.mark.parametrize("trigger", ["manual", "auto"])
@@ -39,7 +48,8 @@ def test_manual_and_auto_share_checkpoint_path(workspace, trigger: str) -> None:
     assert adapter.actions.index("publish_context") < adapter.actions.index("compact")
     assert adapter.actions.index("compact") < adapter.actions.index("insert_receipt")
     assert adapter.actions.index("insert_receipt") < adapter.actions.index("unlock")
-    assert adapter.actions.index("unlock") < adapter.actions.index("close_worker")
+    assert adapter.actions.index("close_worker") < adapter.actions.index("insert_receipt")
+    assert adapter.actions.index("insert_receipt") < adapter.actions.index("unlock")
     assert workspace.thread().last_consolidated_message_id == "msg_assistant_1"
     assert workspace.repository.current_records("events")["evt_publish_delay"]
     frozen = workspace.load_json(f"checkpoints/{result['checkpoint_id']}/frozen.json")
@@ -47,6 +57,255 @@ def test_manual_and_auto_share_checkpoint_path(workspace, trigger: str) -> None:
     assert contract["allowed_streams"]["continuations"]["write_policy"] == "auto"
     assert contract["allowed_streams"]["continuations"]["record_schema"]["required"]
     assert "messages" not in contract["allowed_streams"]
+
+
+def test_repeated_noop_compact_preserves_registered_source_hash_baseline(workspace, tmp_path) -> None:
+    source_path = tmp_path / "registered.md"
+    source_path.write_text("稳定 source\n", encoding="utf-8")
+    registration = SourceManager(workspace).register_local(source_path)
+    source_id = registration["source_id"]
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
+    engine = CheckpointEngine(workspace, adapter)
+
+    first = engine.request("manual", intent="compact")
+    baseline = first["receipt"]["source_hashes"]
+    assert source_id in baseline
+    assert adapter.worker_calls == 1
+    head = workspace.repository.head()
+    checkpoint_count = len(list(workspace.repository.iter_records("checkpoints")))
+    transaction_path = workspace.config.memory_root / "transactions" / "transactions.jsonl"
+    transaction_count = len(transaction_path.read_text(encoding="utf-8").splitlines())
+
+    second = engine.request("manual", intent="compact")
+    assert second["receipt"]["consolidation"]["status"] == "no_op"
+    assert second["receipt"]["source_hashes"] == baseline
+    assert second["receipt"]["canonical_transaction"]["created"] is False
+    assert second["receipt"]["audit_transaction_id"] is None
+    assert CheckpointEngine(workspace, adapter).status()["canonical_transaction"]["created"] is False
+    assert workspace.repository.head() == head
+    assert len(list(workspace.repository.iter_records("checkpoints"))) == checkpoint_count
+    assert len(transaction_path.read_text(encoding="utf-8").splitlines()) == transaction_count
+    assert adapter.worker_calls == 1
+
+    third = engine.request("manual", intent="compact")
+    assert third["receipt"]["consolidation"]["status"] == "no_op"
+    assert third["receipt"]["source_hashes"] == baseline
+    assert adapter.worker_calls == 1
+    assert workspace.repository.head() == head
+    assert len(list(workspace.repository.iter_records("checkpoints"))) == checkpoint_count
+    assert len(transaction_path.read_text(encoding="utf-8").splitlines()) == transaction_count
+    assert third["checkpoint_id"] not in workspace.repository.current_records("checkpoints")
+
+
+def test_pending_compaction_keeps_input_locked_until_native_compact(workspace) -> None:
+    pending = {
+        "request_id": "request_overflow_1",
+        "event_id": "event_overflow_1",
+        "session_id": "ses_fake_main",
+        "requested_boundary": {"through": "msg_assistant_1"},
+        "requested_at": 1785686402000,
+        "origin": "harness_auto_compaction",
+    }
+
+    class PendingDuringWorkerAdapter(FakeHarnessAdapter):
+        def __init__(self, *args, workspace, **kwargs):
+            self.workspace = workspace
+            super().__init__(*args, **kwargs)
+            self.merged = False
+
+        def resume_worker(self, handle, payload):
+            if not self.merged:
+                self.merged = True
+                CheckpointEngine(self.workspace, self).request(
+                    "auto",
+                    pending_compaction=pending,
+                )
+            return super().resume_worker(handle, payload)
+
+    adapter = PendingDuringWorkerAdapter(
+        workspace.config.state_root,
+        workspace=workspace,
+        messages=visible_messages(),
+        worker=basic_worker,
+    )
+    result = CheckpointEngine(workspace, adapter).request("manual", intent="consolidate")
+    assert result["ok"]
+    assert adapter.actions.count("unlock") == 1
+    assert "compact" in adapter.actions
+    compact_index = adapter.actions.index("compact")
+    assert "unlock" not in adapter.actions[:compact_index]
+    assert adapter.actions.index("compact") < adapter.actions.index("unlock")
+    assert workspace.load_json("active-checkpoint.json")["pending_compaction"] is None
+    history = workspace.repository.record_history("checkpoints", result["checkpoint_id"])
+    assert [record["revision"] for record in history] == [1]
+
+
+def test_noop_compact_retry_is_runtime_only(workspace) -> None:
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
+    engine = CheckpointEngine(workspace, adapter)
+    first = engine.request("manual", intent="compact")
+    head = workspace.repository.head()
+    checkpoint_count = len(list(workspace.repository.iter_records("checkpoints")))
+    worker_calls = adapter.worker_calls
+    transaction_path = workspace.config.memory_root / "transactions" / "transactions.jsonl"
+    transaction_count = len(transaction_path.read_text(encoding="utf-8").splitlines())
+
+    adapter.failures["compact"] = RuntimeError("native compact failed")
+    with pytest.raises(RuntimeError):
+        engine.request("manual", intent="compact")
+    failed = engine._load()
+    assert failed.consolidation_status == "no_op"
+    assert failed.compaction_status == "failed"
+    assert workspace.repository.head() == head
+    assert len(list(workspace.repository.iter_records("checkpoints"))) == checkpoint_count
+
+    retried = engine.retry()
+    assert retried["ok"]
+    assert retried["receipt"]["canonical_transaction"]["created"] is False
+    assert adapter.worker_calls == worker_calls
+    assert workspace.repository.head() == head
+    assert len(list(workspace.repository.iter_records("checkpoints"))) == checkpoint_count
+    assert len(transaction_path.read_text(encoding="utf-8").splitlines()) == transaction_count
+
+
+def test_final_receipt_generation_retries_without_duplicate_compact(workspace) -> None:
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
+    adapter.failures["publish_receipt"] = RuntimeError("Host receipt unavailable")
+    engine = CheckpointEngine(workspace, adapter)
+    with pytest.raises(RuntimeError):
+        engine.request("manual")
+
+    failed = engine._load()
+    assert failed.pending_acceptance == "closed"
+    assert failed.receipt_generation == 1
+    assert failed.host_receipt_generation is None
+    assert failed.input_unlocked is False
+    assert adapter.compact_calls == 1
+
+    retried = engine.retry()
+    assert retried["receipt"]["receipt_generation"] == 1
+    assert retried["receipt"]["host_receipt_generation"] == 1
+    assert retried["checkpoint"]["input_unlocked"] is True
+    assert adapter.compact_calls == 1
+    assert len(adapter.receipts) == 1
+
+
+def test_compaction_cursor_is_independent_and_survives_restart(workspace) -> None:
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
+    engine = CheckpointEngine(workspace, adapter)
+
+    consolidated = engine.request("manual", intent="consolidate")
+    assert consolidated["receipt"]["consolidation_cursor_after"] == "msg_assistant_1"
+    assert workspace.thread().last_consolidated_message_id == "msg_assistant_1"
+    assert workspace.thread().compaction_cursor is None
+
+    # Simulate a previously confirmed compact boundary before the latest
+    # consolidate. The next compact must use this independent baseline, not
+    # the consolidation cursor that now points at assistant_1.
+    thread = workspace.thread()
+    thread.compaction_cursor = "msg_user_1"
+    workspace.save_thread(thread)
+    adapter.worker = followup_worker
+    adapter.messages.extend([
+        {
+            "id": "msg_user_2",
+            "native_message_id": "native_user_2",
+            "role": "user",
+            "kind": "conversation",
+            "content": "继续补充一个新的公开边界。",
+            "created_at": NOW,
+        },
+        {
+            "id": "msg_assistant_2",
+            "native_message_id": "native_assistant_2",
+            "role": "assistant",
+            "kind": "conversation",
+            "content": "收到新的公开材料。",
+            "created_at": NOW,
+        },
+    ])
+
+    compacted = engine.request("manual", intent="compact")
+    assert compacted["receipt"]["compaction_cursor_before"] == "msg_user_1"
+    assert compacted["receipt"]["compaction_cursor_after"] == "msg_assistant_2"
+    assert workspace.thread().compaction_cursor == "msg_assistant_2"
+    assert workspace.thread().last_consolidated_message_id == "msg_assistant_2"
+
+    # A new engine instance must initialize the next operation from the
+    # durable thread cursor rather than from last_consolidated_message_id or
+    # an in-memory checkpoint object.
+    reopened = Workspace(workspace.config)
+    reopened.refresh_repository_profile()
+    restarted = CheckpointEngine(reopened, adapter)
+    next_compact = restarted.request("manual", intent="compact")
+    assert next_compact["receipt"]["consolidation"]["status"] == "no_op"
+    assert next_compact["receipt"]["compaction_cursor_before"] == "msg_assistant_2"
+    assert reopened.thread().compaction_cursor == "msg_assistant_2"
+
+
+def test_legacy_thread_without_compaction_cursor_remains_unknown(workspace) -> None:
+    legacy = workspace.load_json("thread.json")
+    legacy.pop("compaction_cursor", None)
+    legacy["last_consolidated_message_id"] = "msg_assistant_1"
+    workspace.save_json("thread.json", legacy)
+
+    thread = workspace.thread()
+    assert thread.last_consolidated_message_id == "msg_assistant_1"
+    assert thread.compaction_cursor is None
+
+    legacy_checkpoint = {
+        "id": "ckpt_legacy",
+        "trigger": "manual",
+        "status": "DONE",
+        "after_message_id": None,
+        "through_message_id": "msg_assistant_1",
+        "thread_id": thread.thread_id,
+        "harness_binding_id": workspace.binding().id,
+        "parent_session_id": "ses_fake_main",
+        "compacted": True,
+    }
+    migrated = CheckpointState.model_validate(legacy_checkpoint)
+    assert migrated.compaction_status == "completed"
+    assert migrated.compaction_cursor_after is None
+
+
+def test_failed_compact_does_not_advance_thread_cursor_until_retry_succeeds(workspace) -> None:
+    adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
+    engine = CheckpointEngine(workspace, adapter)
+    first = engine.request("manual", intent="compact")
+    assert workspace.thread().compaction_cursor == "msg_assistant_1"
+
+    adapter.worker = followup_worker
+    adapter.messages.extend([
+        {
+            "id": "msg_user_2",
+            "native_message_id": "native_user_2",
+            "role": "user",
+            "kind": "conversation",
+            "content": "新的公开材料。",
+            "created_at": NOW,
+        },
+        {
+            "id": "msg_assistant_2",
+            "native_message_id": "native_assistant_2",
+            "role": "assistant",
+            "kind": "conversation",
+            "content": "记录新的边界。",
+            "created_at": NOW,
+        },
+    ])
+    adapter.failures["compact"] = RuntimeError("native compact failed")
+    with pytest.raises(RuntimeError):
+        engine.request("manual", intent="compact")
+    assert workspace.thread().compaction_cursor == "msg_assistant_1"
+    failed = engine._load()
+    assert failed.compaction_cursor_before == "msg_assistant_1"
+    assert failed.compaction_cursor_after is None
+
+    retried = engine.retry()
+    assert retried["ok"]
+    assert workspace.thread().compaction_cursor == "msg_assistant_2"
+    assert adapter.compact_calls == 2  # first success and retry success
 
 
 def test_meta_proposal_cannot_commit_until_yes(workspace) -> None:
@@ -362,21 +621,25 @@ def test_worker_cleanup_failure_is_a_retryable_derivation(workspace) -> None:
     retried = engine.retry_derivations()
     assert retried["status"] == "DONE"
     assert retried["derivations"]["worker_cleanup"]["ok"]
+    persisted_receipt = workspace.load_json(f"checkpoints/{retried['checkpoint_id']}/receipt.json")
+    assert persisted_receipt["status"] == "DONE"
+    assert persisted_receipt["derivations"]["worker_cleanup"]["ok"] is True
+    assert persisted_receipt["derivations"]["worker_cleanup"]["pending"] is False
+    assert persisted_receipt["receipt_generation"] == 2
+    assert persisted_receipt["receipt_delivery"]["host_disposition"] == "created"
+    assert len(adapter.receipt_resources) == 2
     history = workspace.repository.record_history("checkpoints", retried["checkpoint_id"])
-    assert [record["revision"] for record in history] == [1, 2]
-    assert history[0]["payload"]["status"] == "committed_with_pending_derivations"
-    assert history[1]["payload"]["status"] == "committed"
-    cleanup = history[1]["payload"]["derivations"]["worker_cleanup"]
-    assert cleanup["ok"] is True
-    assert len(cleanup["attempts"]) == 2
-    assert cleanup["attempts"][0]["error"]["message"] == "worker delete failed"
-    assert "recovered_from" in cleanup["attempts"][1]
+    # Cleanup is runtime-only; its retry must not revise the consolidation
+    # canonical record or create another Git commit.
+    assert [record["revision"] for record in history] == [1]
+    assert history[0]["payload"]["status"] == "committed"
+    assert "worker_cleanup" not in history[0]["payload"]["derivations"]
 
     # A retry after the successful revision is idempotent and must not append
     # another canonical checkpoint revision.
     retried_again = engine.retry_derivations()
     assert retried_again["status"] == "DONE"
-    assert [record["revision"] for record in workspace.repository.record_history("checkpoints", retried["checkpoint_id"])] == [1, 2]
+    assert [record["revision"] for record in workspace.repository.record_history("checkpoints", retried["checkpoint_id"])] == [1]
 
 
 def test_unavailable_child_is_rebuilt_from_the_same_frozen_boundary(workspace) -> None:
@@ -409,12 +672,20 @@ def test_checkpoint_record_carries_real_commit_and_derivations(workspace) -> Non
     adapter = FakeHarnessAdapter(workspace.config.state_root, messages=visible_messages(), worker=basic_worker)
     result = CheckpointEngine(workspace, adapter).request("manual")
     record = workspace.repository.current_records("checkpoints")[result["checkpoint_id"]]
-    # Cleanup completion is an observable post-commit derivation transition,
-    # so the final canonical audit state is an append-only revision.
-    assert record["revision"] == 2
+    # Cleanup is completed before the canonical final snapshot, so one record
+    # already carries the same outcome as the receipt.
+    assert record["revision"] == 1
     assert record["payload"]["git_commit"] == result["receipt"]["git_commit"]
     assert record["payload"]["audit_transaction_id"] == result["receipt"]["audit_transaction_id"]
     assert record["payload"]["status"] in {"committed", "committed_with_pending_derivations"}
+    assert record["payload"]["requested_intent"] == "compact"
+    for runtime_field in {
+        "compaction_requested", "compaction_status", "compaction_origin",
+        "pending_compaction", "pending_acceptance", "native_compact_attempt_id",
+        "compaction_cursor_before", "compaction_cursor_after",
+        "receipt_generation", "host_receipt_generation", "receipt_kind", "receipt_key",
+    }:
+        assert runtime_field not in record["payload"]
     assert record["payload"]["derivations"] != {
         "index": "scheduled",
         "backlinks": "scheduled",

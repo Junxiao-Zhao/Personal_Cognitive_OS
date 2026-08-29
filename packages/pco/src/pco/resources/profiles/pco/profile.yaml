@@ -1,5 +1,5 @@
 name: pco
-version: 0.3.3
+version: 0.4.0
 streams:
   messages:
     path: raw/conversations/messages.jsonl
@@ -77,7 +77,12 @@ capabilities:
     affine: pco.projection.affine
     markdown: pco.projection.markdown
 checkpoint:
-  trigger_ratio: 0.50
+  auto_consolidate:
+    enabled: true
+    new_public_tokens: 32768
+  auto_compact:
+    enabled: true
+    context_ratio: 0.90
 conversation_archive:
   reasoning:
     archive_if_available: true

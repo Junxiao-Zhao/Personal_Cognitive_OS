@@ -16,11 +16,17 @@ writeFileSync(join(state, "harness-binding.json"), JSON.stringify({
 const callsPath = join(root, "calls.jsonl")
 const fakePco = join(root, "fake-pco.ts")
 writeFileSync(fakePco, `#!/usr/bin/env bun
-import { appendFileSync } from "node:fs"
+import { appendFileSync, unlinkSync } from "node:fs"
 const args = process.argv.slice(2)
 appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify(args) + "\\n")
+const intentIndex = args.indexOf("--intent")
+const intent = intentIndex >= 0 ? args[intentIndex + 1] : undefined
+const hasNativeToken = args.includes("--native-compact-token")
+const retireNativeToken = () => {
+  try { unlinkSync(${JSON.stringify(join(state, "native-compact-bypass.json"))}) } catch {}
+}
 if (args.includes("status")) {
-  console.log(JSON.stringify({ ok: true, checkpoint: { status: "AWAITING_META_APPROVAL" }, proposal: {
+  console.log(JSON.stringify({ ok: true, intent: "compact", compaction: { requested: true, status: "pending" }, checkpoint: { status: "AWAITING_META_APPROVAL", intent: "compact", compaction_status: "pending" }, proposal: {
     checkpoint_id: "ckpt_1",
     proposal_hash: "sha256:proposal_1",
     approval_challenge_id: "challenge_1",
@@ -28,12 +34,15 @@ if (args.includes("status")) {
   }}))
 } else if (args.includes("request")) {
   const n = args.filter((value) => value === "request").length
-  console.log(JSON.stringify({ ok: true, approval_required: true, proposal: {
+  console.log(JSON.stringify({ ok: true, intent, compaction: { requested: intent === "compact", status: intent === "compact" ? "pending" : "not_requested" }, approval_required: true, proposal: {
     checkpoint_id: "ckpt_" + n,
     proposal_hash: "sha256:proposal_" + n,
     approval_challenge_id: "challenge_" + n,
     protected_diff: [{ id: "meta_" + n, before: null, after: { status: "active" } }]
   }}))
+} else if (args.includes("decide")) {
+  if (hasNativeToken) retireNativeToken()
+  console.log(JSON.stringify({ ok: true, intent: hasNativeToken ? "compact" : "consolidate", receipt: { intent: hasNativeToken ? "compact" : "consolidate", compaction: { requested: hasNativeToken, status: hasNativeToken ? "completed" : "not_requested" } }, compaction: { requested: hasNativeToken, status: hasNativeToken ? "completed" : "not_requested" } }))
 } else if (args.includes("auto-probe")) {
   console.log(JSON.stringify({ ok: true, needed: true }))
 } else {
@@ -125,6 +134,9 @@ const loopbackClient = {
           current,
         ] }
       },
+      summarize: async () => {
+        throw new Error("Plugin must not call OpenCode summarize directly; Python OpenCodeAdapter owns it")
+      },
     },
 }
 plugin = await PCOPlugin({
@@ -187,26 +199,66 @@ await assert.rejects(
 assert.equal(externalCompactionOutput.cancel, true)
 assert.equal((externalCompactionOutput.pco_compaction_gate as Record<string, unknown>).decision, "intercept")
 const bypassPath = join(state, "native-compact-bypass.json")
+const bypassExpiry1 = Date.now() + 300_000
 writeFileSync(bypassPath, JSON.stringify({
   token: "bypass-token-1",
   checkpointID: "ckpt-native-1",
   sessionID: "session-1",
   attemptID: "attempt-1",
-  expiresAt: Date.now() + 300_000,
+  expiresAt: bypassExpiry1,
 }))
 plugin = await PCOPlugin({
   client: loopbackClient,
   directory: root,
   serverUrl: new URL("http://127.0.0.1:4096"),
 } as never) as any
-const allowedCompactionOutput: Record<string, unknown> = {}
-await plugin["experimental.session.compacting"]({
+const restartedCompactionOutput: Record<string, unknown> = {}
+await assert.rejects(() => plugin["experimental.session.compacting"]({
   sessionID: "session-1",
   metadata: { pco_native_compact: {
     token: "bypass-token-1",
     checkpoint_id: "ckpt-native-1",
     session_id: "session-1",
     attempt_id: "attempt-1",
+    expires_at: bypassExpiry1,
+  } },
+}, restartedCompactionOutput), "a Plugin restart must invalidate an unconsumed native compact bypass token")
+assert.equal((restartedCompactionOutput.pco_compaction_gate as Record<string, unknown>).decision, "intercept")
+writeFileSync(bypassPath, JSON.stringify({
+  token: "bypass-token-missing-expiry",
+  checkpointID: "ckpt-native-missing-expiry",
+  sessionID: "session-1",
+  attemptID: "attempt-missing-expiry",
+  expiresAt: Date.now() + 300_000,
+}))
+const missingExpiryOutput: Record<string, unknown> = {}
+await assert.rejects(() => plugin["experimental.session.compacting"]({
+  sessionID: "session-1",
+  metadata: { pco_native_compact: {
+    token: "bypass-token-missing-expiry",
+    checkpoint_id: "ckpt-native-missing-expiry",
+    session_id: "session-1",
+    attempt_id: "attempt-missing-expiry",
+  } },
+}, missingExpiryOutput), "a bypass token without expiry must fail closed")
+assert.equal((missingExpiryOutput.pco_compaction_gate as Record<string, unknown>).decision, "intercept")
+const bypassExpiry2 = Date.now() + 300_000
+writeFileSync(bypassPath, JSON.stringify({
+  token: "bypass-token-2",
+  checkpointID: "ckpt-native-2",
+  sessionID: "session-1",
+  attemptID: "attempt-2",
+  expiresAt: bypassExpiry2,
+}))
+const allowedCompactionOutput: Record<string, unknown> = {}
+await plugin["experimental.session.compacting"]({
+  sessionID: "session-1",
+  metadata: { pco_native_compact: {
+    token: "bypass-token-2",
+    checkpoint_id: "ckpt-native-2",
+    session_id: "session-1",
+    attempt_id: "attempt-2",
+    expires_at: bypassExpiry2,
   } },
 }, allowedCompactionOutput)
 assert.equal((allowedCompactionOutput.pco_compaction_gate as Record<string, unknown>).decision, "allow_once")
@@ -215,10 +267,11 @@ await assert.rejects(
   () => plugin["experimental.session.compacting"]({
     sessionID: "session-1",
     metadata: { pco_native_compact: {
-      token: "bypass-token-1",
-      checkpoint_id: "ckpt-native-1",
+      token: "bypass-token-2",
+      checkpoint_id: "ckpt-native-2",
       session_id: "session-1",
-      attempt_id: "attempt-1",
+      attempt_id: "attempt-2",
+      expires_at: bypassExpiry2,
     } },
   }, {}),
   "a consumed native compact bypass token must be rejected",
@@ -279,6 +332,12 @@ const consolidateRequest = calls.find((args) => args.includes("request") && args
 assert.ok(consolidateRequest)
 const compactRequest = calls.find((args) => args.includes("request") && args.includes("--trigger") && args.includes("manual") && args.includes("--intent") && args.includes("compact"))
 assert.ok(compactRequest)
+const compactTokenIndex = compactRequest?.indexOf("--native-compact-token") ?? -1
+const compactAttemptIndex = compactRequest?.indexOf("--native-compact-attempt-id") ?? -1
+const compactExpiryIndex = compactRequest?.indexOf("--native-compact-expires-at") ?? -1
+assert.ok(compactTokenIndex >= 0 && compactRequest?.[compactTokenIndex + 1])
+assert.ok(compactAttemptIndex >= 0 && compactRequest?.[compactAttemptIndex + 1])
+assert.ok(compactExpiryIndex >= 0 && Number(compactRequest?.[compactExpiryIndex + 1]) > Date.now())
 const persistedProvenance = JSON.parse(await Bun.file(join(state, "foreground-auto-provenance.json")).text()) as Record<string, unknown>
 assert.equal((persistedProvenance.marker as Record<string, unknown> | null)?.nonce, undefined)
 assert.ok((persistedProvenance.tombstones as Array<Record<string, unknown>>).every((entry) => entry.nonce === undefined))
@@ -546,6 +605,7 @@ const provenancePath = join(state, "foreground-auto-provenance.json")
 writeFileSync(provenancePath, JSON.stringify({
   marker: {
     sessionID: "session-1",
+    intent: "compact",
     nonce: "expired-after-restart",
     commandMessageID: "expired-command-message",
     expiresAt: Date.now() - 1,
@@ -572,6 +632,7 @@ const incompleteUntil = Date.now() + 120_000
 writeFileSync(provenancePath, JSON.stringify({
   marker: {
     sessionID: "session-1",
+    intent: "compact",
     commandMessageID: "windowed-expired-command",
     expiresAt: Date.now() - 1,
   },
@@ -599,6 +660,7 @@ try { unlinkSync(join(state, "foreground-auto-invalidation.json")) } catch {}
 writeFileSync(provenancePath, JSON.stringify({
   marker: {
     sessionID: "session-1",
+    intent: "compact",
     commandMessageID: "resumable-auto-command",
     toolCallID: "resumable-auto-call",
     toolMessageID: "assistant-resumable-auto",
@@ -648,6 +710,7 @@ for (const [label, expiresAt] of [["missing", undefined], ["zero", 0], ["negativ
 writeFileSync(provenancePath, JSON.stringify({
   marker: {
     sessionID: "session-1",
+    intent: "compact",
     nonce: "retired-but-stale",
     commandMessageID: "retired-command-message",
     expiresAt: Date.now() + 300_000,

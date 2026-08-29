@@ -25,6 +25,9 @@ class ThreadState(BaseModel):
     active_epoch_id: str
     last_archived_message_id: str | None = None
     last_consolidated_message_id: str | None = None
+    # Native Harness compaction advances independently from consolidation.
+    # ``None`` is intentionally an unknown/unproven historical baseline.
+    compaction_cursor: str | None = None
     archive_cursor: str | None = None
     created_at: str
 
@@ -101,7 +104,48 @@ class Workspace:
         os.replace(temporary, path)
 
     def thread(self) -> ThreadState:
-        return ThreadState.model_validate(self.load_json("thread.json"))
+        data = self.load_json("thread.json")
+        if "compaction_cursor" not in data:
+            # A legacy thread may be upgraded only from a fully observable,
+            # successful compact record. Never use consolidation progress as
+            # a substitute when that proof is absent.
+            data["compaction_cursor"] = self._proven_compaction_cursor()
+            self.save_json("thread.json", data)
+        return ThreadState.model_validate(data)
+
+    def _proven_compaction_cursor(self) -> str | None:
+        try:
+            records = list(self.repository.iter_records("checkpoints"))
+        except Exception:
+            return None
+        for record in reversed(records):
+            payload = record.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("status") not in {"committed", "committed_with_pending_derivations"}:
+                continue
+            checkpoint_id = record.get("id")
+            if not isinstance(checkpoint_id, str):
+                continue
+            receipt_path = self.state_path(f"checkpoints/{checkpoint_id}/receipt.json")
+            if not receipt_path.is_file():
+                continue
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            compaction = receipt.get("compaction") if isinstance(receipt, dict) else None
+            publication = receipt.get("context_publication") if isinstance(receipt, dict) else None
+            if (
+                isinstance(compaction, dict)
+                and compaction.get("status") == "completed"
+                and isinstance(compaction.get("cursor_after"), str)
+                and compaction.get("cursor_after")
+                and isinstance(publication, dict)
+                and publication.get("status") == "completed"
+            ):
+                return compaction["cursor_after"]
+        return None
 
     def save_thread(self, state: ThreadState) -> None:
         self.save_json("thread.json", state.model_dump(mode="json"))

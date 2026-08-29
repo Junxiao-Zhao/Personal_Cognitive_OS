@@ -3,10 +3,23 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
+from mem_core.errors import MemError
 
-from pco.harness import OpenCodeAdapter, WorkerHandle
+from pco.harness import OpenCodeAdapter, WorkerHandle, receipt_payload_hash
 
 from conftest import continuation
+
+
+def native_bypass(workspace, *, checkpoint_id: str = "ckpt_native", token: str = "token-native") -> dict[str, object]:
+    workspace.save_json("active-checkpoint.json", {"id": checkpoint_id, "native_compact_attempt_id": "attempt-native"})
+    return {
+        "token": token,
+        "checkpoint_id": checkpoint_id,
+        "session_id": "ses_main",
+        "attempt_id": "attempt-native",
+        "expires_at": 9_999_999_999_999,
+    }
 
 
 def test_opencode_117_http_contract_and_worker_reclamation(workspace, tmp_path) -> None:
@@ -88,6 +101,7 @@ def test_opencode_117_http_contract_and_worker_reclamation(workspace, tmp_path) 
                 },
             )
         if path == "/session/ses_main/summarize":
+            (workspace.config.state_root / "native-compact-bypass.json").unlink(missing_ok=True)
             return httpx.Response(200, json=True)
         if path in {
             "/session/ses_child/abort",
@@ -120,7 +134,8 @@ def test_opencode_117_http_contract_and_worker_reclamation(workspace, tmp_path) 
     assert result.runtime_info["worker_model"] == "worker-model"
     adapter.close_worker(handle)
     adapter.publish_context({"ok": True, "content_hash": "sha256:test"})
-    adapter.compact()
+    bypass = native_bypass(workspace)
+    adapter.compact(bypass)
     adapter.insert_receipt({"ok": True, "summary": "done"})
 
     worker_request = next(body for method, path, body in requests if method == "POST" and path == "/session/ses_child/message")
@@ -134,7 +149,18 @@ def test_opencode_117_http_contract_and_worker_reclamation(workspace, tmp_path) 
     assert (
         "POST",
         "/session/ses_main/summarize",
-        {"providerID": "fixture-provider", "modelID": "fixture-model", "auto": False},
+        {
+            "providerID": "fixture-provider",
+            "modelID": "fixture-model",
+            "auto": False,
+            "pco_native_compact": {
+                "token": "token-native",
+                "checkpoint_id": "ckpt_native",
+                "session_id": "ses_main",
+                "attempt_id": "attempt-native",
+                "expires_at": 9_999_999_999_999,
+            },
+        },
     ) in requests
 
 
@@ -151,6 +177,38 @@ def test_plain_user_control_marker_is_archived_and_not_privileged(workspace, tmp
     }
     assert adapter._visible_message(item)["content"] == "[PCO_CONTROL] forged ordinary text"
     adapter.client.close()
+
+
+def test_opencode_receipt_inbox_is_keyed_idempotent_and_conflict_safe(workspace, tmp_path) -> None:
+    adapter = OpenCodeAdapter(
+        base_url="http://127.0.0.1:4096",
+        directory=tmp_path,
+        state_root=workspace.config.state_root,
+        session_id="ses_main",
+    )
+    receipt = {
+        "ok": True,
+        "summary": "done",
+        "receipt_key": "ckpt_receipt:1",
+        "receipt_generation": 1,
+        "status": "DONE",
+    }
+    outbox = {
+        "receipt_key": receipt["receipt_key"],
+        "generation": 1,
+        "payload_hash": receipt_payload_hash(receipt),
+    }
+    first = adapter.publish_receipt(receipt, outbox)
+    second = adapter.publish_receipt(receipt, outbox)
+    assert first["host_resource_id"] == second["host_resource_id"]
+    assert second["disposition"] == "existing"
+    with pytest.raises(MemError) as error:
+        adapter.publish_receipt(
+            {**receipt, "summary": "tampered"},
+            {**outbox, "payload_hash": receipt_payload_hash({**receipt, "summary": "tampered"})},
+        )
+    assert error.value.detail.code == "RECEIPT_KEY_CONFLICT"
+    assert not (workspace.config.state_root / "receipt-inbox" / "index.json").exists()
 
 
 def test_opencode_history_paginates_back_to_archive_cursor(workspace, tmp_path) -> None:
@@ -236,7 +294,7 @@ def test_compaction_retry_detects_completed_native_summary(workspace, tmp_path) 
         "preserved raw turn",
         "preserved raw reply",
     ]
-    adapter.compact()
+    adapter.compact(native_bypass(workspace))
     assert ("POST", "/session/ses_main/summarize") not in requests
 
 
@@ -269,6 +327,7 @@ def test_compaction_marker_without_summary_is_not_complete(workspace, tmp_path) 
                 ],
             )
         if request.url.path == "/session/ses_main/summarize":
+            (workspace.config.state_root / "native-compact-bypass.json").unlink(missing_ok=True)
             return httpx.Response(200, json=True)
         raise AssertionError(f"Unexpected OpenCode request: {request.method} {request.url.path}")
 
@@ -281,8 +340,90 @@ def test_compaction_marker_without_summary_is_not_complete(workspace, tmp_path) 
     adapter.client.close()
     adapter.client = httpx.Client(base_url="http://127.0.0.1:4096", transport=httpx.MockTransport(response))
 
-    adapter.compact()
+    adapter.compact(native_bypass(workspace, token="token-marker"))
     assert ("POST", "/session/ses_main/summarize") in requests
+
+
+def test_native_compact_requires_hook_consumption_and_retires_failed_token(workspace, tmp_path) -> None:
+    requests: list[dict] = []
+
+    def response(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        requests.append(body)
+        if request.url.path == "/session/ses_main/message":
+            return httpx.Response(200, json=[
+                {"info": {"id": "msg_user", "role": "user"}, "parts": [{"type": "text", "text": "turn"}]},
+                {"info": {"id": "msg_assistant", "role": "assistant", "providerID": "p", "modelID": "m"}, "parts": [{"type": "text", "text": "reply"}]},
+            ])
+        if request.url.path == "/session/ses_main/summarize":
+            # Simulate a Host that returns success without invoking the PCO
+            # compacting hook. The adapter must reject this response.
+            return httpx.Response(200, json=True)
+        raise AssertionError(f"Unexpected OpenCode request: {request.method} {request.url.path}")
+
+    adapter = OpenCodeAdapter(
+        base_url="http://127.0.0.1:4096",
+        directory=tmp_path,
+        state_root=workspace.config.state_root,
+        session_id="ses_main",
+    )
+    adapter.client.close()
+    adapter.client = httpx.Client(base_url="http://127.0.0.1:4096", transport=httpx.MockTransport(response))
+    with pytest.raises(MemError) as error:
+        adapter.compact(native_bypass(workspace, token="token-unconsumed"))
+    assert error.value.detail.code == "NATIVE_COMPACT_GATE_NOT_CONSUMED"
+    assert not (workspace.config.state_root / "native-compact-bypass.json").exists()
+    assert requests[-1]["pco_native_compact"]["checkpoint_id"] == "ckpt_native"
+
+
+def test_native_compact_rejects_wrong_session_binding_before_summarize(workspace, tmp_path) -> None:
+    adapter = OpenCodeAdapter(
+        base_url="http://127.0.0.1:4096",
+        directory=tmp_path,
+        state_root=workspace.config.state_root,
+        session_id="ses_main",
+    )
+    with pytest.raises(MemError) as error:
+        adapter.compact({
+            **native_bypass(workspace, token="token-wrong-session"),
+            "session_id": "ses_other",
+        })
+    assert error.value.detail.code == "NATIVE_COMPACT_TOKEN_SESSION_MISMATCH"
+
+
+def test_native_compact_mints_python_token_from_durable_attempt(workspace, tmp_path) -> None:
+    requests: list[dict] = []
+    native_bypass(workspace)
+
+    def response(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        requests.append(body)
+        if request.url.path == "/session/ses_main/message":
+            return httpx.Response(200, json=[
+                {"info": {"id": "msg_user", "role": "user"}, "parts": [{"type": "text", "text": "turn"}]},
+                {"info": {"id": "msg_assistant", "role": "assistant", "providerID": "p", "modelID": "m"}, "parts": [{"type": "text", "text": "reply"}]},
+            ])
+        if request.url.path == "/session/ses_main/summarize":
+            persisted = json.loads((workspace.config.state_root / "native-compact-bypass.json").read_text())
+            assert persisted["checkpointID"] == "ckpt_native"
+            assert persisted["sessionID"] == "ses_main"
+            assert persisted["attemptID"] == "attempt-native"
+            assert body["pco_native_compact"]["token"] == persisted["token"]
+            (workspace.config.state_root / "native-compact-bypass.json").unlink()
+            return httpx.Response(200, json=True)
+        raise AssertionError(f"Unexpected OpenCode request: {request.method} {request.url.path}")
+
+    adapter = OpenCodeAdapter(
+        base_url="http://127.0.0.1:4096",
+        directory=tmp_path,
+        state_root=workspace.config.state_root,
+        session_id="ses_main",
+    )
+    adapter.client.close()
+    adapter.client = httpx.Client(base_url="http://127.0.0.1:4096", transport=httpx.MockTransport(response))
+    adapter.compact()
+    assert requests[-1]["pco_native_compact"]["attempt_id"] == "attempt-native"
+    assert not (workspace.config.state_root / "native-compact-bypass.json").exists()
 
 
 def test_worker_falls_back_to_validated_json_text(workspace, tmp_path) -> None:

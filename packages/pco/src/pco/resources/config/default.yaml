@@ -5,7 +5,12 @@ indexes_dir: indexes
 projection_dir: projection
 profile: pco
 checkpoint:
-  trigger_ratio: 0.50
+  auto_consolidate:
+    enabled: true
+    new_public_tokens: 32768
+  auto_compact:
+    enabled: true
+    context_ratio: 0.90
   derivations:
     index: true
     backlinks: true

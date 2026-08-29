@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -99,6 +101,19 @@ def receipt_result_urls(receipt: dict[str, Any]) -> list[str]:
     return urls
 
 
+def receipt_payload_hash(receipt: dict[str, Any]) -> str:
+    """Hash the immutable receipt payload, excluding delivery acknowledgements."""
+
+    immutable = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"host_receipt_generation", "receipt_delivery"}
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(immutable, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
 WORKER_RESULT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -156,6 +171,72 @@ class WorkerResult:
     runtime_info: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class NativeCompactBypass:
+    """Private one-shot binding used for a PCO-owned native compact."""
+
+    token: str
+    checkpoint_id: str
+    session_id: str
+    attempt_id: str
+    expires_at: int
+
+    @classmethod
+    def from_value(cls, value: "NativeCompactBypass | dict[str, Any]") -> "NativeCompactBypass":
+        if isinstance(value, cls):
+            return value
+        checkpoint_id = value.get("checkpoint_id", value.get("checkpointID"))
+        session_id = value.get("session_id", value.get("sessionID"))
+        attempt_id = value.get("attempt_id", value.get("attemptID"))
+        expires_at = value.get("expires_at", value.get("expiresAt"))
+        ensure(
+            isinstance(value.get("token"), str) and value["token"],
+            "NATIVE_COMPACT_TOKEN_INVALID",
+            "native_compact",
+            "Missing native compact bypass token",
+        )
+        ensure(
+            isinstance(checkpoint_id, str) and checkpoint_id,
+            "NATIVE_COMPACT_TOKEN_INVALID",
+            "native_compact",
+            "Missing native compact checkpoint binding",
+        )
+        ensure(
+            isinstance(session_id, str) and session_id,
+            "NATIVE_COMPACT_TOKEN_INVALID",
+            "native_compact",
+            "Missing native compact session binding",
+        )
+        ensure(
+            isinstance(attempt_id, str) and attempt_id,
+            "NATIVE_COMPACT_TOKEN_INVALID",
+            "native_compact",
+            "Missing native compact attempt binding",
+        )
+        ensure(
+            isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool),
+            "NATIVE_COMPACT_TOKEN_INVALID",
+            "native_compact",
+            "Missing native compact token expiry",
+        )
+        return cls(
+            token=value["token"],
+            checkpoint_id=checkpoint_id,
+            session_id=session_id,
+            attempt_id=attempt_id,
+            expires_at=int(expires_at),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "token": self.token,
+            "checkpointID": self.checkpoint_id,
+            "sessionID": self.session_id,
+            "attemptID": self.attempt_id,
+            "expiresAt": self.expires_at,
+        }
+
+
 class HarnessAdapter(Protocol):
     def attach_or_create(self) -> str: ...
     def archive_messages_since(self, cursor: str | None) -> list[dict[str, Any]]: ...
@@ -166,9 +247,9 @@ class HarnessAdapter(Protocol):
     def spawn_worker(self, spec: dict[str, Any]) -> WorkerHandle: ...
     def resume_worker(self, handle: WorkerHandle, payload: dict[str, Any]) -> WorkerResult: ...
     def close_worker(self, handle: WorkerHandle) -> None: ...
-    def compact(self) -> None: ...
+    def compact(self, bypass: NativeCompactBypass | dict[str, Any] | None = None) -> None: ...
     def publish_context(self, bundle: dict[str, Any]) -> None: ...
-    def insert_receipt(self, receipt: dict[str, Any]) -> None: ...
+    def publish_receipt(self, receipt: dict[str, Any], outbox: dict[str, Any]) -> dict[str, Any]: ...
 
 
 class FakeHarnessAdapter:
@@ -195,6 +276,7 @@ class FakeHarnessAdapter:
         self.closed_workers: list[str] = []
         self.actions: list[str] = []
         self.failures: dict[str, Exception] = {}
+        self.receipt_resources: dict[str, dict[str, Any]] = {}
 
     def _maybe_fail(self, name: str) -> None:
         error = self.failures.pop(name, None)
@@ -257,7 +339,7 @@ class FakeHarnessAdapter:
         self.actions.append("close_worker")
         self.closed_workers.append(handle.id)
 
-    def compact(self) -> None:
+    def compact(self, bypass: NativeCompactBypass | dict[str, Any] | None = None) -> None:
         self._maybe_fail("compact")
         self.compact_calls += 1
         self.actions.append("compact")
@@ -267,10 +349,34 @@ class FakeHarnessAdapter:
         self.published.append(bundle)
         self.actions.append("publish_context")
 
-    def insert_receipt(self, receipt: dict[str, Any]) -> None:
-        self._maybe_fail("insert_receipt")
+    def publish_receipt(self, receipt: dict[str, Any], outbox: dict[str, Any]) -> dict[str, Any]:
+        self._maybe_fail("publish_receipt")
+        key = str(outbox["receipt_key"])
+        payload_hash = str(outbox["payload_hash"])
+        existing = self.receipt_resources.get(key)
+        if existing is not None:
+            if existing["payload_hash"] != payload_hash:
+                raise MemError("RECEIPT_KEY_CONFLICT", "receipt", "Receipt key was reused with a different payload", retryable=False)
+            self.actions.append("receipt_existing")
+            return {**existing, "disposition": "existing"}
+        resource = {
+            "host_resource_id": f"fake_receipt_{uuid.uuid4().hex}",
+            "key": key,
+            "generation": int(outbox["generation"]),
+            "payload_hash": payload_hash,
+            "disposition": "created",
+        }
+        self.receipt_resources[key] = resource
         self.receipts.append(receipt)
         self.actions.append("insert_receipt")
+        return resource
+
+    def insert_receipt(self, receipt: dict[str, Any]) -> None:
+        # Compatibility entry point for older direct adapter callers. The
+        # checkpoint finalizer uses publish_receipt and its durable outbox.
+        key = str(receipt.get("receipt_key") or f"legacy:{uuid.uuid4().hex}")
+        outbox = {"receipt_key": key, "generation": int(receipt.get("receipt_generation", 0)), "payload_hash": receipt_payload_hash(receipt)}
+        self.publish_receipt(receipt, outbox)
 
 
 class OpenCodeAdapter:
@@ -285,6 +391,7 @@ class OpenCodeAdapter:
         session_id: str | None = None,
         model_context_tokens: int = 128000,
         timeout: float = 120.0,
+        native_compact_bypass: NativeCompactBypass | dict[str, Any] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.directory = directory.resolve()
@@ -292,6 +399,7 @@ class OpenCodeAdapter:
         self.session_id = session_id
         self.model_context_tokens = model_context_tokens
         self.timeout_seconds = timeout
+        self.native_compact_bypass = native_compact_bypass
         self.client = httpx.Client(base_url=self.base_url, timeout=timeout, trust_env=False)
         self._runtime_info: dict[str, Any] = {
             "harness": "opencode",
@@ -820,9 +928,125 @@ class OpenCodeAdapter:
             pass
         self._request("DELETE", f"/session/{handle.native_session_id}")
 
-    def compact(self) -> None:
+    def _active_checkpoint_binding(self) -> tuple[str, str]:
+        path = self.state_root / "active-checkpoint.json"
+        ensure(path.is_file(), "NATIVE_COMPACT_CHECKPOINT_MISSING", "native_compact", "No durable checkpoint is available for native compact")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise MemError("NATIVE_COMPACT_CHECKPOINT_INVALID", "native_compact", "Durable checkpoint state is unreadable", retryable=True) from exc
+        checkpoint_id = value.get("id") if isinstance(value, dict) else None
+        ensure(isinstance(checkpoint_id, str) and checkpoint_id, "NATIVE_COMPACT_CHECKPOINT_INVALID", "native_compact", "Durable checkpoint has no ID")
+        attempt_id = value.get("native_compact_attempt_id") if isinstance(value, dict) else None
+        ensure(
+            isinstance(attempt_id, str) and attempt_id,
+            "NATIVE_COMPACT_ATTEMPT_MISSING",
+            "native_compact",
+            "Durable NATIVE_COMPACT state has no attempt ID",
+        )
+        return checkpoint_id, attempt_id
+
+    def _native_bypass_path(self) -> Path:
+        return self.state_root / "native-compact-bypass.json"
+
+    def _persist_native_bypass(self, bypass: NativeCompactBypass) -> None:
+        path = self._native_bypass_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(bypass.as_dict(), sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+
+    def _retire_native_bypass(self, bypass: NativeCompactBypass) -> None:
+        path = self._native_bypass_path()
+        if not path.exists():
+            return
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            path.unlink(missing_ok=True)
+            return
+        if not isinstance(stored, dict) or stored.get("token") == bypass.token:
+            path.unlink(missing_ok=True)
+
+    def _bind_native_bypass(self, value: NativeCompactBypass | dict[str, Any] | None) -> NativeCompactBypass:
+        ensure(value is not None, "NATIVE_COMPACT_TOKEN_REQUIRED", "native_compact", "PCO native compact requires a one-shot bypass token")
+        bypass = NativeCompactBypass.from_value(value)
+        ensure(bypass.session_id == self.session_id, "NATIVE_COMPACT_TOKEN_SESSION_MISMATCH", "native_compact", "Native compact token is bound to another session")
+        ensure(bypass.expires_at > int(time.time() * 1000), "NATIVE_COMPACT_TOKEN_EXPIRED", "native_compact", "Native compact bypass token has expired")
+        checkpoint_id, attempt_id = self._active_checkpoint_binding()
+        ensure(
+            bypass.checkpoint_id in {"pending", ""} or bypass.checkpoint_id == checkpoint_id,
+            "NATIVE_COMPACT_TOKEN_CHECKPOINT_MISMATCH",
+            "native_compact",
+            "Native compact token is bound to another checkpoint",
+        )
+        ensure(
+            bypass.attempt_id == attempt_id,
+            "NATIVE_COMPACT_TOKEN_ATTEMPT_MISMATCH",
+            "native_compact",
+            "Native compact token is bound to another attempt",
+        )
+        bound = NativeCompactBypass(
+            token=bypass.token,
+            checkpoint_id=checkpoint_id,
+            session_id=bypass.session_id,
+            attempt_id=attempt_id,
+            expires_at=bypass.expires_at,
+        )
+        path = self._native_bypass_path()
+        if path.exists():
+            try:
+                stored = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise MemError("NATIVE_COMPACT_TOKEN_INVALID", "native_compact", "Existing native compact token is unreadable", retryable=False) from exc
+            ensure(
+                isinstance(stored, dict) and stored.get("token") == bypass.token,
+                "NATIVE_COMPACT_TOKEN_REPLAY",
+                "native_compact",
+                "A different native compact token is already pending",
+            )
+        self._persist_native_bypass(bound)
+        return bound
+
+    def _mint_native_bypass(self) -> NativeCompactBypass:
+        """Create and durably bind the one-shot gate for the current phase.
+
+        The checkpoint finalizer persists ``native_compact_attempt_id`` before
+        calling the adapter.  The adapter is therefore the first component
+        that is allowed to mint the private token used by the OpenCode hook.
+        """
+
+        checkpoint_id, attempt_id = self._active_checkpoint_binding()
+        path = self._native_bypass_path()
+        ensure(
+            not path.exists(),
+            "NATIVE_COMPACT_TOKEN_REPLAY",
+            "native_compact",
+            "A native compact bypass token is already pending",
+        )
+        token = NativeCompactBypass(
+            token=secrets.token_urlsafe(32),
+            checkpoint_id=checkpoint_id,
+            session_id=self.session_id or "",
+            attempt_id=attempt_id,
+            expires_at=int(time.time() * 1000) + 5 * 60_000,
+        )
+        self._persist_native_bypass(token)
+        return token
+
+    def compact(self, bypass: NativeCompactBypass | dict[str, Any] | None = None) -> None:
         ensure(self.session_id is not None, "HARNESS_NOT_ATTACHED", "harness", "OpenCode session is not attached")
-        items = self._request("GET", f"/session/{self.session_id}/message", params={"limit": 10000})
+        supplied = bypass if bypass is not None else self.native_compact_bypass
+        bound: NativeCompactBypass | None = None
+        try:
+            # Explicit values remain supported for adapter-level compatibility,
+            # but the normal durable checkpoint path mints the token here.
+            bound = self._bind_native_bypass(supplied) if supplied is not None else self._mint_native_bypass()
+            items = self._request("GET", f"/session/{self.session_id}/message", params={"limit": 10000})
+        except Exception:
+            if bound is not None:
+                self._retire_native_bypass(bound)
+            raise
         latest_conversation = -1
         latest_summary = -1
         provider_id: str | None = None
@@ -842,24 +1066,107 @@ class OpenCodeAdapter:
         # finished compaction.  Treat that case as success instead of creating
         # a second summary.
         if latest_summary > latest_conversation:
+            if bound is not None:
+                self._retire_native_bypass(bound)
             return
 
-        ensure(provider_id is not None and model_id is not None, "HARNESS_MODEL_UNKNOWN", "harness", "Cannot compact without an OpenCode provider/model")
-        result = self._request(
-            "POST",
-            f"/session/{self.session_id}/summarize",
-            json={"providerID": provider_id, "modelID": model_id, "auto": False},
-        )
-        ensure(result is True, "HARNESS_COMPACTION_FAILED", "harness", "OpenCode did not confirm native compaction")
+        try:
+            ensure(provider_id is not None and model_id is not None, "HARNESS_MODEL_UNKNOWN", "harness", "Cannot compact without an OpenCode provider/model")
+            result = self._request(
+                "POST",
+                f"/session/{self.session_id}/summarize",
+                json={
+                    "providerID": provider_id,
+                    "modelID": model_id,
+                    "auto": False,
+                    "pco_native_compact": {
+                        "token": bound.token,
+                        "checkpoint_id": bound.checkpoint_id,
+                        "session_id": bound.session_id,
+                        "attempt_id": bound.attempt_id,
+                        "expires_at": bound.expires_at,
+                    },
+                },
+            )
+            ensure(result is True, "HARNESS_COMPACTION_FAILED", "harness", "OpenCode did not confirm native compaction")
+            ensure(
+                not self._native_bypass_path().exists(),
+                "NATIVE_COMPACT_GATE_NOT_CONSUMED",
+                "native_compact",
+                "OpenCode did not consume the bound PCO native compact token",
+                retryable=True,
+            )
+        except Exception:
+            # A failed, timed-out, or unconsumed attempt may never be replayed.
+            self._retire_native_bypass(bound)
+            raise
 
     def publish_context(self, bundle: dict[str, Any]) -> None:
         target = self.state_root / "context" / "bundle.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
+    def _receipt_inbox(self) -> Path:
+        path = self.state_root / "receipt-inbox"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def publish_receipt(self, receipt: dict[str, Any], outbox: dict[str, Any]) -> dict[str, Any]:
+        """Publish into the Plugin's durable, keyed receipt inbox.
+
+        OpenCode 1.17's toast endpoint has no idempotency or lookup contract,
+        so it is deliberately not used for final receipts. The inbox file is
+        the Host resource: the Plugin consumes it by key and persists its own
+        dedup/supersede index across restarts.
+        """
+
+        key = str(outbox.get("receipt_key") or "")
+        payload_hash = str(outbox.get("payload_hash") or receipt_payload_hash(receipt))
+        generation = int(outbox.get("generation", receipt.get("receipt_generation", 0)))
+        ensure(key, "RECEIPT_KEY_INVALID", "receipt", "Receipt publish requires a stable receipt key")
+        path = self._receipt_inbox() / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json")
+        resource_id = f"opencode_receipt_{hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]}"
+        if path.is_file():
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise MemError("RECEIPT_INBOX_CORRUPT", "receipt", "Durable Host receipt inbox entry is unreadable", retryable=True) from exc
+            ensure(
+                existing.get("payload_hash") == payload_hash,
+                "RECEIPT_KEY_CONFLICT",
+                "receipt",
+                "Receipt key was reused with a different payload",
+                retryable=False,
+            )
+            return {
+                "host_resource_id": existing.get("host_resource_id", resource_id),
+                "key": key,
+                "generation": int(existing.get("generation", generation)),
+                "payload_hash": payload_hash,
+                "disposition": "existing",
+            }
+        record = {
+            "host_resource_id": resource_id,
+            "key": key,
+            "generation": generation,
+            "payload_hash": payload_hash,
+            "supersedes_key": outbox.get("supersedes_key"),
+            "payload": receipt,
+        }
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.replace(path)
+        return {
+            "host_resource_id": resource_id,
+            "key": key,
+            "generation": generation,
+            "payload_hash": payload_hash,
+            "disposition": "created",
+        }
+
     def insert_receipt(self, receipt: dict[str, Any]) -> None:
-        self._request(
-            "POST",
-            "/tui/show-toast",
-            json={"title": "PCO checkpoint", "message": receipt["summary"], "variant": "success" if receipt.get("ok") else "error", "duration": 10000},
-        )
+        # Compatibility alias. Final checkpoint publication always goes
+        # through the durable keyed inbox above; never fall back to toast.
+        key = str(receipt.get("receipt_key") or f"legacy:{uuid.uuid4().hex}")
+        outbox = {"receipt_key": key, "generation": int(receipt.get("receipt_generation", 0)), "payload_hash": receipt_payload_hash(receipt)}
+        self.publish_receipt(receipt, outbox)

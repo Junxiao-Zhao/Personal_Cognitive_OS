@@ -281,7 +281,9 @@ def test_affine_failure_is_reported_after_commit_and_retry_is_idempotent(workspa
     checkpoint_record_commit = workspace.repository.head()
     assert result["status"] == "COMMITTED_WITH_PENDING_DERIVATIONS"
     assert result["receipt"]["derivations"]["projection"]["error"]["code"] == "AFFINE_BRIDGE_NOT_CONFIGURED"
-    assert adapter.receipts[-1]["status"] == "RECEIPT_INSERTED"
+    # The Host sees the final derivation outcome in the first and only final
+    # receipt; RECEIPT_INSERTED is an internal publication boundary.
+    assert adapter.receipts[-1]["status"] == "COMMITTED_WITH_PENDING_DERIVATIONS"
     assert len(adapter.receipts) == 1
 
     bridge = Path(__file__).parent / "fixtures" / "affine_bridge.py"
@@ -299,7 +301,8 @@ def test_affine_failure_is_reported_after_commit_and_retry_is_idempotent(workspa
     assert projection["attempts"][0]["error"]["code"] == "AFFINE_BRIDGE_NOT_CONFIGURED"
     assert "recovered_from" in projection["attempts"][1]
     assert [record["revision"] for record in workspace.repository.record_history("checkpoints", result["checkpoint_id"])] == [1, 2]
-    assert len(adapter.receipts) == 1
+    assert len(adapter.receipts) == 2
+    assert adapter.receipts[-1]["receipt_generation"] == 2
     persisted = workspace.load_json(f"checkpoints/{result['checkpoint_id']}/receipt.json")
     assert persisted["status"] == "DONE"
 

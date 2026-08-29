@@ -77,14 +77,17 @@ def decide(
             state.transaction_id,
             checkpoint_id=state.id,
             proposal_hash_value=state.proposal_hash or "",
-            receipt_id=f"approval_{state.id}",
+            receipt_id=state.approval_receipt_id or f"approval_{state.id}",
             authorization_id=grant_payload["grant_id"],
             authorization_source="opencode_question",
             authorization_provenance={"question_request_id": question_request_id},
         )
         state_store.transition(engine, state, "FINAL_CHANGESET_VALIDATED")
         try:
-            return finalize_steps.commit_and_finalize(engine, state)
+            result = finalize_steps.commit_and_finalize(engine, state)
+            if state_store.load(engine).pending_compaction is not None:
+                return recovery_steps.resume_pending_compaction(engine, result)
+            return result
         except Exception as exc:
             state_store.recover(engine, state, exc)
             raise

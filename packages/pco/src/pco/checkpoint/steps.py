@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import copy
 import json
 import math
 import uuid
@@ -62,9 +63,14 @@ def freeze(engine: Any, state: CheckpointState) -> dict[str, Any]:
             selected.append(message)
         elif message["id"] == thread.last_consolidated_message_id:
             started = True
-    ensure(selected, "CHECKPOINT_RANGE_EMPTY", "freeze", "There are no unconsolidated public messages")
-    ensure(selected[-1]["id"] == state.through_message_id, "CHECKPOINT_BOUNDARY_CHANGED", "freeze", "Frozen message boundary no longer matches the archive")
     source_result = engine.sources.collect_diffs()
+    # A source-only update is a valid consolidate boundary even when the
+    # conversation cursor did not move.  A truly empty boundary is rejected by
+    # the request layer as a no-op and never reaches the worker.
+    if selected:
+        ensure(selected[-1]["id"] == state.through_message_id, "CHECKPOINT_BOUNDARY_CHANGED", "freeze", "Frozen message boundary no longer matches the archive")
+    else:
+        ensure(source_result["changes"], "CHECKPOINT_RANGE_EMPTY", "freeze", "There are no unconsolidated public messages or changed sources")
     current = {
         "meta": workspace.repository.current_records("meta_revisions").get("meta_current"),
         "continuation": workspace.repository.current_records("continuations").get("continuation_current"),
@@ -182,6 +188,26 @@ def validate_continuation(engine: Any, state: CheckpointState, operations: list[
     )
 
 
+def canonical_fingerprint_context(state: CheckpointState, frozen: dict[str, Any]) -> dict[str, Any]:
+    """Build the stable cognitive transaction fingerprint boundary.
+
+    Request provenance, checkpoint identity, retries, timestamps and audit
+    receipts belong to the operation/audit layer and must not fork canonical
+    cognitive content.
+    """
+
+    return {
+        "message_range": {
+            "after": state.after_message_id,
+            "through": state.through_message_id,
+        },
+        "source_hashes": frozen.get("source_hashes", {}),
+        "worker_contract": frozen.get("profile_contract", {}),
+        "profile": frozen["profile"],
+        "policy_hash": frozen["policy_hash"],
+    }
+
+
 def _main_evidence(engine: Any, refs: list[str]) -> list[dict[str, Any]]:
     """Resolve the user-facing evidence behind protected Meta references."""
 
@@ -253,6 +279,10 @@ def protected_diff(engine: Any, operations: list[Operation]) -> list[dict[str, A
 
 def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any], result: WorkerResult) -> dict[str, Any]:
     workspace = engine.workspace
+    # A Harness overflow request may have been merged while the worker was
+    # running. Import it before any proposal/commit transition can overwrite
+    # the durable state with this older in-memory object.
+    finalize_steps._sync_pending_compaction(engine, state)
     validate_rejection_candidate(engine, state, result)
     search_receipts = effective_search_receipts(engine, state, result)
     persisted_result = {
@@ -321,7 +351,15 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
         and operation.stream is not None
         and workspace.profile.stream(operation.stream).write_policy == "user_approval"
     ]
-    approval_receipt_id = f"approval_{state.id}"
+    approval_basis = []
+    for operation in protected_operations or operations:
+        normalized = operation.normalized()
+        if normalized.get("stream") == "meta_revisions" and isinstance(normalized.get("record"), dict):
+            normalized = copy.deepcopy(normalized)
+            normalized["record"].get("payload", {}).pop("approval_ref", None)
+        approval_basis.append(normalized)
+    approval_receipt_id = f"approval_{proposal_hash([Operation.model_validate(item) for item in approval_basis])}"
+    state.approval_receipt_id = approval_receipt_id
     for operation in operations:
         if operation.op == "append" and operation.stream == "meta_revisions" and operation.record is not None:
             operation.record["payload"]["approval_ref"] = approval_receipt_id
@@ -332,19 +370,14 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
             {operation.stream for operation in protected_operations if operation.stream}
         )
     transaction_id = f"txn_{state.id}_{uuid.uuid4().hex[:8]}"
+    fingerprint_context = canonical_fingerprint_context(state, frozen)
+    # Keep the Host-reviewed protected-operation hash distinct from the full
+    # transaction proposal hash. Approval attachment must bind to the former;
+    # the latter also includes wrapper-owned auto operations such as receipts.
+    fingerprint_context["reviewed_proposal_hash"] = reviewed_proposal_hash
     transaction = engine.manager.begin(
         transaction_id=transaction_id,
-        fingerprint_context={
-            "thread_id": workspace.thread().thread_id,
-            "harness_binding_id": engine.workspace.binding().id,
-            "message_range": {"after": state.after_message_id, "through": state.through_message_id},
-            "source_hashes": frozen.get("source_hashes", {}),
-            "profile": frozen["profile"],
-            "policy_hash": frozen["policy_hash"],
-            "checkpoint_id": state.id,
-            "decision_message_id": state.decision_message_id,
-            "reviewed_proposal_hash": reviewed_proposal_hash,
-        },
+        fingerprint_context=fingerprint_context,
     )
     for operation in operations:
         engine.manager.append(transaction.id, operation)
@@ -394,4 +427,12 @@ def prepare_candidate(engine: Any, state: CheckpointState, frozen: dict[str, Any
         state_store.transition(engine, state, "AWAITING_META_APPROVAL")
         return {"ok": True, "checkpoint_id": state.id, "status": state.status, "approval_required": True, "proposal": proposal}
     state_store.transition(engine, state, "FINAL_CHANGESET_VALIDATED")
-    return finalize_steps.commit_and_finalize(engine, state)
+    result = finalize_steps.commit_and_finalize(engine, state)
+    if state_store.load(engine).pending_compaction is not None:
+        # Local import avoids the steps <-> recovery module cycle. The
+        # original consolidate state remains authoritative; recovery only
+        # appends the compact-only tail after publication.
+        from . import recovery as recovery_steps
+
+        return recovery_steps.resume_pending_compaction(engine, result)
+    return result
