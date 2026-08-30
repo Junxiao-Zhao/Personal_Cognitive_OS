@@ -9,3 +9,5 @@ dist/
 build/
 .pco/
 .opencode/node_modules/
+.agents/
+skills-lock.json
