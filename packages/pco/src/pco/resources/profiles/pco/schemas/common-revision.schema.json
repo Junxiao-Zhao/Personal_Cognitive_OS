@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pco/common-revision/v1",
+  "$defs": {
+    "revision_payload": {
+      "type": "object",
+      "required": ["previous_revision", "change_summary", "body_markdown"],
+      "properties": {
+        "previous_revision": {"type": ["integer", "null"], "minimum": 1},
+        "change_summary": {"type": "string", "minLength": 1},
+        "body_markdown": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

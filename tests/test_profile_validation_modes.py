@@ -95,11 +95,11 @@ def _stage_transaction(repository: MemoryRepository, state) -> None:
     repository._git("add", ".")
 
 
-def test_bundled_profiles_declare_independent_validation_policies() -> None:
-    pco = Profile.load(bundled_profile("pco"), default_registry())
+def test_generic_profiles_declare_independent_validation_policies(tmp_path: Path) -> None:
+    public_logs = Profile.load(_logs_profile(tmp_path / "logs"))
     research = Profile.load(bundled_profile("research"), default_registry())
 
-    assert pco.uses_delta_fast_path("messages")
+    assert public_logs.uses_delta_fast_path("logs")
     assert research.uses_delta_fast_path("observations")
     assert not research.uses_delta_fast_path("claims")
 

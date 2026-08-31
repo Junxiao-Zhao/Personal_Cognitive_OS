@@ -44,6 +44,7 @@ class ProfileConfig(BaseModel):
 
     name: str
     version: str
+    application_commit_policy: Literal["public", "pco_proposal"] = "public"
     streams: dict[str, StreamConfig]
     validators: list[str] = Field(default_factory=list)
     artifact_roots: list[str] = Field(default_factory=list)
