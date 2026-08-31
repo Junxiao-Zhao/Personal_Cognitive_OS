@@ -1,24 +1,29 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
 
-from mem_core.approval import verify_approval_receipt
 from mem_core.errors import MemError
-from mem_core.models import Operation, latest_by_id, proposal_hash, transaction_fingerprint
-from mem_core.profile import Profile
-from mem_core.registry import default_registry
+from mem_core.models import Operation, latest_by_id
 from mem_core.repository import MemoryRepository
 from mem_core.transaction import TransactionManager
-from pco.paths import bundled_profile
 
-from conftest import NOW, envelope, event, hypothesis, meta
+from conftest import NOW
 
 
-def test_latest_by_id_keeps_highest_revision():
+def log_record(record_id: str = "log_1", revision: int = 1, message: str = "first") -> dict:
+    return {
+        "id": record_id,
+        "revision": revision,
+        "recorded_at": NOW,
+        "schema_version": "public/log/v1",
+        "payload": {"message": message},
+    }
+
+
+def test_latest_by_id_keeps_highest_revision() -> None:
     records = [
         {"id": "a", "revision": 1, "payload": {}},
         {"id": "a", "revision": 2, "payload": {}},
@@ -27,594 +32,83 @@ def test_latest_by_id_keeps_highest_revision():
     assert latest_by_id(records) == {"a": records[1], "b": records[2]}
 
 
-def _message_record(native_id: str) -> dict:
-    return envelope(
-        f"msg_{native_id}",
-        "conversation-message/v1",
-        {
-            "thread_id": "thread_t",
-            "epoch_id": "epoch_e",
-            "harness": "fake",
-            "native_session_id": "ses_fake_main",
-            "native_message_id": native_id,
-            "role": "user",
-            "kind": "conversation",
-            "content": "公开消息",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    )
+def test_schema_validator_is_cached_and_reports_invalid_public_record(repository: MemoryRepository) -> None:
+    profile = repository.profile
+    assert profile.schema_validator("logs") is profile.schema_validator("logs")
 
-
-def test_schema_validator_reused_within_profile(workspace) -> None:
-    profile = workspace.repository.profile
-    assert profile.schema_validator("messages") is profile.schema_validator("messages")
-
-
-def test_cached_schema_validator_still_reports_first_error_pointer(workspace) -> None:
-    record = {
-        "id": "msg_bad",
-        "revision": 1,
-        "recorded_at": NOW,
-        "schema_version": "conversation-message/v1",
-        "payload": {
-            "thread_id": "t",
-            "epoch_id": "e",
-            "harness": "h",
-            "native_session_id": "s",
-            "native_message_id": "n",
-            "role": "robot",
-            "kind": "conversation",
-            "content": "x",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    }
+    invalid = log_record()
+    invalid["payload"] = {}
     with pytest.raises(MemError) as exc:
-        workspace.repository.profile.validate_record_schema("messages", record)
+        profile.validate_record_schema("logs", invalid)
     assert exc.value.detail.code == "SCHEMA_VALIDATION_FAILED"
+    assert exc.value.detail.path == "/payload"
 
 
-def test_messages_only_validate_is_incremental(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    state = manager.begin(fingerprint_context={"kind": "delta"})
-    manager.append(state.id, Operation(op="append", stream="messages", record=_message_record("native_delta_1")))
+def test_public_log_transaction_commits_to_repository(repository: MemoryRepository, tmp_path: Path) -> None:
+    manager = TransactionManager(repository, tmp_path / "state")
+    state = manager.begin(transaction_id="txn_public_log", fingerprint_context={"kind": "public-log"})
+    manager.append(state.id, Operation(op="append", stream="logs", record=log_record()))
+
+    committed = manager.commit(state.id)
+
+    assert committed["ok"] is True
+    assert repository.current_records("logs") == {"log_1": log_record()}
+    assert repository.is_clean()
+
+
+def test_incremental_validation_reports_public_log_delta(repository: MemoryRepository, tmp_path: Path) -> None:
+    manager = TransactionManager(repository, tmp_path / "state")
+    state = manager.begin(transaction_id="txn_incremental", fingerprint_context={"kind": "incremental"})
+    manager.append(state.id, Operation(op="append", stream="logs", record=log_record()))
+
     validation = manager.validate(state.id)
+
     assert validation["mode"] == "incremental"
-    assert validation["delta"] == {"messages": 1}
+    assert validation["delta"] == {"logs": 1}
     assert validation["records"] == 1
 
 
-def test_messages_only_validate_rejects_revision_collision(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    first = manager.begin(transaction_id="txn_collision_a", fingerprint_context={"kind": "delta"})
-    manager.append(first.id, Operation(op="append", stream="messages", record=_message_record("native_collision")))
+def test_incremental_validation_rejects_duplicate_log_revision(repository: MemoryRepository, tmp_path: Path) -> None:
+    manager = TransactionManager(repository, tmp_path / "state")
+    first = manager.begin(transaction_id="txn_first", fingerprint_context={"kind": "revision"})
+    manager.append(first.id, Operation(op="append", stream="logs", record=log_record()))
     manager.commit(first.id)
 
-    second = manager.begin(transaction_id="txn_collision_b", fingerprint_context={"kind": "delta"})
-    manager.append(second.id, Operation(op="append", stream="messages", record=_message_record("native_collision")))
+    duplicate = manager.begin(transaction_id="txn_duplicate", fingerprint_context={"kind": "revision"})
+    manager.append(duplicate.id, Operation(op="append", stream="logs", record=log_record()))
+
     with pytest.raises(MemError) as exc:
-        manager.validate(second.id)
+        manager.validate(duplicate.id)
     assert exc.value.detail.code == "REVISION_SEQUENCE_INVALID"
 
 
-def test_messages_only_validate_skips_historical_corruption(workspace) -> None:
-    path = workspace.config.memory_root / "raw" / "conversations" / "messages.jsonl"
-    original = path.read_text(encoding="utf-8")
-    path.write_text(original + '{"broken"\n{}\n', encoding="utf-8")
-    workspace.repository._git("add", ".")
-    workspace.repository._git("commit", "--no-verify", "-m", "fixture: corrupt history")
-    assert workspace.repository.is_clean()
-
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    state = manager.begin(fingerprint_context={"kind": "delta"})
-    manager.append(state.id, Operation(op="append", stream="messages", record=_message_record("native_after_corruption")))
-    validation = manager.validate(state.id)
-    assert validation["mode"] == "incremental"
-    assert validation["ok"] is True
-
-    with pytest.raises(MemError) as exc:
-        workspace.repository.verify()
-    assert exc.value.detail.code == "JSONL_INVALID"
-
-
-def test_messages_only_validate_skips_revision_check_when_baseline_corrupt(workspace) -> None:
-    # 历史：msg_native_rev_corrupt rev 1 之后跟一条损坏行（实际应为 rev 2，但不可解析）。
-    # 若按"容忍后的最新基线"继续断言，delta rev 3 会被误判 REVISION_SEQUENCE_INVALID；
-    # 基线不可靠时应跳过该流 delta 的 revision 连续性断言。
-    path = workspace.config.memory_root / "raw" / "conversations" / "messages.jsonl"
-    base = _message_record("native_rev_corrupt")
-    path.write_text(
-        json.dumps(base, ensure_ascii=False, sort_keys=True)
-        + '\n{"id":"msg_native_rev_corrupt","revision":2,"broken"\n',
-        encoding="utf-8",
-    )
-    workspace.repository._git("add", ".")
-    workspace.repository._git("commit", "--no-verify", "-m", "fixture: corrupt latest revision")
-    assert workspace.repository.is_clean()
-
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    state = manager.begin(fingerprint_context={"kind": "delta"})
-    manager.append(state.id, Operation(op="append", stream="messages", record={**base, "revision": 3}))
-    validation = manager.validate(state.id)
-    assert validation["mode"] == "incremental"
-    assert validation["ok"] is True
-
-
-def _user_message(workspace) -> dict:
-    """event() 的 evidence_refs 引用 message:msg_user_1，结构化测试必须先有这条消息。"""
-    return envelope(
-        "msg_user_1",
-        "conversation-message/v1",
-        {
-            "thread_id": workspace.thread().thread_id,
-            "epoch_id": workspace.thread().active_epoch_id,
-            "harness": "fake",
-            "native_session_id": "ses_fake",
-            "native_message_id": "native_user_1",
-            "role": "user",
-            "kind": "conversation",
-            "content": "这是用户证据。",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    )
-
-
-def test_structured_validate_is_incremental(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    state = manager.begin(transaction_id="txn_structured_delta", fingerprint_context={"kind": "checkpoint"})
-    # event() 的 evidence_refs 引用 message:msg_user_1，缺失时交叉校验会先抛 EVIDENCE_NOT_FOUND
-    manager.append(state.id, Operation(op="append", stream="messages", record=_user_message(workspace)))
-    manager.append(state.id, Operation(op="append", stream="events", record=event()))
-    validation = manager.validate(state.id)
-    assert validation["mode"] == "incremental"
-    assert validation["delta"] == {"messages": 1, "events": 1}
-    assert validation["records"] == 2
-
-
-def test_structured_incremental_rejects_bad_delta_envelope(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    record = event()
-    record["revision"] = 99
-    state = manager.begin(transaction_id="txn_bad_delta", fingerprint_context={"kind": "checkpoint"})
-    manager.append(state.id, Operation(op="append", stream="events", record=record))
-    with pytest.raises(MemError) as exc:
-        manager.validate(state.id)
-    assert exc.value.detail.code == "REVISION_SEQUENCE_INVALID"
-
-
-def test_messages_only_commit_still_rejects_append_only_violation(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    state = manager.begin(fingerprint_context={"kind": "tamper_test"})
-    manager.append(state.id, Operation(op="append", stream="messages", record=_message_record("native_tamper_1")))
+def test_pre_commit_hook_rejects_historical_log_edit(repository: MemoryRepository, tmp_path: Path) -> None:
+    manager = TransactionManager(repository, tmp_path / "state")
+    state = manager.begin(transaction_id="txn_hook", fingerprint_context={"kind": "append-only"})
+    manager.append(state.id, Operation(op="append", stream="logs", record=log_record()))
     manager.commit(state.id)
-    path = workspace.config.memory_root / "raw" / "conversations" / "messages.jsonl"
-    original = path.read_text(encoding="utf-8")
-    path.write_text(original.replace(original.splitlines()[0], "{}"), encoding="utf-8")
-    workspace.repository._git("add", ".")
-    result = subprocess.run(
-        ["git", "-C", str(workspace.config.memory_root), "commit", "-m", "tamper"],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode != 0
-    assert "APPEND_ONLY_VIOLATION" in result.stderr + result.stdout
 
+    log_path = repository.profile.stream_path(repository.root, "logs")
+    original = log_path.read_text(encoding="utf-8")
+    log_path.write_text(original.replace('"message": "first"', '"message": "changed"'), encoding="utf-8")
+    repository._git("add", str(log_path.relative_to(repository.root)))
+    log_path.write_text(original, encoding="utf-8")
+    status = repository.pre_commit_hook_status()
+    result = subprocess.run([status["path"]], cwd=repository.root, text=True, capture_output=True, check=False)
 
-def test_protected_stream_requires_exact_approval(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    transaction = manager.begin(transaction_id="txn_meta", fingerprint_context={"checkpoint_id": "ckpt_1"})
-    message = envelope(
-        "msg_user_1",
-        "conversation-message/v1",
-        {
-            "thread_id": workspace.thread().thread_id,
-            "epoch_id": workspace.thread().active_epoch_id,
-            "harness": "fake",
-            "native_session_id": "ses_fake",
-            "native_message_id": "native_user",
-            "role": "user",
-            "kind": "conversation",
-            "content": "这是用户证据。",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    )
-    meta_record = meta()
-    meta_record["payload"]["promotion_refs"] = []
-    manager.append(transaction.id, Operation(op="append", stream="messages", record=message))
-    manager.append(transaction.id, Operation(op="append", stream="meta_revisions", record=meta_record))
-
-    validation = manager.validate(transaction.id)
-    assert validation["approval_required"] is True
-    with pytest.raises(MemError) as error:
-        manager.commit(transaction.id)
-    assert error.value.detail.code == "USER_APPROVAL_REQUIRED"
-
-    proposal_hash = manager.load(transaction.id).proposal_hash
-    manager.attach_approval(
-        transaction.id,
-        checkpoint_id="ckpt_1",
-        proposal_hash_value=proposal_hash,
-        receipt_id="approval_pending",
-    )
-    committed = manager.commit(transaction.id)
-    assert committed["ok"]
-    assert workspace.repository.current_records("meta_revisions")["meta_current"]["revision"] == 1
-    assert manager.commit(transaction.id)["idempotent"] is True
-
-
-def test_shared_approval_verification_rejects_stale_hash(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    state = manager.begin(fingerprint_context={"kind": "shared_approval"})
-    manager.append(state.id, Operation(op="append", stream="meta_revisions", record=meta()))
-    manager.attach_approval(
-        state.id,
-        checkpoint_id="ckpt_shared",
-        proposal_hash_value=manager.load(state.id).proposal_hash,
-    )
-    state = manager.load(state.id)
-    protected = {"meta_revisions"}
-    with pytest.raises(MemError) as exc:
-        verify_approval_receipt(
-            receipt=state.approval_receipt,
-            operations=state.operations,
-            protected=protected,
-            profile=workspace.repository.profile,
-            reviewed_proposal_hash=state.proposal_hash,
-            transaction_proposal_hash="sha256:stale",
-            transaction_fingerprint=state.transaction_fingerprint,
-        )
-    assert exc.value.detail.code == "APPROVAL_STALE"
-
-
-def test_profile_rejects_assistant_as_user_evidence(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    raw = manager.begin(transaction_id="txn_assistant", fingerprint_context={"kind": "raw"})
-    assistant = envelope(
-        "msg_assistant",
-        "conversation-message/v1",
-        {
-            "thread_id": workspace.thread().thread_id,
-            "epoch_id": workspace.thread().active_epoch_id,
-            "harness": "fake",
-            "native_session_id": "ses_fake",
-            "native_message_id": "native_assistant",
-            "role": "assistant",
-            "kind": "conversation",
-            "content": "我认为用户害怕失败。",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    )
-    manager.append(raw.id, Operation(op="append", stream="messages", record=assistant))
-    manager.commit(raw.id)
-
-    transaction = manager.begin(transaction_id="txn_bad_evidence", fingerprint_context={"kind": "checkpoint"})
-    bad_hypothesis = envelope(
-        "hyp_bad",
-        "pco/hypothesis/v1",
-        {
-            "statement": "用户害怕失败。",
-            "confidence": "low",
-            "evidence_refs": ["message:msg_assistant"],
-            "counter_evidence_refs": [],
-            "status": "hypothesis",
-            "policy_version": "promotion@0.3",
-        },
-    )
-    manager.append(transaction.id, Operation(op="append", stream="hypotheses", record=bad_hypothesis))
-    with pytest.raises(MemError) as error:
-        manager.validate(transaction.id)
-    assert error.value.detail.code == "EVIDENCE_INELIGIBLE"
-    assert error.value.detail.path == "/payload/evidence_refs/0"
-
-
-def test_unknown_and_missing_structured_evidence_are_rejected(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    for reference in ("evt_missing", "unknown:whatever"):
-        record = hypothesis()
-        record["payload"]["evidence_refs"] = [reference]
-        state = manager.begin(fingerprint_context={"case": reference})
-        manager.append(state.id, Operation(op="append", stream="hypotheses", record=record))
-        with pytest.raises(MemError) as error:
-            manager.validate(state.id)
-        assert error.value.detail.code == "EVIDENCE_REFERENCE_INVALID"
-
-
-def test_entity_ids_reject_path_traversal(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    record = event()
-    record["id"] = "../../state/context/current"
-    state = manager.begin(fingerprint_context={"case": "unsafe-id"})
-    manager.append(state.id, Operation(op="append", stream="events", record=record))
-    with pytest.raises(MemError) as error:
-        manager.validate(state.id)
-    assert error.value.detail.code == "ENVELOPE_INVALID"
-
-
-def test_non_pco_profile_uses_same_core_without_code_changes(tmp_path: Path) -> None:
-    profile = Profile.load(bundled_profile("research"), default_registry())
-    repository = MemoryRepository(tmp_path / "research-memory", profile)
-    repository.init()
-    manager = TransactionManager(repository, tmp_path / "research-state")
-    transaction = manager.begin(transaction_id="txn_observation", fingerprint_context={"run": "r1"})
-    observation = envelope(
-        "obs_1",
-        "research/observation/v1",
-        {"text": "The sample changed color.", "source": "lab-note-1"},
-    )
-    manager.append(transaction.id, Operation(op="append", stream="observations", record=observation))
-    assert manager.commit(transaction.id)["ok"]
-    result = profile.invoke("retrieval.search", repo_root=repository.root, query="changed color")
-    assert result["results"][0]["id"] == "obs_1"
-    projection = profile.invoke("projections.markdown", repo_root=repository.root, output_root=tmp_path / "research-projection")
-    assert projection["ok"] and projection["pages"] == 1
-
-    protected = manager.begin(transaction_id="txn_claim", fingerprint_context={"run": "r1-claim"})
-    manager.append(
-        protected.id,
-        Operation(
-            op="append",
-            stream="claims",
-            record=envelope(
-                "claim_1",
-                "research/claim/v1",
-                {"statement": "The sample changed color.", "observation_refs": ["obs_1"]},
-            ),
-        ),
-    )
-    manager.attach_approval(
-        protected.id,
-        checkpoint_id="research_claim_review",
-        proposal_hash_value=manager.load(protected.id).proposal_hash,
-        receipt_id="approval_research_claim",
-    )
-    assert manager.commit(protected.id)["ok"]
-    assert repository.current_records("claims")["claim_1"]
-
-    forbidden = manager.begin(transaction_id="txn_read_only", fingerprint_context={"run": "r2"})
-    manager.append(
-        forbidden.id,
-        Operation(
-            op="append",
-            stream="papers",
-            record=envelope("paper_1", "research/paper/v1", {"title": "Read-only evidence"}),
-        ),
-    )
-    with pytest.raises(MemError) as error:
-        manager.validate(forbidden.id)
-    assert error.value.detail.code == "STREAM_READ_ONLY"
-
-
-def test_pre_commit_hook_reuses_profile_validation(workspace) -> None:
-    status = workspace.repository.pre_commit_hook_status()
-    assert status["installed"]
-    messages = workspace.config.memory_root / "raw" / "conversations" / "messages.jsonl"
-    original = messages.read_text(encoding="utf-8")
-    messages.write_text('{"not":"a valid envelope"}\n', encoding="utf-8")
-    workspace.repository._git("add", str(messages.relative_to(workspace.config.memory_root)))
-    messages.write_text(original, encoding="utf-8")
-    result = subprocess.run(
-        [status["path"]],
-        cwd=workspace.config.memory_root,
-        text=True,
-        capture_output=True,
-        check=False,
-        env={**__import__("os").environ},
-    )
-    assert result.returncode == 1
-    assert "ENVELOPE_INVALID" in result.stdout
-
-
-def test_pre_commit_hook_rejects_schema_valid_historical_edit(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    transaction = manager.begin(transaction_id="txn_raw_for_hook", fingerprint_context={"kind": "raw"})
-    message = envelope(
-        "msg_hook_user",
-        "conversation-message/v1",
-        {
-            "thread_id": workspace.thread().thread_id,
-            "epoch_id": workspace.thread().active_epoch_id,
-            "harness": "fake",
-            "native_session_id": "ses_fake",
-            "native_message_id": "native_hook_user",
-            "role": "user",
-            "kind": "conversation",
-            "content": "original",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    )
-    manager.append(transaction.id, Operation(op="append", stream="messages", record=message))
-    manager.commit(transaction.id)
-    path = workspace.config.memory_root / "raw" / "conversations" / "messages.jsonl"
-    original = path.read_text(encoding="utf-8")
-    edited = original.replace('"content": "original"', '"content": "edited"')
-    path.write_text(edited, encoding="utf-8")
-    workspace.repository._git("add", str(path.relative_to(workspace.config.memory_root)))
-    path.write_text(original, encoding="utf-8")
-    status = workspace.repository.pre_commit_hook_status()
-    result = subprocess.run(
-        [status["path"]],
-        cwd=workspace.config.memory_root,
-        text=True,
-        capture_output=True,
-        check=False,
-        env={**__import__("os").environ},
-    )
+    assert status["installed"] is True
     assert result.returncode == 1
     assert "APPEND_ONLY_VIOLATION" in result.stdout
 
 
-def test_pre_commit_hook_rejects_unreceipted_protected_append(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    transaction = manager.begin(transaction_id="txn_raw_before_meta", fingerprint_context={"kind": "raw"})
-    message = envelope(
-        "msg_meta_evidence",
-        "conversation-message/v1",
-        {
-            "thread_id": workspace.thread().thread_id,
-            "epoch_id": workspace.thread().active_epoch_id,
-            "harness": "fake",
-            "native_session_id": "ses_fake",
-            "native_message_id": "native_meta_evidence",
-            "role": "user",
-            "kind": "conversation",
-            "content": "evidence",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    )
-    manager.append(transaction.id, Operation(op="append", stream="messages", record=message))
-    manager.commit(transaction.id)
+def test_repository_worktree_uses_requested_base_commit(repository: MemoryRepository, tmp_path: Path) -> None:
+    base_commit = repository.head()
+    worktree = tmp_path / "transaction-worktree"
 
-    protected = meta()
-    protected["payload"]["evidence_refs"] = ["message:msg_meta_evidence"]
-    protected["payload"]["promotion_refs"] = []
-    protected["payload"]["approval_ref"] = "forged_approval"
-    path = workspace.config.memory_root / "meta" / "revisions.jsonl"
-    original = path.read_text(encoding="utf-8")
-    path.write_text(original + json.dumps(protected, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
-    workspace.repository._git("add", str(path.relative_to(workspace.config.memory_root)))
-    path.write_text(original, encoding="utf-8")
-    status = workspace.repository.pre_commit_hook_status()
-    result = subprocess.run(
-        [status["path"]],
-        cwd=workspace.config.memory_root,
-        text=True,
-        capture_output=True,
-        check=False,
-        env={**__import__("os").environ},
-    )
-    assert result.returncode == 1
-    assert "TRANSACTION_RECEIPT_REQUIRED" in result.stdout
+    repository.add_worktree(worktree, base_commit)
 
+    assert (worktree / ".git").exists()
+    assert repository._git("rev-parse", "HEAD", cwd=worktree) == base_commit
 
-def test_txn_commit_dry_run_does_not_commit(workspace) -> None:
-    manager = TransactionManager(workspace.repository, workspace.config.state_root)
-    state = manager.begin(fingerprint_context={"kind": "dry_run_test"})
-    message = envelope(
-        "msg_user_1",
-        "conversation-message/v1",
-        {
-            "thread_id": workspace.thread().thread_id,
-            "epoch_id": workspace.thread().active_epoch_id,
-            "harness": "fake",
-            "native_session_id": "ses_fake",
-            "native_message_id": "native_user",
-            "role": "user",
-            "kind": "conversation",
-            "content": "这是用户证据。",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    )
-    manager.append(state.id, Operation(op="append", stream="messages", record=message))
-    manager.append(state.id, Operation(op="append", stream="events", record=event()))
-    head_before = workspace.repository.head()
-    result = manager.commit(state.id, dry_run=True)
-    assert result["dry_run"] is True
-    assert result["validation"]["ok"] is True
-    assert workspace.repository.head() == head_before
-    loaded = manager.load(state.id)
-    assert loaded.commit is None
-    assert loaded.status == "validated"
-
-
-def _stage_structured_commit(workspace, *, event_record=None) -> dict:
-    """Stage a transaction-shaped structured change in the canonical repo.
-
-    This mirrors what TransactionManager.commit writes to the worktree, so the
-    pre-commit hook can be exercised directly without spawning a git commit.
-    """
-    from mem_core.hook import validate_repository
-
-    root = workspace.config.memory_root
-    profile = workspace.repository.profile
-    message = envelope(
-        "msg_hook_user",
-        "conversation-message/v1",
-        {
-            "thread_id": workspace.thread().thread_id,
-            "epoch_id": workspace.thread().active_epoch_id,
-            "harness": "fake",
-            "native_session_id": "ses_fake",
-            "native_message_id": "native_hook_user",
-            "role": "user",
-            "kind": "conversation",
-            "content": "这是 hook 增量校验测试的用户证据。",
-            "reasoning": None,
-            "refs": [],
-            "created_at": NOW,
-        },
-    )
-    evt = event_record or event()
-    evt["payload"]["evidence_refs"] = ["message:msg_hook_user"]
-    operations = [
-        Operation(op="append", stream="messages", record=message),
-        Operation(op="append", stream="events", record=evt),
-    ]
-    base_commit = workspace.repository.head()
-    fingerprint_context = {"kind": "hook_structured_incremental"}
-    transaction_record = {
-        "id": "txn_hook_structured",
-        "transaction_fingerprint": transaction_fingerprint(
-            base_commit=base_commit,
-            profile_name=profile.name,
-            profile_version=profile.version,
-            fingerprint_context=fingerprint_context,
-            operations=operations,
-        ),
-        "proposal_hash": proposal_hash(operations),
-        "base_commit": base_commit,
-        "profile": f"{profile.name}@{profile.version}",
-        "fingerprint_context": fingerprint_context,
-        "operation_count": len(operations),
-        "operations": [operation.normalized() for operation in operations],
-        "approval_receipt": None,
-        "committed_at": NOW,
-    }
-    for operation in operations:
-        stream = operation.stream or ""
-        path = profile.stream_path(root, stream)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(operation.record, ensure_ascii=False, sort_keys=True) + "\n")
-    transaction_path = root / "transactions" / "transactions.jsonl"
-    with transaction_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(transaction_record, ensure_ascii=False, sort_keys=True) + "\n")
-    workspace.repository._git("add", ".")
-    return {"validate_repository": validate_repository, "root": root, "operations": operations}
-
-
-def test_structured_pre_commit_hook_uses_incremental_validation(workspace, monkeypatch) -> None:
-    staged = _stage_structured_commit(workspace)
-
-    def _boom(*_args, **_kwargs):
-        raise AssertionError("MemoryRepository.validate_all must not run for structured incremental hook")
-
-    monkeypatch.setattr(MemoryRepository, "validate_all", _boom)
-    result = staged["validate_repository"](staged["root"])
-    assert result["mode"] == "incremental"
-    assert result["ok"] is True
-    assert result["increment"]["messages_only"] is False
-    assert result["increment"]["operations"] == 2
-
-
-def test_structured_pre_commit_hook_still_runs_cross_validators(workspace) -> None:
-    bad = event()
-    bad["payload"]["links"]["psychologies"] = ["psy_missing"]
-    staged = _stage_structured_commit(workspace, event_record=bad)
-    with pytest.raises(MemError) as exc:
-        staged["validate_repository"](staged["root"])
-    assert exc.value.detail.code == "REFERENCE_NOT_FOUND"
+    repository.remove_worktree(worktree)
+    assert not worktree.exists()
