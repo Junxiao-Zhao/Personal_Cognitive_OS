@@ -6,10 +6,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Any, Iterable
 
 from .errors import MemError, ensure
+from .locking import canonical_lock
 from .models import RecordEnvelope, latest_by_id
 from .profile import Profile
 
@@ -82,6 +84,10 @@ class MemoryRepository:
         raw = self._git("rev-parse", "--git-common-dir")
         path = Path(raw)
         return path.resolve() if path.is_absolute() else (self.root / path).resolve()
+
+    def lock(self, *, blocking: bool = True) -> AbstractContextManager[None]:
+        self.assert_initialized()
+        return canonical_lock(self._common_git_dir() / "pco-canonical.lock", blocking=blocking)
 
     def install_pre_commit_hook(self) -> Path:
         """Install the repository-owned final schema/semantic validation gate."""
