@@ -7,7 +7,7 @@
     "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"enum": ["pco/psychology/v1", "pco/philosophy/v1"]},
     "commit_ref": {"type": "string", "minLength": 1},
     "payload": {
-      "type": "object", "additionalProperties": false, "required": ["previous_revision", "change_summary", "body_markdown", "name", "aliases", "evidence_refs", "status"],
+      "type": "object", "additionalProperties": false, "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}], "required": ["previous_revision", "change_summary", "body_markdown", "name", "aliases", "evidence_refs", "status"],
       "properties": {
         "previous_revision": {"type": ["integer", "null"], "minimum": 1}, "change_summary": {"type": "string", "minLength": 1}, "body_markdown": {"type": "string", "minLength": 1},
         "name": {"type": "string", "minLength": 1},

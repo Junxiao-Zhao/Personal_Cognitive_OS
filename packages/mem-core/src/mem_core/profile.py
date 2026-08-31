@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterable, Literal
 import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import BaseModel, ConfigDict, Field
+from referencing import Registry, Resource
 
 from .errors import MemError, ensure
 
@@ -189,7 +190,13 @@ class Profile:
         stream = self.stream(name)
         schema = json.loads((self.root / stream.schema_path).read_text(encoding="utf-8"))
         Draft202012Validator.check_schema(schema)
-        validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        registry = Registry()
+        for schema_path in self.root.rglob("*.schema.json"):
+            resource_schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            resource_id = resource_schema.get("$id")
+            if isinstance(resource_id, str):
+                registry = registry.with_resource(resource_id, Resource.from_contents(resource_schema))
+        validator = Draft202012Validator(schema, registry=registry, format_checker=FormatChecker())
         self._schema_validators[name] = validator
         return validator
 

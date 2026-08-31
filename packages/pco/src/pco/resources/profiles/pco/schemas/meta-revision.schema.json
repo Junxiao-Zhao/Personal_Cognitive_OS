@@ -6,6 +6,7 @@
     "id": {"const": "meta_current"}, "revision": {"type": "integer", "minimum": 1}, "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/meta-revision/v1"}, "commit_ref": {"type": "string", "minLength": 1},
     "payload": {
       "type": "object", "additionalProperties": false,
+      "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}],
       "required": ["previous_revision", "change_summary", "body_markdown", "evidence_refs", "promotion_refs", "status"],
       "properties": {
         "previous_revision": {"type": ["integer", "null"], "minimum": 1},

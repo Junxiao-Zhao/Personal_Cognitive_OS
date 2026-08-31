@@ -5,7 +5,7 @@
   "properties": {
     "id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1}, "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/hypothesis/v1"}, "commit_ref": {"type": "string", "minLength": 1},
     "payload": {
-      "type": "object", "additionalProperties": false, "required": ["previous_revision", "change_summary", "body_markdown", "confidence", "evidence_refs", "counter_evidence_refs", "status"],
+      "type": "object", "additionalProperties": false, "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}], "required": ["previous_revision", "change_summary", "body_markdown", "confidence", "evidence_refs", "counter_evidence_refs", "status"],
       "properties": {"previous_revision": {"type": ["integer", "null"], "minimum": 1}, "change_summary": {"type": "string", "minLength": 1}, "body_markdown": {"type": "string", "minLength": 1}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true}, "counter_evidence_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}, "status": {"enum": ["hypothesis", "promoted", "disputed", "rejected", "superseded", "tombstone"]}}
     }
   },

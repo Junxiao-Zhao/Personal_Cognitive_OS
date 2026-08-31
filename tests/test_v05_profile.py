@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import shutil
+
 import pytest
 
 from mem_core.errors import MemError
@@ -71,5 +74,21 @@ def test_revision_requires_previous_revision_and_change_summary(minimal_records:
 
     with pytest.raises(MemError) as exc:
         profile.validate_record_schema("hypotheses", record)
+
+    assert exc.value.detail.code == "SCHEMA_VALIDATION_FAILED"
+
+
+def test_v05_stream_payload_enforces_common_revision_contract(tmp_path, minimal_records: dict[str, dict]) -> None:
+    """Ignoring a common revision constraint would let divergent payloads into one stream."""
+    profile_root = tmp_path / "profile"
+    shutil.copytree(bundled_profile(), profile_root)
+    common_path = profile_root / "schemas" / "common-revision.schema.json"
+    common = json.loads(common_path.read_text(encoding="utf-8"))
+    common["$defs"]["revision_payload"]["properties"]["body_markdown"] = {"const": "Common contract body"}
+    common_path.write_text(json.dumps(common), encoding="utf-8")
+    profile = Profile.load(profile_root, default_registry())
+
+    with pytest.raises(MemError) as exc:
+        profile.validate_record_schema("hypotheses", minimal_records["hypotheses"])
 
     assert exc.value.detail.code == "SCHEMA_VALIDATION_FAILED"

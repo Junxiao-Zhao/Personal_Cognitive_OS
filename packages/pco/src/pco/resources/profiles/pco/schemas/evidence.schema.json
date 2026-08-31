@@ -12,6 +12,7 @@
     "payload": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}],
       "required": ["previous_revision", "change_summary", "body_markdown", "speaker", "source_kind", "user_authored", "fidelity", "status"],
       "properties": {
         "previous_revision": {"type": ["integer", "null"], "minimum": 1},

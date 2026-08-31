@@ -8,6 +8,7 @@
     "commit_ref": {"type": "string", "minLength": 1},
     "payload": {
       "type": "object", "additionalProperties": false,
+      "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}],
       "required": ["previous_revision", "change_summary", "body_markdown", "locator", "title", "retrieved_at", "provider_label", "content_hash", "snapshot_ref", "fidelity", "used_excerpts", "status"],
       "properties": {
         "previous_revision": {"type": ["integer", "null"], "minimum": 1},
