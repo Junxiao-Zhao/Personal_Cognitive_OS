@@ -291,10 +291,13 @@ class TransactionManager:
         return state.validation
 
     def _find_committed_fingerprint(self, fingerprint: str) -> dict[str, Any] | None:
-        path = self.repository.root / "transactions" / "transactions.jsonl"
-        if not path.exists():
-            return None
-        for line in path.read_text(encoding="utf-8").splitlines():
+        head = self.repository.head()
+        raw = show_bytes(
+            self.repository.root,
+            head,
+            "transactions/transactions.jsonl",
+        ).decode("utf-8")
+        for line in raw.splitlines():
             if not line.strip():
                 continue
             record = json.loads(line)

@@ -158,6 +158,34 @@ def test_application_commit_reuses_transaction_digest(
     assert second["idempotent"] is True
 
 
+def test_uncommitted_matching_ledger_line_does_not_report_idempotent_success(
+    pco_repository: MemoryRepository, application_request: ApplicationCommitRequest
+) -> None:
+    transaction_record = {
+        "id": application_transaction_id(application_request.transaction_digest),
+        "application_policy": application_request.policy,
+        "base_commit": application_request.base_commit,
+        "operation_count": len(application_request.operations),
+        "operations": [
+            operation.normalized() for operation in application_request.operations
+        ],
+        "transaction_fingerprint": application_request.transaction_digest,
+        "receipt": application_request.receipt,
+    }
+    txn_log = pco_repository.root / "transactions" / "transactions.jsonl"
+    with txn_log.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(
+            json.dumps(transaction_record, ensure_ascii=False, sort_keys=True) + "\n"
+        )
+
+    assert count_transaction_digest(pco_repository, application_request.transaction_digest) == 0
+    with pytest.raises(MemError) as exc:
+        TransactionManager(
+            pco_repository, pco_repository.root.parent / "tmp"
+        ).commit_application(application_request)
+    assert exc.value.detail.code == "CANONICAL_DIRTY"
+
+
 def test_manager_construction_has_no_filesystem_side_effect(
     pco_repository: MemoryRepository, tmp_path: Path
 ) -> None:
