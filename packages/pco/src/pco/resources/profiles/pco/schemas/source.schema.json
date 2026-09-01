@@ -22,6 +22,7 @@
         "content_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "snapshot_ref": {"type": "string", "pattern": "^source_blobs/[0-9a-f]{64}$"},
         "fidelity": {"enum": ["selected_excerpt", "full_user_provided_transcript", "registered_source_excerpt"]},
+        "user_authored": {"type": "boolean"},
         "used_excerpts": {"type": "array", "items": {"type": "string", "minLength": 1}},
         "status": {"enum": ["active", "superseded", "tombstone"]}
       }
@@ -30,5 +31,8 @@
   "allOf": [{
     "if": {"properties": {"revision": {"minimum": 2}}, "required": ["revision"]},
     "then": {"properties": {"payload": {"properties": {"previous_revision": {"type": "integer", "minimum": 1}}}}}
+  }, {
+    "if": {"properties": {"payload": {"properties": {"fidelity": {"const": "full_user_provided_transcript"}}, "required": ["fidelity"]}}},
+    "then": {"properties": {"payload": {"required": ["user_authored"], "properties": {"user_authored": {"const": true}}}}}
   }]
 }

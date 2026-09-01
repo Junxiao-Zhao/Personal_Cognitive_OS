@@ -7,7 +7,10 @@ from typing import Any
 import pytest
 
 from mem_core.models import ApplicationCommitRequest
+from mem_core.profile import Profile
+from mem_core.registry import default_registry
 from mem_core.transaction import TransactionManager
+from pco.paths import bundled_profile
 from pco.validation import validate_profile
 
 
@@ -122,6 +125,29 @@ def test_registered_material_without_user_authorship_cannot_support_personal_fac
     assert _first_problem(records)["code"] == "EVIDENCE_INELIGIBLE"
 
 
+def test_assistant_speaker_cannot_masquerade_as_user_authored_registered_evidence(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """Ignoring speaker would allow an assistant summary to establish a personal fact."""
+    records = _records(minimal_records)
+    records["evidence"].append(
+        _evidence(
+            "ev_assistant_registered",
+            speaker="assistant",
+            source_kind="registered",
+            user_authored=True,
+        )
+    )
+    records["events"] = [
+        _record_with_evidence(records, "events", "evidence:ev_assistant_registered")
+    ]
+
+    problem = _first_problem(records)
+
+    assert problem["code"] == "EVIDENCE_INELIGIBLE"
+    assert problem["path"] == "/payload/evidence_refs/0"
+
+
 def test_retired_target_is_not_a_current_reference(minimal_records: dict[str, dict[str, Any]]) -> None:
     """Treating a tombstoned hypothesis as current would revive retired memory."""
     records = _records(minimal_records)
@@ -166,6 +192,54 @@ def test_source_fidelity_uses_the_same_closed_v05_vocabulary(
     assert problem["path"] == "/payload/fidelity"
 
 
+def test_source_full_transcript_requires_explicit_user_authorship(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """A source cannot claim a full user transcript without provenance metadata."""
+    records = _records(minimal_records)
+    records["sources"][0]["payload"]["fidelity"] = "full_user_provided_transcript"
+
+    problem = _first_problem(records)
+
+    assert problem["code"] == "EVIDENCE_FIDELITY_INVALID"
+    assert problem["stream"] == "sources"
+    assert problem["path"] == "/payload/user_authored"
+
+
+def test_source_schema_allows_explicit_user_authorship_for_full_transcript(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """A closed source schema must carry the provenance needed by the fidelity rule."""
+    record = deepcopy(minimal_records["sources"])
+    record["payload"]["fidelity"] = "full_user_provided_transcript"
+    record["payload"]["user_authored"] = True
+
+    Profile.load(bundled_profile(), default_registry()).validate_record_schema("sources", record)
+
+
+def test_historical_reference_remains_valid_after_current_records_retire(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """Revalidating retired history against today’s current view would rewrite the past."""
+    records = _records(minimal_records)
+    old_event = deepcopy(records["events"][0])
+    current_event = deepcopy(old_event)
+    current_event["revision"] = 2
+    current_event["payload"]["previous_revision"] = 1
+    current_event["payload"]["evidence_refs"] = ["evidence:ev_current"]
+    current_evidence = _evidence("ev_current")
+    evidence_tombstone = deepcopy(records["evidence"][0])
+    evidence_tombstone["revision"] = 2
+    evidence_tombstone["payload"]["previous_revision"] = 1
+    evidence_tombstone["payload"]["status"] = "tombstone"
+    records["events"] = [old_event, current_event]
+    records["evidence"] = [records["evidence"][0], evidence_tombstone, current_evidence]
+    for stream in ("psychologies", "philosophies", "archetypes", "hypotheses", "meta_revisions"):
+        records[stream][0]["payload"]["evidence_refs"] = ["evidence:ev_current"]
+
+    assert list(validate_profile(Path("."), records)) == []
+
+
 def test_revision_chain_requires_the_immediately_previous_revision(
     minimal_records: dict[str, dict[str, Any]],
 ) -> None:
@@ -180,6 +254,79 @@ def test_revision_chain_requires_the_immediately_previous_revision(
 
     assert problem["code"] == "PROPOSAL_REVISION_CONFLICT"
     assert problem["path"] == "/revision"
+
+
+def test_duplicate_revision_ties_are_reported_deterministically(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """Changing append order must not change duplicate-revision diagnostics."""
+    records = _records(minimal_records)
+    duplicate = deepcopy(records["evidence"][0])
+    duplicate["payload"].update(
+        {
+            "change_summary": "Competing duplicate revision",
+            "source_kind": "external",
+            "user_authored": False,
+        }
+    )
+    forward = {**records, "evidence": [records["evidence"][0], duplicate]}
+    reverse = {**records, "evidence": [duplicate, records["evidence"][0]]}
+
+    forward_problems = list(validate_profile(Path("."), forward))
+    reverse_problems = list(validate_profile(Path("."), reverse))
+
+    assert forward_problems == reverse_problems
+    assert any(
+        problem["code"] == "PROPOSAL_REVISION_CONFLICT"
+        and problem["stream"] == "evidence"
+        and problem["path"] == "/revision"
+        for problem in forward_problems
+    )
+
+
+def test_counter_evidence_obeys_the_personal_fact_boundary(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """Skipping counter-evidence would let external research establish a user fact."""
+    records = _records(minimal_records)
+    records["evidence"].append(
+        _evidence("ev_external_counter", source_kind="external", user_authored=False)
+    )
+    records["hypotheses"][0]["payload"]["counter_evidence_refs"] = [
+        "evidence:ev_external_counter"
+    ]
+
+    problem = _first_problem(records)
+
+    assert problem["code"] == "EVIDENCE_INELIGIBLE"
+    assert problem["path"] == "/payload/counter_evidence_refs/0"
+
+
+def test_invalid_event_link_stream_is_a_structured_problem(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """Silently ignoring a legacy or misspelled event-link stream loses a reference."""
+    records = _records(minimal_records)
+    records["events"][0]["payload"]["links"] = {"legacy_relations": ["rel_1"]}
+
+    problem = _first_problem(records)
+
+    assert problem["code"] == "PROPOSAL_REFERENCE_INVALID"
+    assert problem["path"] == "/payload/links/legacy_relations"
+
+
+def test_unknown_list_valued_stream_is_rejected_deterministically(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """Treating an internal ledger as a business stream would revive v0.4 surfaces."""
+    records = _records(minimal_records)
+    records["transactions"] = []
+
+    problem = _first_problem(records)
+
+    assert problem["code"] == "STREAM_NOT_FOUND"
+    assert problem["stream"] == "transactions"
+    assert problem["path"] == "/transactions"
 
 
 def test_commit_ref_must_identify_a_proposal_receipt(minimal_records: dict[str, dict[str, Any]]) -> None:
