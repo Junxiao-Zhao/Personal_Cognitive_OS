@@ -148,6 +148,30 @@ def test_assistant_speaker_cannot_masquerade_as_user_authored_registered_evidenc
     assert problem["path"] == "/payload/evidence_refs/0"
 
 
+def test_assistant_registered_evidence_cannot_support_a_psychology_concept(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
+    """Allowing an assistant summary as concept evidence would violate the attribution boundary."""
+    records = _records(minimal_records)
+    records["evidence"].append(
+        _evidence(
+            "ev_assistant_concept",
+            speaker="assistant",
+            source_kind="registered",
+            user_authored=True,
+        )
+    )
+    records["psychologies"] = [
+        _record_with_evidence(records, "psychologies", "evidence:ev_assistant_concept")
+    ]
+
+    problems = list(validate_profile(Path("."), records))
+
+    assert [(problem["code"], problem["stream"], problem["path"]) for problem in problems] == [
+        ("EVIDENCE_INELIGIBLE", "psychologies", "/payload/evidence_refs/0")
+    ]
+
+
 def test_retired_target_is_not_a_current_reference(minimal_records: dict[str, dict[str, Any]]) -> None:
     """Treating a tombstoned hypothesis as current would revive retired memory."""
     records = _records(minimal_records)

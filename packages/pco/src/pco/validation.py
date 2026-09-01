@@ -158,6 +158,8 @@ def validate_references(stream: str, record: Mapping[str, Any],
 def _evidence_supports(stream: str, evidence: Mapping[str, Any]) -> bool:
     payload = _payload(evidence)
     source_kind, speaker = payload.get("source_kind"), payload.get("speaker")
+    if speaker == "assistant":
+        return False
     user_authored = payload.get("user_authored") is True
     user_conversation = source_kind == "conversation" and speaker == "user" and user_authored
     user_registered_material = source_kind == "registered" and user_authored and speaker != "assistant"
