@@ -3,13 +3,20 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+from .application import (
+    application_transaction_id,
+    ensure_duplicate_matches_request,
+    rmdir_if_empty,
+)
 from .approval import verify_approval_receipt
 from .delta import is_fast_path, latest_base_by_id, show_bytes, validate_delta_records, validate_structured_delta
 from .errors import MemError, ensure
 from .models import (
+    ApplicationCommitRequest,
     ApprovalReceipt,
     Operation,
     TransactionState,
@@ -28,7 +35,6 @@ class TransactionManager:
         self.repository = repository
         self.state_root = state_root.resolve()
         self.transactions_root = self.state_root / "transactions"
-        self.transactions_root.mkdir(parents=True, exist_ok=True)
 
     def _dir(self, transaction_id: str) -> Path:
         ensure(
@@ -63,6 +69,23 @@ class TransactionManager:
             raise MemError("TRANSACTION_STATE_INVALID", "transaction", str(exc), path=str(path)) from exc
 
     def begin(
+        self,
+        *,
+        fingerprint_context: dict[str, Any],
+        transaction_id: str | None = None,
+    ) -> TransactionState:
+        ensure(
+            self.repository.profile.config.application_commit_policy == "public",
+            "DIRECT_PCO_STREAM_WRITE_FORBIDDEN",
+            "write_policy",
+            "PCO business streams can only be written through pco proposal commit",
+        )
+        return self._begin_public(
+            fingerprint_context=fingerprint_context,
+            transaction_id=transaction_id,
+        )
+
+    def _begin_public(
         self,
         *,
         fingerprint_context: dict[str, Any],
@@ -192,7 +215,11 @@ class TransactionManager:
         worktree = self._worktree_path(state.id)
         self.repository.remove_worktree(worktree)
         self.repository.add_worktree(worktree, state.base_commit)
-        for operation in state.operations:
+        self._apply_operations(worktree, state.operations)
+        return worktree
+
+    def _apply_operations(self, worktree: Path, operations: list[Operation]) -> None:
+        for operation in operations:
             if operation.op == "append":
                 assert operation.stream is not None and operation.record is not None
                 self.repository.append_record(worktree, operation.stream, operation.record)
@@ -201,7 +228,6 @@ class TransactionManager:
                 target = self.repository.profile.artifact_path(worktree, operation.path)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(operation.content, encoding="utf-8")
-        return worktree
 
     def validate(self, transaction_id: str, *, require_approval: bool = False) -> dict[str, Any]:
         state = self.load(transaction_id)
@@ -284,6 +310,168 @@ class TransactionManager:
                 )
                 return record
         return None
+
+    def _application_attempt_dir(self, transaction_digest: str) -> Path:
+        return self.state_root / "application-worktrees" / application_transaction_id(transaction_digest)
+
+    def _application_worktree_path(self, transaction_digest: str) -> Path:
+        return self._application_attempt_dir(transaction_digest) / "worktree"
+
+    def _cleanup_application_attempt(self, transaction_digest: str, *, review_id: str) -> None:
+        attempt = self._application_attempt_dir(transaction_digest)
+        worktree = attempt / "worktree"
+        self.repository.remove_worktree(worktree)
+        ensure(
+            not worktree.exists(),
+            "CANONICAL_WORKTREE_CLEANUP_FAILED",
+            "application_cleanup",
+            "Committed application worktree could not be removed",
+            # Task 6 replaces this legacy compatibility field with
+            # canonical_changed=True and retry_safe=True.
+            retryable=True,
+            recovery=[f"pco proposal commit {review_id}"],
+        )
+        rmdir_if_empty(attempt)
+        rmdir_if_empty(attempt.parent)
+
+    def _validate_application_operations(
+        self,
+        request: ApplicationCommitRequest,
+        worktree: Path,
+    ) -> dict[str, Any]:
+        profile = self.repository.profile
+        delta: dict[str, list[dict[str, Any]]] = {}
+        for operation in request.operations:
+            if operation.op == "append":
+                assert operation.stream is not None and operation.record is not None
+                stream = profile.stream(operation.stream)
+                ensure(
+                    stream.write_policy != "read_only",
+                    "STREAM_READ_ONLY",
+                    "write_policy",
+                    f"Stream cannot be written: {operation.stream}",
+                    stream=operation.stream,
+                )
+                delta.setdefault(operation.stream, []).append(operation.record)
+            else:
+                assert operation.path is not None and operation.content is not None
+                profile.artifact_path(worktree, operation.path)
+
+        if is_fast_path(profile, request.operations):
+            current: dict[str, dict[str, dict[str, Any]]] = {}
+            for stream_name in delta:
+                stream_path = profile.stream(stream_name).path
+                base_bytes = show_bytes(self.repository.root, request.base_commit, stream_path)
+                stream_current, baseline_reliable = latest_base_by_id(
+                    base_bytes.decode("utf-8").splitlines()
+                )
+                if baseline_reliable:
+                    current[stream_name] = stream_current
+            count = validate_delta_records(profile, delta, current)
+        else:
+            base_records = {
+                stream: list(self.repository.iter_records(stream))
+                for stream in profile.config.streams
+            }
+            count = validate_structured_delta(
+                profile=profile,
+                base_records=base_records,
+                delta=delta,
+                root=worktree,
+            )
+        return {
+            "ok": True,
+            "profile": f"{profile.name}@{profile.version}",
+            "mode": "incremental",
+            "records": count,
+            "delta": {name: len(records) for name, records in delta.items()},
+        }
+
+    def _commit_application_worktree(self, request: ApplicationCommitRequest) -> dict[str, Any]:
+        transaction_id = application_transaction_id(request.transaction_digest)
+        worktree = self._application_worktree_path(request.transaction_digest)
+        self.repository.assert_clean()
+        self.repository.remove_worktree(worktree)
+        self.repository.add_worktree(worktree, request.base_commit)
+        self._apply_operations(worktree, request.operations)
+        validation = self._validate_application_operations(request, worktree)
+        transaction_record = {
+            "id": transaction_id,
+            "application_policy": request.policy,
+            "base_commit": request.base_commit,
+            "operation_count": len(request.operations),
+            "operations": [operation.normalized() for operation in request.operations],
+            "transaction_fingerprint": request.transaction_digest,
+            "receipt": request.receipt,
+        }
+        txn_log = worktree / "transactions" / "transactions.jsonl"
+        with txn_log.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(transaction_record, ensure_ascii=False, sort_keys=True) + "\n")
+        self.repository._git("add", ".", cwd=worktree)
+        # The generic hook verifies the public TransactionState receipt shape.
+        # This internal path performs the same incremental validation above and
+        # commits its distinct application receipt shape atomically.
+        self.repository._git(
+            "commit",
+            "--no-verify",
+            "-m",
+            f"memory transaction {transaction_id}",
+            cwd=worktree,
+        )
+        commit = self.repository._git("rev-parse", "HEAD", cwd=worktree)
+        self.repository.fast_forward(commit)
+        self._cleanup_application_attempt(
+            request.transaction_digest,
+            review_id=str(request.receipt["review_id"]),
+        )
+        return {
+            "ok": True,
+            "idempotent": False,
+            "transaction_id": transaction_id,
+            "commit": commit,
+            "validation": validation,
+        }
+
+    def commit_application(
+        self,
+        request: ApplicationCommitRequest,
+        *,
+        lock_held: bool = False,
+    ) -> dict[str, Any]:
+        ensure(
+            request.policy == self.repository.profile.config.application_commit_policy,
+            "DIRECT_PCO_STREAM_WRITE_FORBIDDEN",
+            "write_policy",
+            "Application commit policy mismatch",
+        )
+        context = nullcontext() if lock_held else self.repository.lock()
+        with context:
+            duplicate = self._find_committed_fingerprint(request.transaction_digest)
+            if duplicate is not None:
+                ensure_duplicate_matches_request(duplicate, request)
+                self._cleanup_application_attempt(
+                    request.transaction_digest,
+                    review_id=str(request.receipt["review_id"]),
+                )
+                return {
+                    "ok": True,
+                    "idempotent": True,
+                    "commit": duplicate["commit"],
+                    "transaction": duplicate,
+                }
+            ensure(
+                self.repository.head() == request.base_commit,
+                "CANONICAL_HEAD_CHANGED",
+                "transaction_validation",
+                "Canonical HEAD changed before commit",
+                # Task 6 replaces this legacy compatibility field with
+                # canonical_changed=False and retry_safe=False.
+                retryable=False,
+                recovery=[
+                    "Create a new proposal from pco proposal scaffold against the current HEAD"
+                ],
+            )
+            return self._commit_application_worktree(request)
 
     def commit(self, transaction_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         if dry_run:

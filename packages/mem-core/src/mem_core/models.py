@@ -36,6 +36,7 @@ class RecordEnvelope(BaseModel):
     revision: int = Field(ge=1)
     recorded_at: str
     schema_version: str = Field(min_length=1)
+    commit_ref: str | None = Field(default=None, min_length=1)
     payload: dict[str, Any]
 
     @field_validator("recorded_at")
@@ -72,6 +73,22 @@ class Operation(BaseModel):
 
     def normalized(self) -> dict[str, Any]:
         return self.model_dump(mode="json", exclude_none=True)
+
+
+class ApplicationCommitRequest(BaseModel):
+    """Complete, one-shot application transaction input.
+
+    The application supplies a digest, but never a transaction ID. mem-core
+    derives the ledger and worktree identity from the validated digest.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy: str
+    transaction_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    base_commit: str
+    operations: list[Operation] = Field(min_length=1)
+    receipt: dict[str, Any]
 
 
 class ApprovalReceipt(BaseModel):
