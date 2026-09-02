@@ -39,7 +39,9 @@ def _begin(engine: Any, state: CheckpointState, name: str) -> dict[str, Any]:
     return previous
 
 
-def _finish(engine: Any, state: CheckpointState, name: str, result: dict[str, Any]) -> None:
+def _finish(
+    engine: Any, state: CheckpointState, name: str, result: dict[str, Any]
+) -> None:
     state.derivations[name] = result
     state_store.save(engine, state)
 
@@ -53,19 +55,28 @@ def cleanup_worker(engine: Any, state: CheckpointState) -> None:
     previous = _begin(engine, state, "worker_cleanup")
     try:
         engine.adapter.close_worker(WorkerHandle(**state.worker_handle))
-        _finish(engine, state, "worker_cleanup", _with_derivation_status(
-            successful_attempt(
-                {**previous, "worker_id": state.worker_handle["id"]},
-                {"worker_id": state.worker_handle["id"]},
+        _finish(
+            engine,
+            state,
+            "worker_cleanup",
+            _with_derivation_status(
+                successful_attempt(
+                    {**previous, "worker_id": state.worker_handle["id"]},
+                    {"worker_id": state.worker_handle["id"]},
+                ),
+                "completed",
             ),
-            "completed",
-        ))
+        )
     except Exception as exc:
         failed = _with_derivation_status(
-            failed_attempt({**previous, "worker_id": state.worker_handle["id"]}, exc, "worker_cleanup"),
+            failed_attempt(
+                {**previous, "worker_id": state.worker_handle["id"]},
+                exc,
+                "worker_cleanup",
+            ),
             "failed",
         )
-        # A failed cleanup is retryable work, not a terminal derivation
+        # A failed cleanup remains safe retry work, not a terminal derivation
         # result. Keep the pending bit explicit in every receipt snapshot.
         failed["pending"] = True
         _finish(engine, state, "worker_cleanup", failed)
@@ -83,28 +94,56 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
                 indexes_root=engine.workspace.config.indexes_root,
                 source_commit=source_commit,
             )
-            _finish(engine, state, "index", _with_derivation_status(
-                result_attempt(previous, result, "index"),
-                "completed" if result.get("ok", True) else "failed",
-            ))
+            _finish(
+                engine,
+                state,
+                "index",
+                _with_derivation_status(
+                    result_attempt(previous, result, "index"),
+                    "completed" if result.get("ok", True) else "failed",
+                ),
+            )
         except Exception as exc:
-            _finish(engine, state, "index", _with_derivation_status(failed_attempt(previous, exc, "index"), "failed"))
+            _finish(
+                engine,
+                state,
+                "index",
+                _with_derivation_status(
+                    failed_attempt(previous, exc, "index"), "failed"
+                ),
+            )
     if config.backlinks and not state.derivations.get("backlinks", {}).get("ok"):
         previous = _begin(engine, state, "backlinks")
         try:
             result = engine.workspace.profile.invoke(
                 "backlinks.build",
                 repo_root=engine.workspace.config.memory_root,
-                output_path=engine.workspace.config.state_root / "derivations" / f"backlinks-{source_commit}.json",
+                output_path=engine.workspace.config.state_root
+                / "derivations"
+                / f"backlinks-{source_commit}.json",
                 source_commit=source_commit,
             )
-            _finish(engine, state, "backlinks", _with_derivation_status(
-                result_attempt(previous, result, "backlinks"),
-                "completed" if result.get("ok", True) else "failed",
-            ))
+            _finish(
+                engine,
+                state,
+                "backlinks",
+                _with_derivation_status(
+                    result_attempt(previous, result, "backlinks"),
+                    "completed" if result.get("ok", True) else "failed",
+                ),
+            )
         except Exception as exc:
-            _finish(engine, state, "backlinks", _with_derivation_status(failed_attempt(previous, exc, "backlinks"), "failed"))
-    if config.projection == "markdown" and not state.derivations.get("projection", {}).get("ok"):
+            _finish(
+                engine,
+                state,
+                "backlinks",
+                _with_derivation_status(
+                    failed_attempt(previous, exc, "backlinks"), "failed"
+                ),
+            )
+    if config.projection == "markdown" and not state.derivations.get(
+        "projection", {}
+    ).get("ok"):
         previous = _begin(engine, state, "projection")
         try:
             result = engine.workspace.profile.invoke(
@@ -113,13 +152,27 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
                 output_root=engine.workspace.config.projection_root,
                 source_commit=source_commit,
             )
-            _finish(engine, state, "projection", _with_derivation_status(
-                result_attempt(previous, result, "projection"),
-                "completed" if result.get("ok", True) else "failed",
-            ))
+            _finish(
+                engine,
+                state,
+                "projection",
+                _with_derivation_status(
+                    result_attempt(previous, result, "projection"),
+                    "completed" if result.get("ok", True) else "failed",
+                ),
+            )
         except Exception as exc:
-            _finish(engine, state, "projection", _with_derivation_status(failed_attempt(previous, exc, "projection"), "failed"))
-    elif config.projection == "affine" and not state.derivations.get("projection", {}).get("ok"):
+            _finish(
+                engine,
+                state,
+                "projection",
+                _with_derivation_status(
+                    failed_attempt(previous, exc, "projection"), "failed"
+                ),
+            )
+    elif config.projection == "affine" and not state.derivations.get(
+        "projection", {}
+    ).get("ok"):
         previous = _begin(engine, state, "projection")
         try:
             result = engine.workspace.profile.invoke(
@@ -128,9 +181,21 @@ def run_derivations(engine: Any, state: CheckpointState) -> None:
                 state_root=engine.workspace.config.state_root,
                 source_commit=source_commit,
             )
-            _finish(engine, state, "projection", _with_derivation_status(
-                result_attempt(previous, result, "projection"),
-                "completed" if result.get("ok", True) else "failed",
-            ))
+            _finish(
+                engine,
+                state,
+                "projection",
+                _with_derivation_status(
+                    result_attempt(previous, result, "projection"),
+                    "completed" if result.get("ok", True) else "failed",
+                ),
+            )
         except Exception as exc:
-            _finish(engine, state, "projection", _with_derivation_status(failed_attempt(previous, exc, "projection"), "failed"))
+            _finish(
+                engine,
+                state,
+                "projection",
+                _with_derivation_status(
+                    failed_attempt(previous, exc, "projection"), "failed"
+                ),
+            )

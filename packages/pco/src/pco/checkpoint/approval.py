@@ -26,8 +26,22 @@ def decide(
 ) -> dict[str, Any]:
     workspace = engine.workspace
     state = state_store.load(engine)
-    ensure(state.status == "AWAITING_META_APPROVAL", "CHECKPOINT_NOT_AWAITING_APPROVAL", "approval", f"Checkpoint is {state.status}")
-    ensure(state.transaction_id is not None and state.proposal_hash is not None, "CHECKPOINT_STATE_INVALID", "approval", "Missing candidate transaction")
+    ensure(
+        state.status == "AWAITING_META_APPROVAL",
+        "CHECKPOINT_NOT_AWAITING_APPROVAL",
+        "approval",
+        f"Checkpoint is {state.status}",
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    ensure(
+        state.transaction_id is not None and state.proposal_hash is not None,
+        "CHECKPOINT_STATE_INVALID",
+        "approval",
+        "Missing candidate transaction",
+        canonical_changed=False,
+        retry_safe=False,
+    )
     grant_payload: dict[str, Any]
     if decision == "yes":
         ensure(
@@ -35,6 +49,8 @@ def decide(
             "APPROVAL_PROVENANCE_REQUIRED",
             "approval",
             "Protected Meta approval requires a host-issued approval grant",
+            canonical_changed=False,
+            retry_safe=False,
         )
         grant_payload = verify_grant(
             approval_grant,
@@ -58,13 +74,18 @@ def decide(
         frozen = workspace.load_json(f"checkpoints/{state.id}/frozen.json")
         frozen["base_commit"] = workspace.repository.head()
         workspace.save_json(f"checkpoints/{state.id}/frozen.json", frozen)
-        persisted_result = workspace.load_json(f"checkpoints/{state.id}/worker-result-initial.json")
+        persisted_result = workspace.load_json(
+            f"checkpoints/{state.id}/worker-result-initial.json"
+        )
         checkpoint_steps.prepare_candidate(
             engine,
             state,
             frozen,
             WorkerResult(
-                operations=[Operation.model_validate(item) for item in persisted_result["operations"]],
+                operations=[
+                    Operation.model_validate(item)
+                    for item in persisted_result["operations"]
+                ],
                 search_receipts=persisted_result.get("search_receipts", []),
                 diagnostics=persisted_result.get("diagnostics", []),
                 skill_versions=persisted_result.get("skill_versions", {}),
@@ -72,7 +93,14 @@ def decide(
             ),
         )
         state = state_store.load(engine)
-        ensure(state.transaction_id is not None, "CHECKPOINT_STATE_INVALID", "approval", "Rebuilt approval transaction is missing")
+        ensure(
+            state.transaction_id is not None,
+            "CHECKPOINT_STATE_INVALID",
+            "approval",
+            "Rebuilt approval transaction is missing",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         engine.manager.attach_approval(
             state.transaction_id,
             checkpoint_id=state.id,
@@ -91,18 +119,30 @@ def decide(
         except Exception as exc:
             state_store.recover(engine, state, exc)
             raise
-    ensure(reason is not None and reason.strip(), "REJECTION_REASON_REQUIRED", "approval", "No requires a reason or supplemental experience", path="/reason")
+    ensure(
+        reason is not None and reason.strip(),
+        "REJECTION_REASON_REQUIRED",
+        "approval",
+        "No requires a reason or supplemental experience",
+        path="/reason",
+        canonical_changed=False,
+        retry_safe=False,
+    )
     ensure(
         isinstance(approval_grant, str) and bool(approval_grant.strip()),
         "APPROVAL_PROVENANCE_REQUIRED",
         "approval",
         "A native question decision requires a host-issued grant",
+        canonical_changed=False,
+        retry_safe=False,
     )
     ensure(
         isinstance(question_request_id, str) and bool(question_request_id.strip()),
         "QUESTION_REQUEST_ID_REQUIRED",
         "approval",
         "A native question request ID is required for a rejection",
+        canonical_changed=False,
+        retry_safe=False,
     )
     grant_payload = verify_grant(
         approval_grant,
@@ -135,8 +175,17 @@ def decide(
         engine.manager.abort(state.transaction_id)
         frozen = workspace.load_json(f"checkpoints/{state.id}/frozen.json")
         frozen["message_range"]["through"] = state.through_message_id
-        decision_message = workspace.repository.current_records("messages").get(state.decision_message_id)
-        ensure(decision_message is not None, "DECISION_MESSAGE_NOT_ARCHIVED", "approval", "The rejection decision was not found in canonical conversation")
+        decision_message = workspace.repository.current_records("messages").get(
+            state.decision_message_id
+        )
+        ensure(
+            decision_message is not None,
+            "DECISION_MESSAGE_NOT_ARCHIVED",
+            "approval",
+            "The rejection decision was not found in canonical conversation",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         frozen["messages"].append(decision_message)
         frozen["base_commit"] = workspace.repository.head()
         workspace.save_json(f"checkpoints/{state.id}/frozen.json", frozen)
@@ -150,7 +199,12 @@ def decide(
                 "decision_message_id": state.decision_message_id,
                 "reason": reason,
                 "original_proposal_hash": state.proposal_hash,
-                "requirements": ["remove all user_approval operations", "append a disputed/rejected hypothesis revision", "extract supplemental event evidence when applicable", "do not ask a follow-up question"],
+                "requirements": [
+                    "remove all user_approval operations",
+                    "append a disputed/rejected hypothesis revision",
+                    "extract supplemental event evidence when applicable",
+                    "do not ask a follow-up question",
+                ],
                 "frozen": frozen,
             },
         )

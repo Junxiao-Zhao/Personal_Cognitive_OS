@@ -9,7 +9,6 @@ from typing import Callable, Iterator
 
 from .errors import MemError
 
-
 if os.name == "nt":
     import msvcrt
 
@@ -96,8 +95,11 @@ def canonical_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
                 "CANONICAL_LOCKED",
                 "canonical_lock",
                 "Canonical transaction is already running",
-                retryable=True,
-                recovery=["Retry pco proposal commit after the active command finishes"],
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=[
+                    "Retry pco proposal commit after the active command finishes"
+                ],
             ) from exc
         acquired = True
         yield

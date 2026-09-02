@@ -14,7 +14,12 @@ from . import steps as checkpoint_steps
 
 def _retire_pending_if_complete(engine: Any, result: dict[str, Any]) -> dict[str, Any]:
     state = state_store.load(engine)
-    if state.pending_compaction is not None and state.compaction_status == "completed" and state.receipt_inserted and state.input_unlocked:
+    if (
+        state.pending_compaction is not None
+        and state.compaction_status == "completed"
+        and state.receipt_inserted
+        and state.input_unlocked
+    ):
         state_store.retire_pending_compaction(engine, state)
         refreshed = state_store.load(engine)
         result = dict(result)
@@ -24,7 +29,9 @@ def _retire_pending_if_complete(engine: Any, result: dict[str, Any]) -> dict[str
     return result
 
 
-def resume_pending_compaction(engine: Any, result: dict[str, Any] | None = None) -> dict[str, Any]:
+def resume_pending_compaction(
+    engine: Any, result: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Continue the compact-only tail of a durable checkpoint.
 
     The original consolidate intent is preserved. This helper is deliberately
@@ -36,9 +43,22 @@ def resume_pending_compaction(engine: Any, result: dict[str, Any] | None = None)
     state = state_store.load(engine)
     if state.pending_compaction is None:
         return result or {"ok": True, "checkpoint_id": state.id, "status": state.status}
-    if state.context_publication_status != "completed" or not state.context_published or not state.content_commit:
-        return result or {"ok": True, "checkpoint_id": state.id, "status": state.status, "pending_compaction": state.pending_compaction.model_dump(mode="json")}
-    if state.compaction_status == "completed" and state.receipt_inserted and state.input_unlocked:
+    if (
+        state.context_publication_status != "completed"
+        or not state.context_published
+        or not state.content_commit
+    ):
+        return result or {
+            "ok": True,
+            "checkpoint_id": state.id,
+            "status": state.status,
+            "pending_compaction": state.pending_compaction.model_dump(mode="json"),
+        }
+    if (
+        state.compaction_status == "completed"
+        and state.receipt_inserted
+        and state.input_unlocked
+    ):
         return _retire_pending_if_complete(engine, result or {})
 
     if state.status in state_store.TERMINAL_STATUSES or state.input_unlocked:
@@ -46,7 +66,9 @@ def resume_pending_compaction(engine: Any, result: dict[str, Any] | None = None)
         state.status = "COMMITTED_CONTEXT_PENDING"
         state_store.transition(engine, state, state.status)
     state.compaction_requested = True
-    state.compaction_status = "pending" if state.compaction_status != "completed" else state.compaction_status
+    state.compaction_status = (
+        "pending" if state.compaction_status != "completed" else state.compaction_status
+    )
     state.compaction_origin = state.pending_compaction.origin
     state_store.save(engine, state)
     compact_result = finalize_steps.finalize_noop_compact(engine, state)
@@ -55,19 +77,37 @@ def resume_pending_compaction(engine: Any, result: dict[str, Any] | None = None)
 
 def retry(engine: Any) -> dict[str, Any]:
     state = state_store.load(engine)
-    receipt_pending = state.host_receipt_generation != state.receipt_generation or not state.input_unlocked
+    receipt_pending = (
+        state.host_receipt_generation != state.receipt_generation
+        or not state.input_unlocked
+    )
     ensure(
-        state.status in {"RECOVERY", "COMMITTED_CONTEXT_PENDING", "RECEIPT_INSERTED", "INPUT_UNLOCKED", "DERIVATIONS_RUNNING", "CONTEXT_COMPACTED", "DONE", "COMMITTED_WITH_PENDING_DERIVATIONS"},
-        # A terminal state is retryable only when the pending compact tail was
+        state.status
+        in {
+            "RECOVERY",
+            "COMMITTED_CONTEXT_PENDING",
+            "RECEIPT_INSERTED",
+            "INPUT_UNLOCKED",
+            "DERIVATIONS_RUNNING",
+            "CONTEXT_COMPACTED",
+            "DONE",
+            "COMMITTED_WITH_PENDING_DERIVATIONS",
+        },
+        # A terminal state is safe to retry only when the pending compact tail was
         # durably recorded before the process stopped.
         "CHECKPOINT_NOT_RETRYABLE",
         "checkpoint",
         f"Checkpoint is {state.status}",
+        canonical_changed=False,
+        retry_safe=False,
     )
     # A committed checkpoint with only failed/pending derivations is a
     # derivation recovery operation, not a new checkpoint retry. Keep the
     # durable commit and retry only the replaceable derivation tail.
-    if state.status == "COMMITTED_WITH_PENDING_DERIVATIONS" and state.pending_compaction is None:
+    if (
+        state.status == "COMMITTED_WITH_PENDING_DERIVATIONS"
+        and state.pending_compaction is None
+    ):
         return retry_derivations(engine)
     ensure(
         state.status not in {"DONE", "COMMITTED_WITH_PENDING_DERIVATIONS"}
@@ -76,26 +116,49 @@ def retry(engine: Any) -> dict[str, Any]:
         "CHECKPOINT_NOT_RETRYABLE",
         "checkpoint",
         f"Checkpoint is {state.status}",
+        canonical_changed=False,
+        retry_safe=False,
     )
     state.retries += 1
     state.error = None
     state.failure_phase = None
-    if state.pending_compaction is not None and state.context_publication_status == "completed" and state.content_commit:
+    if (
+        state.pending_compaction is not None
+        and state.context_publication_status == "completed"
+        and state.content_commit
+    ):
         return resume_pending_compaction(engine)
     if state.content_commit or state.commit:
         post_derivation = bool(
             state.context_published
             and (
                 state.compaction_status in {"failed", "pending", "completed"}
-                or state.failure_phase in {"NATIVE_COMPACT", "RECEIPT_INSERT", "RECEIPT_INSERTED", "INPUT_UNLOCKED"}
+                or state.failure_phase
+                in {
+                    "NATIVE_COMPACT",
+                    "RECEIPT_INSERT",
+                    "RECEIPT_INSERTED",
+                    "INPUT_UNLOCKED",
+                }
                 or state.receipt_inserted
-                or state.status in {"CONTEXT_COMPACTED", "RECEIPT_INSERTED", "INPUT_UNLOCKED", "DONE", "COMMITTED_WITH_PENDING_DERIVATIONS"}
+                or state.status
+                in {
+                    "CONTEXT_COMPACTED",
+                    "RECEIPT_INSERTED",
+                    "INPUT_UNLOCKED",
+                    "DONE",
+                    "COMMITTED_WITH_PENDING_DERIVATIONS",
+                }
             )
         )
         state_store.save(engine, state)
         if post_derivation:
-            return _retire_pending_if_complete(engine, finalize_steps.finalize_after_derivations(engine, state))
-        return resume_pending_compaction(engine, finalize_steps.finalize_committed(engine, state))
+            return _retire_pending_if_complete(
+                engine, finalize_steps.finalize_after_derivations(engine, state)
+            )
+        return resume_pending_compaction(
+            engine, finalize_steps.finalize_committed(engine, state)
+        )
     try:
         frozen = engine.workspace.load_json(f"checkpoints/{state.id}/frozen.json")
         handle = WorkerHandle(**(state.worker_handle or {}))
@@ -107,7 +170,13 @@ def retry(engine: Any) -> dict[str, Any]:
                 "decision_question_request_id": state.decision_question_request_id,
                 "decision_authorization_id": state.decision_authorization_id,
                 "original_proposal_hash": state.proposal_hash,
-                "requirements": ["remove all user_approval operations", "append a disputed/rejected hypothesis revision", "cite the archived decision as counter-evidence", "include a non-empty revision reason", "do not ask a follow-up question"],
+                "requirements": [
+                    "remove all user_approval operations",
+                    "append a disputed/rejected hypothesis revision",
+                    "cite the archived decision as counter-evidence",
+                    "include a non-empty revision reason",
+                    "do not ask a follow-up question",
+                ],
                 "frozen": frozen,
             }
         else:
@@ -123,7 +192,9 @@ def retry(engine: Any) -> dict[str, Any]:
                     "checkpoint_id": state.id,
                     "worker_id": f"worker_{uuid.uuid4().hex}",
                     "replacement_for": handle.id,
-                    "frozen_input_path": str(state_store.checkpoint_dir(engine, state.id) / "frozen.json"),
+                    "frozen_input_path": str(
+                        state_store.checkpoint_dir(engine, state.id) / "frozen.json"
+                    ),
                 }
             )
             state.worker_handle = replacement.as_dict()
@@ -137,12 +208,22 @@ def retry(engine: Any) -> dict[str, Any]:
 
 def retry_derivations(engine: Any) -> dict[str, Any]:
     state = state_store.load(engine)
-    ensure(state.content_commit or state.commit is not None, "CHECKPOINT_NOT_COMMITTED", "derivations", "Checkpoint has no canonical commit")
+    ensure(
+        state.content_commit or state.commit is not None,
+        "CHECKPOINT_NOT_COMMITTED",
+        "derivations",
+        "Checkpoint has no canonical commit",
+        canonical_changed=False,
+        retry_safe=False,
+    )
     state.retries += 1
     # A derivation retry after a published final receipt is a new observable
     # runtime outcome. Reopen the operation under a higher receipt generation
     # so Host/UI state is superseded rather than silently changed on disk.
-    if state.input_unlocked and state.host_receipt_generation == state.receipt_generation:
+    if (
+        state.input_unlocked
+        and state.host_receipt_generation == state.receipt_generation
+    ):
         state.receipt_generation += 1
         state.receipt_outbox = None
         state.receipt_inserted = False
@@ -161,7 +242,14 @@ def retry_derivations(engine: Any) -> dict[str, Any]:
 
 def abort(engine: Any) -> dict[str, Any]:
     state = state_store.load(engine)
-    ensure(state.commit is None, "CHECKPOINT_ALREADY_COMMITTED", "checkpoint", "A committed checkpoint cannot be aborted; retry context publication")
+    ensure(
+        state.commit is None,
+        "CHECKPOINT_ALREADY_COMMITTED",
+        "checkpoint",
+        "A committed checkpoint cannot be aborted; retry context publication",
+        canonical_changed=False,
+        retry_safe=False,
+    )
     if state.transaction_id:
         transaction = engine.manager.load(state.transaction_id)
         if transaction.status != "aborted":

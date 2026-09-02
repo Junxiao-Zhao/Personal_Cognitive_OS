@@ -36,7 +36,9 @@ class CheckpointEngine:
         self.adapter = adapter
         self.archive = ConversationArchive(workspace)
         self.sources = SourceManager(workspace)
-        self.manager = TransactionManager(workspace.repository, workspace.config.state_root)
+        self.manager = TransactionManager(
+            workspace.repository, workspace.config.state_root
+        )
 
     # Thin compatibility delegators retained for tests and internal callers.
     @property
@@ -52,7 +54,9 @@ class CheckpointEngine:
     def _load(self) -> CheckpointState:
         return state_store.load(self)
 
-    def _recover(self, state: CheckpointState, exc: Exception, *, preserve_status: bool = False) -> None:
+    def _recover(
+        self, state: CheckpointState, exc: Exception, *, preserve_status: bool = False
+    ) -> None:
         state_store.recover(self, state, exc, preserve_status=preserve_status)
 
     def _worker_profile_contract(self) -> dict[str, Any]:
@@ -61,7 +65,9 @@ class CheckpointEngine:
     def _freeze(self, state: CheckpointState) -> dict[str, Any]:
         return checkpoint_steps.freeze(self, state)
 
-    def _prepare_candidate(self, state: CheckpointState, frozen: dict[str, Any], result: Any) -> dict[str, Any]:
+    def _prepare_candidate(
+        self, state: CheckpointState, frozen: dict[str, Any], result: Any
+    ) -> dict[str, Any]:
         return checkpoint_steps.prepare_candidate(self, state, frozen, result)
 
     def _commit_and_finalize(self, state: CheckpointState) -> dict[str, Any]:
@@ -92,7 +98,9 @@ class CheckpointEngine:
         self,
         trigger: Literal["manual", "auto"],
         intent: Literal["consolidate", "compact"] | None = None,
-        origin: Literal["command", "idle_threshold", "harness_auto_compaction"] | None = None,
+        origin: (
+            Literal["command", "idle_threshold", "harness_auto_compaction"] | None
+        ) = None,
         pending_compaction: PendingCompaction | dict[str, Any] | None = None,
         native_compact_bypass: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -101,33 +109,70 @@ class CheckpointEngine:
         # this compatibility default.
         legacy_call = intent is None
         intent = intent or "compact"
-        ensure(intent in {"consolidate", "compact"}, "CHECKPOINT_INTENT_INVALID", "checkpoint", "Unknown checkpoint intent")
+        ensure(
+            intent in {"consolidate", "compact"},
+            "CHECKPOINT_INTENT_INVALID",
+            "checkpoint",
+            "Unknown checkpoint intent",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         pending_request = (
             pending_compaction
             if isinstance(pending_compaction, PendingCompaction)
-            else PendingCompaction.model_validate(pending_compaction)
-            if pending_compaction is not None
-            else None
+            else (
+                PendingCompaction.model_validate(pending_compaction)
+                if pending_compaction is not None
+                else None
+            )
         )
         if pending_request is not None:
             intent = "compact"
             origin = "harness_auto_compaction"
         if trigger == "auto":
-            threshold_ok = origin == "harness_auto_compaction" or self.should_auto_checkpoint(intent)
+            threshold_ok = (
+                origin == "harness_auto_compaction"
+                or self.should_auto_checkpoint(intent)
+            )
             if legacy_call:
                 # Keep direct v0.3 Python callers readable during migration;
                 # trusted v0.4 Plugin/CLI callers always provide an intent and
                 # therefore use the split thresholds above.
-                legacy_ratio = getattr(self.workspace.config.checkpoint, "trigger_ratio", 0.5)
-                threshold_ok = threshold_ok or self.adapter.estimate_context_usage() >= legacy_ratio
-            ensure(threshold_ok, "AUTO_THRESHOLD_NOT_REACHED", "checkpoint", "Automatic checkpoint threshold has not been reached")
+                legacy_ratio = getattr(
+                    self.workspace.config.checkpoint, "trigger_ratio", 0.5
+                )
+                threshold_ok = (
+                    threshold_ok
+                    or self.adapter.estimate_context_usage() >= legacy_ratio
+                )
+            ensure(
+                threshold_ok,
+                "AUTO_THRESHOLD_NOT_REACHED",
+                "checkpoint",
+                "Automatic checkpoint threshold has not been reached",
+                canonical_changed=False,
+                retry_safe=False,
+            )
         if state_store.active_path(self).exists():
             previous = state_store.load(self)
-            if previous.status not in {"DONE", "COMMITTED_WITH_PENDING_DERIVATIONS", "ABORTED"}:
+            if previous.status not in {
+                "DONE",
+                "COMMITTED_WITH_PENDING_DERIVATIONS",
+                "ABORTED",
+            }:
                 if pending_request is None:
-                    ensure(False, "CHECKPOINT_ACTIVE", "checkpoint", f"Checkpoint {previous.id} is still {previous.status}")
+                    ensure(
+                        False,
+                        "CHECKPOINT_ACTIVE",
+                        "checkpoint",
+                        f"Checkpoint {previous.id} is still {previous.status}",
+                        canonical_changed=False,
+                        retry_safe=False,
+                    )
                 if previous.pending_acceptance == "open":
-                    state_store.merge_pending_compaction(self, previous, pending_request)
+                    state_store.merge_pending_compaction(
+                        self, previous, pending_request
+                    )
                     result = state_store.status(self)
                     result["pending_compaction_merged"] = True
                     return result
@@ -139,7 +184,14 @@ class CheckpointEngine:
         if binding.native_session_id is None:
             binding.native_session_id = session_id
             self.workspace.save_binding(binding)
-        ensure(binding.native_session_id == session_id, "HARNESS_BINDING_CONFLICT", "checkpoint", "Adapter session does not match the active PCO binding")
+        ensure(
+            binding.native_session_id == session_id,
+            "HARNESS_BINDING_CONFLICT",
+            "checkpoint",
+            "Adapter session does not match the active PCO binding",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         thread = self.workspace.thread()
         new_messages = self.adapter.archive_messages_since(thread.archive_cursor)
         self.archive.archive(new_messages)
@@ -150,7 +202,9 @@ class CheckpointEngine:
             and thread.last_consolidated_message_id != thread.last_archived_message_id
         )
         previous_source_hashes = self._last_consolidation_source_hashes()
-        source_changed = dict(source_probe.get("source_hashes") or {}) != previous_source_hashes
+        source_changed = (
+            dict(source_probe.get("source_hashes") or {}) != previous_source_hashes
+        )
         state = CheckpointState(
             id=f"ckpt_{uuid.uuid4().hex}",
             trigger=trigger,
@@ -167,13 +221,18 @@ class CheckpointEngine:
             compaction_cursor_before=thread.compaction_cursor,
             compaction_requested=intent == "compact",
             compaction_status="pending" if intent == "compact" else "not_requested",
-            compaction_origin=origin or ("command" if trigger == "manual" else "idle_threshold"),
+            compaction_origin=origin
+            or ("command" if trigger == "manual" else "idle_threshold"),
             pending_compaction=pending_request,
-            pending_compaction_request_ids=[pending_request.request_id] if pending_request else [],
+            pending_compaction_request_ids=(
+                [pending_request.request_id] if pending_request else []
+            ),
             native_compact_attempt_id=(native_compact_bypass or {}).get("attempt_id"),
             harness_runtime=self.adapter.runtime_info(),
         )
-        state.consolidation_source_hashes = dict(self._last_consolidation_source_hashes())
+        state.consolidation_source_hashes = dict(
+            self._last_consolidation_source_hashes()
+        )
         state_store.transition(self, state, "CHECKPOINT_REQUESTED")
         try:
             state_store.transition(self, state, "INPUT_LOCKED")
@@ -188,7 +247,14 @@ class CheckpointEngine:
                 state.consolidation_source_hashes = dict(state.source_hashes)
                 latest = self._latest_successful_checkpoint_payload()
                 reusable = self._validated_reusable_context(latest)
-                ensure(reusable is not None, "CONTEXT_BUNDLE_MISSING", "context", "The latest successful context cannot be safely reused")
+                ensure(
+                    reusable is not None,
+                    "CONTEXT_BUNDLE_MISSING",
+                    "context",
+                    "The latest successful context cannot be safely reused",
+                    canonical_changed=False,
+                    retry_safe=False,
+                )
                 state.content_commit = reusable["content_commit"]
                 state.commit = state.content_commit
                 state.context_bundle = reusable["bundle"]
@@ -206,12 +272,16 @@ class CheckpointEngine:
                 {
                     "checkpoint_id": state.id,
                     "worker_id": f"worker_{uuid.uuid4().hex}",
-                    "frozen_input_path": str(state_store.checkpoint_dir(self, state.id) / "frozen.json"),
+                    "frozen_input_path": str(
+                        state_store.checkpoint_dir(self, state.id) / "frozen.json"
+                    ),
                 }
             )
             state.worker_handle = handle.as_dict()
             state_store.transition(self, state, "WORKER_RUNNING")
-            result = self.adapter.resume_worker(handle, {"kind": "consolidate", "frozen": frozen})
+            result = self.adapter.resume_worker(
+                handle, {"kind": "consolidate", "frozen": frozen}
+            )
             return checkpoint_steps.prepare_candidate(self, state, frozen, result)
         except Exception as exc:
             state_store.recover(self, state, exc)
@@ -226,13 +296,18 @@ class CheckpointEngine:
             records = list(self.workspace.repository.iter_records("checkpoints"))
             for record in reversed(records):
                 payload = record.get("payload", {})
-                if payload.get("status") in {"committed", "committed_with_pending_derivations"}:
+                if payload.get("status") in {
+                    "committed",
+                    "committed_with_pending_derivations",
+                }:
                     return dict(payload.get("source_hashes") or {})
         except Exception:
             pass
         return {}
 
-    def _validated_reusable_context(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _validated_reusable_context(
+        self, payload: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
         """Return the last published context only when every hash agrees.
 
         ``current.json`` is a cache, not proof of publication. The checkpoint
@@ -240,21 +315,36 @@ class CheckpointEngine:
         ``current.md`` must all describe the same successful context.
         """
 
-        if not payload or payload.get("status") not in {"committed", "committed_with_pending_derivations"}:
+        if not payload or payload.get("status") not in {
+            "committed",
+            "committed_with_pending_derivations",
+        }:
             return None
         content_commit = payload.get("content_commit") or payload.get("git_commit")
         checkpoint_id = payload.get("checkpoint_id") or payload.get("id")
-        if not isinstance(content_commit, str) or not content_commit or not isinstance(checkpoint_id, str):
+        if (
+            not isinstance(content_commit, str)
+            or not content_commit
+            or not isinstance(checkpoint_id, str)
+        ):
             return None
         context_json_path = self.workspace.state_path("context/current.json")
         context_md_path = self.workspace.state_path("context/current.md")
-        receipt_path = self.workspace.state_path(f"checkpoints/{checkpoint_id}/receipt.json")
+        receipt_path = self.workspace.state_path(
+            f"checkpoints/{checkpoint_id}/receipt.json"
+        )
         try:
             bundle = self.workspace.load_json("context/current.json")
-            receipt = self.workspace.load_json(f"checkpoints/{checkpoint_id}/receipt.json")
+            receipt = self.workspace.load_json(
+                f"checkpoints/{checkpoint_id}/receipt.json"
+            )
         except Exception:
             return None
-        if not context_json_path.is_file() or not context_md_path.is_file() or not receipt_path.is_file():
+        if (
+            not context_json_path.is_file()
+            or not context_md_path.is_file()
+            or not receipt_path.is_file()
+        ):
             return None
         if not isinstance(bundle, dict) or not isinstance(receipt, dict):
             return None
@@ -262,17 +352,29 @@ class CheckpointEngine:
         if not isinstance(content_hash, str) or not content_hash:
             return None
         try:
-            actual_hash = "sha256:" + hashlib.sha256(context_md_path.read_bytes()).hexdigest()
+            actual_hash = (
+                "sha256:" + hashlib.sha256(context_md_path.read_bytes()).hexdigest()
+            )
         except OSError:
             return None
-        if actual_hash != content_hash or bundle.get("source_commit") != content_commit or bundle.get("memory_commit") != content_commit:
+        if (
+            actual_hash != content_hash
+            or bundle.get("source_commit") != content_commit
+            or bundle.get("memory_commit") != content_commit
+        ):
             return None
         publication = receipt.get("context_publication")
-        if not isinstance(publication, dict) or publication.get("status") != "completed":
+        if (
+            not isinstance(publication, dict)
+            or publication.get("status") != "completed"
+        ):
             return None
         if publication.get("content_hash") != content_hash:
             return None
-        if receipt.get("content_commit") != content_commit and receipt.get("git_commit") != content_commit:
+        if (
+            receipt.get("content_commit") != content_commit
+            and receipt.get("git_commit") != content_commit
+        ):
             return None
         return {"content_commit": content_commit, "bundle": bundle}
 
@@ -281,7 +383,10 @@ class CheckpointEngine:
             records = list(self.workspace.repository.iter_records("checkpoints"))
             for record in reversed(records):
                 payload = record.get("payload", {})
-                if payload.get("status") in {"committed", "committed_with_pending_derivations"}:
+                if payload.get("status") in {
+                    "committed",
+                    "committed_with_pending_derivations",
+                }:
                     return {**payload, "checkpoint_id": record.get("id")}
         except Exception:
             return None

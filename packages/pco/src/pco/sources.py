@@ -42,13 +42,44 @@ def content_hash(content: str) -> str:
 
 
 def _validate_locator(locator: str) -> str:
-    ensure(isinstance(locator, str) and locator.strip(), "SOURCE_LOCATOR_INVALID", "source", "Source locator must be a non-empty string")
+    ensure(
+        isinstance(locator, str) and locator.strip(),
+        "SOURCE_LOCATOR_INVALID",
+        "source",
+        "Source locator must be a non-empty string",
+        canonical_changed=False,
+        retry_safe=False,
+    )
     parsed = urlparse(locator)
-    ensure(parsed.scheme and parsed.scheme not in {"data", "javascript"}, "SOURCE_LOCATOR_INVALID", "source", "Source locator must use a supported URI scheme", value=locator)
+    ensure(
+        parsed.scheme and parsed.scheme not in {"data", "javascript"},
+        "SOURCE_LOCATOR_INVALID",
+        "source",
+        "Source locator must use a supported URI scheme",
+        value=locator,
+        canonical_changed=False,
+        retry_safe=False,
+    )
     if parsed.scheme == "file":
-        ensure(parsed.path, "SOURCE_LOCATOR_INVALID", "source", "File locator must include a path", value=locator)
+        ensure(
+            parsed.path,
+            "SOURCE_LOCATOR_INVALID",
+            "source",
+            "File locator must include a path",
+            value=locator,
+            canonical_changed=False,
+            retry_safe=False,
+        )
     elif parsed.scheme in {"http", "https"}:
-        ensure(parsed.netloc, "SOURCE_LOCATOR_INVALID", "source", "HTTP(S) locator must include a host", value=locator)
+        ensure(
+            parsed.netloc,
+            "SOURCE_LOCATOR_INVALID",
+            "source",
+            "HTTP(S) locator must include a host",
+            value=locator,
+            canonical_changed=False,
+            retry_safe=False,
+        )
     return locator
 
 
@@ -57,9 +88,25 @@ def read_local_file(locator: str) -> SourceRead:
 
     _validate_locator(locator)
     parsed = urlparse(locator)
-    ensure(parsed.scheme == "file", "SOURCE_READER_LOCATOR_MISMATCH", "source", "The local reader only accepts file locators", value=locator)
+    ensure(
+        parsed.scheme == "file",
+        "SOURCE_READER_LOCATOR_MISMATCH",
+        "source",
+        "The local reader only accepts file locators",
+        value=locator,
+        canonical_changed=False,
+        retry_safe=False,
+    )
     path = Path(unquote(parsed.path))
-    ensure(path.is_file(), "SOURCE_NOT_READABLE", "source", f"Registered source is unavailable: {path}", value=str(path))
+    ensure(
+        path.is_file(),
+        "SOURCE_NOT_READABLE",
+        "source",
+        f"Registered source is unavailable: {path}",
+        value=str(path),
+        canonical_changed=False,
+        retry_safe=False,
+    )
     raw_content = path.read_text(encoding="utf-8")
     media_type = mimetypes.guess_type(path.name)[0] or "text/plain"
     return {
@@ -96,14 +143,39 @@ class ReaderRegistry:
 
         result = cls()
         for name, target in profile.raw.get("source_readers", {}).items():
-            reader = target if callable(target) else profile.registry.resolve(str(target))
+            reader = (
+                target if callable(target) else profile.registry.resolve(str(target))
+            )
             result.register(str(name), reader)
         return result
 
     def register(self, name: str, reader: SourceReader) -> None:
-        ensure(isinstance(name, str) and name.strip(), "SOURCE_READER_INVALID", "source", "Reader name must be non-empty")
-        ensure(callable(reader), "SOURCE_READER_INVALID", "source", f"Reader is not callable: {name}", value=name)
-        ensure(name not in self._readers, "SOURCE_READER_DUPLICATE", "source", f"Reader is already registered: {name}", value=name)
+        ensure(
+            isinstance(name, str) and name.strip(),
+            "SOURCE_READER_INVALID",
+            "source",
+            "Reader name must be non-empty",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            callable(reader),
+            "SOURCE_READER_INVALID",
+            "source",
+            f"Reader is not callable: {name}",
+            value=name,
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            name not in self._readers,
+            "SOURCE_READER_DUPLICATE",
+            "source",
+            f"Reader is already registered: {name}",
+            value=name,
+            canonical_changed=False,
+            retry_safe=False,
+        )
         self._readers[name] = reader
 
     def resolve(self, name: str) -> SourceReader:
@@ -115,20 +187,83 @@ class ReaderRegistry:
                 "source",
                 f"No registered reader named {name}",
                 value=name,
-                retryable=True,
+                canonical_changed=False,
+                retry_safe=True,
                 recovery=["Register the source reader before materializing the source"],
             ) from exc
 
     def read(self, *, reader: str, locator: str) -> SourceRead:
         result = self.resolve(reader)(locator)
-        ensure(isinstance(result, Mapping), "SOURCE_READER_CONTRACT_INVALID", "source", "Source reader must return a mapping", value=reader)
-        required = {"locator", "reader", "normalized_content", "media_type", "read_metadata"}
-        ensure(set(result) == required, "SOURCE_READER_CONTRACT_INVALID", "source", "Source reader returned fields outside the materialization contract", value={"reader": reader, "fields": sorted(result)})
-        ensure(isinstance(result["locator"], str), "SOURCE_READER_CONTRACT_INVALID", "source", "Reader locator must be a string", value=reader)
-        ensure(isinstance(result["reader"], str) and result["reader"] == reader, "SOURCE_READER_CONTRACT_INVALID", "source", "Reader must identify itself with its registry name", value=reader)
-        ensure(isinstance(result["normalized_content"], str), "SOURCE_READER_CONTRACT_INVALID", "source", "Reader content must be text", value=reader)
-        ensure(isinstance(result["media_type"], str) and result["media_type"].strip(), "SOURCE_READER_CONTRACT_INVALID", "source", "Reader media_type must be non-empty", value=reader)
-        ensure(isinstance(result["read_metadata"], Mapping), "SOURCE_READER_CONTRACT_INVALID", "source", "Reader read_metadata must be a mapping", value=reader)
+        ensure(
+            isinstance(result, Mapping),
+            "SOURCE_READER_CONTRACT_INVALID",
+            "source",
+            "Source reader must return a mapping",
+            value=reader,
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        required = {
+            "locator",
+            "reader",
+            "normalized_content",
+            "media_type",
+            "read_metadata",
+        }
+        ensure(
+            set(result) == required,
+            "SOURCE_READER_CONTRACT_INVALID",
+            "source",
+            "Source reader returned fields outside the materialization contract",
+            value={"reader": reader, "fields": sorted(result)},
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            isinstance(result["locator"], str),
+            "SOURCE_READER_CONTRACT_INVALID",
+            "source",
+            "Reader locator must be a string",
+            value=reader,
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            isinstance(result["reader"], str) and result["reader"] == reader,
+            "SOURCE_READER_CONTRACT_INVALID",
+            "source",
+            "Reader must identify itself with its registry name",
+            value=reader,
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            isinstance(result["normalized_content"], str),
+            "SOURCE_READER_CONTRACT_INVALID",
+            "source",
+            "Reader content must be text",
+            value=reader,
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            isinstance(result["media_type"], str) and result["media_type"].strip(),
+            "SOURCE_READER_CONTRACT_INVALID",
+            "source",
+            "Reader media_type must be non-empty",
+            value=reader,
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            isinstance(result["read_metadata"], Mapping),
+            "SOURCE_READER_CONTRACT_INVALID",
+            "source",
+            "Reader read_metadata must be a mapping",
+            value=reader,
+            canonical_changed=False,
+            retry_safe=False,
+        )
         return {
             "locator": result["locator"],
             "reader": result["reader"],
@@ -139,9 +274,13 @@ class ReaderRegistry:
 
 
 class SourceManager:
-    def __init__(self, workspace: Workspace, reader_registry: ReaderRegistry | None = None) -> None:
+    def __init__(
+        self, workspace: Workspace, reader_registry: ReaderRegistry | None = None
+    ) -> None:
         self.workspace = workspace
-        self.reader_registry = reader_registry or ReaderRegistry.from_profile(workspace.profile)
+        self.reader_registry = reader_registry or ReaderRegistry.from_profile(
+            workspace.profile
+        )
 
     def register_reader(self, name: str, reader: SourceReader) -> None:
         """Register a wrapper-owned reader without changing the Profile."""
@@ -159,7 +298,10 @@ class SourceManager:
     ) -> dict[str, Any]:
         _validate_locator(locator)
         for record in self.workspace.repository.current_records("sources").values():
-            if record["payload"].get("locator") == locator and record["payload"].get("status") == "active":
+            if (
+                record["payload"].get("locator") == locator
+                and record["payload"].get("status") == "active"
+            ):
                 existing = record["payload"]
                 same_registration = (
                     existing.get("reader_skill") == reader_skill
@@ -178,9 +320,18 @@ class SourceManager:
                             "provider": existing.get("provider"),
                             "name": existing.get("display_name"),
                         },
-                        "requested": {"reader": reader_skill, "provider": provider, "name": display_name},
+                        "requested": {
+                            "reader": reader_skill,
+                            "provider": provider,
+                            "name": display_name,
+                        },
                     },
-                    recovery=["Reuse the existing source registration", "Choose a different locator"],
+                    recovery=[
+                        "Reuse the existing source registration",
+                        "Choose a different locator",
+                    ],
+                    canonical_changed=False,
+                    retry_safe=False,
                 )
                 return {
                     "ok": True,
@@ -207,24 +358,49 @@ class SourceManager:
                 "locator": locator,
                 "display_name": display_name,
                 "reader_skill": reader_skill,
-                "snapshot_path": snapshot_path or f"sources/snapshots/{source_id}{suffix}",
+                "snapshot_path": snapshot_path
+                or f"sources/snapshots/{source_id}{suffix}",
                 "content_hash": None,
                 "registered_at": utc_now(),
                 "status": "active",
             },
         }
-        manager = TransactionManager(self.workspace.repository, self.workspace.config.state_root)
+        manager = TransactionManager(
+            self.workspace.repository, self.workspace.config.state_root
+        )
         state = manager.begin(
             transaction_id=f"txn_source_{uuid.uuid4().hex}",
-            fingerprint_context={"kind": "source_register", "locator": locator, "reader": reader_skill},
+            fingerprint_context={
+                "kind": "source_register",
+                "locator": locator,
+                "reader": reader_skill,
+            },
         )
-        manager.append(state.id, Operation(op="append", stream="sources", record=record))
+        manager.append(
+            state.id, Operation(op="append", stream="sources", record=record)
+        )
         result = manager.commit(state.id)
-        return {"ok": True, "idempotent": False, "source_id": source_id, "commit": result["commit"], "record": record}
+        return {
+            "ok": True,
+            "idempotent": False,
+            "source_id": source_id,
+            "commit": result["commit"],
+            "record": record,
+        }
 
-    def register_local(self, path: Path, *, display_name: str | None = None) -> dict[str, Any]:
+    def register_local(
+        self, path: Path, *, display_name: str | None = None
+    ) -> dict[str, Any]:
         source = path.resolve()
-        ensure(source.is_file(), "SOURCE_NOT_READABLE", "source", f"Source is not a readable file: {source}", value=str(source))
+        ensure(
+            source.is_file(),
+            "SOURCE_NOT_READABLE",
+            "source",
+            f"Source is not a readable file: {source}",
+            value=str(source),
+            canonical_changed=False,
+            retry_safe=False,
+        )
         return self._register_locator(
             source.as_uri(),
             reader_skill="local-readonly",
@@ -245,7 +421,15 @@ class SourceManager:
 
         _validate_locator(locator)
         parsed = urlparse(locator)
-        ensure(parsed.scheme != "file", "SOURCE_USE_REGISTER_LOCAL", "source", "Use register_local for file locators", value=locator)
+        ensure(
+            parsed.scheme != "file",
+            "SOURCE_USE_REGISTER_LOCAL",
+            "source",
+            "Use register_local for file locators",
+            value=locator,
+            canonical_changed=False,
+            retry_safe=False,
+        )
         return self._register_locator(
             locator,
             reader_skill=reader_skill,
@@ -279,12 +463,31 @@ class SourceManager:
         payload = record.get("payload", {})
         locator = _validate_locator(payload.get("locator", ""))
         reader_name = payload.get("reader_skill")
-        ensure(isinstance(reader_name, str) and reader_name, "SOURCE_READER_REQUIRED", "source", "Source record has no reader_skill", record_id=record.get("id"))
+        ensure(
+            isinstance(reader_name, str) and reader_name,
+            "SOURCE_READER_REQUIRED",
+            "source",
+            "Source record has no reader_skill",
+            record_id=record.get("id"),
+            canonical_changed=False,
+            retry_safe=False,
+        )
         materialized = self.reader_registry.read(reader=reader_name, locator=locator)
-        ensure(materialized["locator"] == locator, "SOURCE_READER_CONTRACT_INVALID", "source", "Reader returned a different locator", record_id=record.get("id"), value=materialized["locator"])
+        ensure(
+            materialized["locator"] == locator,
+            "SOURCE_READER_CONTRACT_INVALID",
+            "source",
+            "Reader returned a different locator",
+            record_id=record.get("id"),
+            value=materialized["locator"],
+            canonical_changed=False,
+            retry_safe=False,
+        )
         # Readers may normalize for their own API, but the wrapper owns the
         # canonical normalization boundary before hashing and diffing.
-        materialized["normalized_content"] = normalize_text(materialized["normalized_content"])
+        materialized["normalized_content"] = normalize_text(
+            materialized["normalized_content"]
+        )
         _validate_locator(materialized["locator"])
         return materialized
 
@@ -309,7 +512,11 @@ class SourceManager:
                 continue
             snapshot_path = record["payload"]["snapshot_path"]
             previous_path = self.workspace.config.memory_root / snapshot_path
-            previous = previous_path.read_text(encoding="utf-8") if previous_path.exists() else ""
+            previous = (
+                previous_path.read_text(encoding="utf-8")
+                if previous_path.exists()
+                else ""
+            )
             diff = "".join(
                 difflib.unified_diff(
                     previous.splitlines(keepends=True),
@@ -341,7 +548,12 @@ class SourceManager:
                     "source_revision": updated["revision"],
                 }
             )
-        return {"ok": True, "changes": changes, "operations": operations, "source_hashes": source_hashes}
+        return {
+            "ok": True,
+            "changes": changes,
+            "operations": operations,
+            "source_hashes": source_hashes,
+        }
 
 
 # Descriptive alias for integrations that use the registry as a public PCO

@@ -12,7 +12,6 @@ from mem_core.errors import MemError
 from .backlinks import build as build_backlinks
 from .repo_loader import repository_at, resolve_derivation_source_commit
 
-
 STREAM_TITLES = {
     "events": "事件",
     "psychologies": "心理概念",
@@ -27,12 +26,26 @@ ENTITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def _projection_path(target_root: Path, stream: str, entity_id: str) -> Path:
-    if not ENTITY_ID_PATTERN.fullmatch(entity_id) or not ENTITY_ID_PATTERN.fullmatch(stream):
-        raise MemError("PROJECTION_ENTITY_ID_UNSAFE", "projection", entity_id)
+    if not ENTITY_ID_PATTERN.fullmatch(entity_id) or not ENTITY_ID_PATTERN.fullmatch(
+        stream
+    ):
+        raise MemError(
+            "PROJECTION_ENTITY_ID_UNSAFE",
+            "projection",
+            entity_id,
+            canonical_changed=False,
+            retry_safe=False,
+        )
     root = target_root.resolve()
     candidate = (root / stream / f"{entity_id}.md").resolve()
     if root not in candidate.parents:
-        raise MemError("PROJECTION_PATH_ESCAPE", "projection", str(candidate))
+        raise MemError(
+            "PROJECTION_PATH_ESCAPE",
+            "projection",
+            str(candidate),
+            canonical_changed=False,
+            retry_safe=False,
+        )
     return candidate
 
 
@@ -44,7 +57,12 @@ def _load_mapping(path: Path) -> dict[str, Any]:
 
 def _record_title(stream: str, record: dict[str, Any]) -> str:
     payload = record["payload"]
-    return payload.get("name") or payload.get("description") or payload.get("statement") or record["id"]
+    return (
+        payload.get("name")
+        or payload.get("description")
+        or payload.get("statement")
+        or record["id"]
+    )
 
 
 def _page(
@@ -56,9 +74,17 @@ def _page(
 ) -> dict[str, Any]:
     latest = history[-1]
     title = _record_title(stream, latest)
-    lines = [f"# {title}", "", f"PCO entity ID: `{record_id}`", f"Stream: `{stream}`", ""]
+    lines = [
+        f"# {title}",
+        "",
+        f"PCO entity ID: `{record_id}`",
+        f"Stream: `{stream}`",
+        "",
+    ]
     for record in history:
-        lines.extend([f"## Revision {record['revision']} · {record['recorded_at']}", ""])
+        lines.extend(
+            [f"## Revision {record['revision']} · {record['recorded_at']}", ""]
+        )
         payload = record["payload"]
         for key, value in payload.items():
             if key == "sections":
@@ -68,7 +94,13 @@ def _page(
                     lines.append("")
             elif isinstance(value, list):
                 lines.extend([f"### {key}", ""])
-                lines.extend([f"- {json.dumps(entry, ensure_ascii=False) if isinstance(entry, dict) else entry}" for entry in value] or ["- 无"])
+                lines.extend(
+                    [
+                        f"- {json.dumps(entry, ensure_ascii=False) if isinstance(entry, dict) else entry}"
+                        for entry in value
+                    ]
+                    or ["- 无"]
+                )
                 lines.append("")
             elif key == "links" and isinstance(value, dict):
                 lines.extend(["### links", ""])
@@ -79,7 +111,16 @@ def _page(
                     lines.append("- 无")
                 lines.append("")
             elif isinstance(value, dict):
-                lines.extend([f"### {key}", "", "```json", json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), "```", ""])
+                lines.extend(
+                    [
+                        f"### {key}",
+                        "",
+                        "```json",
+                        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
+                        "```",
+                        "",
+                    ]
+                )
             else:
                 lines.extend([f"- **{key}**: {value}", ""])
     if stream == "checkpoints":
@@ -93,18 +134,35 @@ def _page(
                     lines.extend([f"- {entry}" for entry in value] or ["- 无"])
                     lines.append("")
                 else:
-                    lines.extend([f"- **{key}**: {json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value}", ""])
+                    lines.extend(
+                        [
+                            f"- **{key}**: {json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value}",
+                            "",
+                        ]
+                    )
     related = backlinks.get(record_id, [])
     if related:
         lines.extend(["## Backlinks", ""])
         lines.extend(
-            [f"- [{item['source_stream']}:{item['source_id']}](pco://{item['source_id']}) · {item['relation']}" for item in related]
+            [
+                f"- [{item['source_stream']}:{item['source_id']}](pco://{item['source_id']}) · {item['relation']}"
+                for item in related
+            ]
         )
         lines.append("")
-    return {"entity_id": record_id, "stream": stream, "title": title, "content": "\n".join(lines).rstrip() + "\n"}
+    return {
+        "entity_id": record_id,
+        "stream": stream,
+        "title": title,
+        "content": "\n".join(lines).rstrip() + "\n",
+    }
 
 
-def _pages(repository: MemoryRepository, backlink_map: dict[str, Any] | None = None, memory_commit: str | None = None) -> list[dict[str, Any]]:
+def _pages(
+    repository: MemoryRepository,
+    backlink_map: dict[str, Any] | None = None,
+    memory_commit: str | None = None,
+) -> list[dict[str, Any]]:
     records = repository.records_by_stream()
     if backlink_map is None:
         backlink_map = build_backlinks(repo_root=repository.root)["current_backlinks"]
@@ -125,9 +183,17 @@ def _pages(repository: MemoryRepository, backlink_map: dict[str, Any] | None = N
             pages.append(page)
             indexes[stream].append((page["title"], record_id))
     for stream, label in STREAM_TITLES.items():
-        lines = [f"# {label}索引", "", f"Canonical commit: `{memory_commit or repository.head()}`", ""]
+        lines = [
+            f"# {label}索引",
+            "",
+            f"Canonical commit: `{memory_commit or repository.head()}`",
+            "",
+        ]
         lines.extend(
-            [f"- [{title}](pco://{entity_id})" for title, entity_id in sorted(indexes[stream])]
+            [
+                f"- [{title}](pco://{entity_id})"
+                for title, entity_id in sorted(indexes[stream])
+            ]
             or ["- 暂无记录"]
         )
         pages.append(
@@ -139,9 +205,21 @@ def _pages(repository: MemoryRepository, backlink_map: dict[str, Any] | None = N
             }
         )
     meta = repository.current_records("meta_revisions").get("meta_current")
-    home = ["# PCO 首页", "", f"Canonical commit: `{memory_commit or repository.head()}`", ""]
+    home = [
+        "# PCO 首页",
+        "",
+        f"Canonical commit: `{memory_commit or repository.head()}`",
+        "",
+    ]
     if meta:
-        home.extend([f"## 当前人格侧写 · revision {meta['revision']}", "", meta["payload"]["change_summary"], ""])
+        home.extend(
+            [
+                f"## 当前人格侧写 · revision {meta['revision']}",
+                "",
+                meta["payload"]["change_summary"],
+                "",
+            ]
+        )
         for section, values in meta["payload"]["sections"].items():
             home.extend([f"### {section}", ""])
             home.extend([f"- {value}" for value in values] or ["- 无"])
@@ -150,46 +228,106 @@ def _pages(repository: MemoryRepository, backlink_map: dict[str, Any] | None = N
         home.extend(["## 当前人格侧写", "", "尚无已批准的 Meta-memory。", ""])
     for stream, label in STREAM_TITLES.items():
         home.extend([f"## [{label}](pco://index_{stream})", ""])
-        home.extend([f"- [{title}](pco://{entity_id})" for title, entity_id in sorted(indexes[stream])] or ["- 暂无记录"])
+        home.extend(
+            [
+                f"- [{title}](pco://{entity_id})"
+                for title, entity_id in sorted(indexes[stream])
+            ]
+            or ["- 暂无记录"]
+        )
         home.append("")
-    pages.insert(0, {"entity_id": "pco_home", "stream": "home", "title": "PCO 首页", "content": "\n".join(home).rstrip() + "\n"})
+    pages.insert(
+        0,
+        {
+            "entity_id": "pco_home",
+            "stream": "home",
+            "title": "PCO 首页",
+            "content": "\n".join(home).rstrip() + "\n",
+        },
+    )
     return pages
 
 
-def project_markdown(*, repo_root: Path, output_root: str | Path, source_commit: str | None = None, state_root: str | Path | None = None, **_: Any) -> dict[str, Any]:
+def project_markdown(
+    *,
+    repo_root: Path,
+    output_root: str | Path,
+    source_commit: str | None = None,
+    state_root: str | Path | None = None,
+    **_: Any,
+) -> dict[str, Any]:
     source_root = Path(repo_root)
-    commit = resolve_derivation_source_commit(source_root, state_root=state_root or source_root.parent / "state", source_commit=source_commit)
-    backlink_map = build_backlinks(repo_root=source_root, source_commit=commit, state_root=state_root)["current_backlinks"]
+    commit = resolve_derivation_source_commit(
+        source_root,
+        state_root=state_root or source_root.parent / "state",
+        source_commit=source_commit,
+    )
+    backlink_map = build_backlinks(
+        repo_root=source_root, source_commit=commit, state_root=state_root
+    )["current_backlinks"]
     with repository_at(source_root, commit) as repository:
-        return _project_markdown_repository(repository, Path(output_root), commit, backlink_map)
+        return _project_markdown_repository(
+            repository, Path(output_root), commit, backlink_map
+        )
 
 
-def _project_markdown_repository(repository: Any, target_root: Path, commit: str, backlink_map: dict[str, Any]) -> dict[str, Any]:
+def _project_markdown_repository(
+    repository: Any, target_root: Path, commit: str, backlink_map: dict[str, Any]
+) -> dict[str, Any]:
     mapping_path = target_root / ".pco-projection.json"
     mapping = _load_mapping(mapping_path)
     if mapping.get("commits", {}).get(commit) == "complete":
-        return {"ok": True, "idempotent": True, "target": "markdown", "memory_commit": commit, "pages": 0}
+        return {
+            "ok": True,
+            "idempotent": True,
+            "target": "markdown",
+            "memory_commit": commit,
+            "pages": 0,
+        }
     pages = _pages(repository, backlink_map, commit)
-    paths = {page["entity_id"]: _projection_path(target_root, page["stream"], page["entity_id"]) for page in pages}
+    paths = {
+        page["entity_id"]: _projection_path(
+            target_root, page["stream"], page["entity_id"]
+        )
+        for page in pages
+    }
     for page in pages:
         directory = paths[page["entity_id"]].parent
         directory.mkdir(parents=True, exist_ok=True)
         path = paths[page["entity_id"]]
         content = re.sub(
             r"pco://([A-Za-z0-9_.-]+)",
-            lambda match: Path(os.path.relpath(paths[match.group(1)], start=path.parent)).as_posix()
-            if match.group(1) in paths
-            else match.group(0),
+            lambda match: (
+                Path(
+                    os.path.relpath(paths[match.group(1)], start=path.parent)
+                ).as_posix()
+                if match.group(1) in paths
+                else match.group(0)
+            ),
             page["content"],
         )
         path.write_text(content, encoding="utf-8")
-        mapping["entities"][page["entity_id"]] = {"target_id": str(path), "stream": page["stream"], "last_commit": commit}
+        mapping["entities"][page["entity_id"]] = {
+            "target_id": str(path),
+            "stream": page["stream"],
+            "last_commit": commit,
+        }
     mapping.setdefault("commits", {})[commit] = "complete"
     mapping_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = mapping_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(mapping, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.write_text(
+        json.dumps(mapping, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     temporary.replace(mapping_path)
-    return {"ok": True, "idempotent": False, "target": "markdown", "memory_commit": commit, "pages": len(pages), "output_root": str(target_root)}
+    return {
+        "ok": True,
+        "idempotent": False,
+        "target": "markdown",
+        "memory_commit": commit,
+        "pages": len(pages),
+        "output_root": str(target_root),
+    }
 
 
 def project_affine(
@@ -207,24 +345,50 @@ def project_affine(
     CRDT/Yjs behavior outside canonical memory and mem-core.
     """
     source_root = Path(repo_root)
-    commit = resolve_derivation_source_commit(source_root, state_root=state_root, source_commit=source_commit)
-    backlink_map = build_backlinks(repo_root=source_root, source_commit=commit, state_root=state_root)["current_backlinks"]
+    commit = resolve_derivation_source_commit(
+        source_root, state_root=state_root, source_commit=source_commit
+    )
+    backlink_map = build_backlinks(
+        repo_root=source_root, source_commit=commit, state_root=state_root
+    )["current_backlinks"]
     with repository_at(source_root, commit) as repository:
-        return _project_affine_repository(repository, Path(state_root), command, commit, backlink_map)
+        return _project_affine_repository(
+            repository, Path(state_root), command, commit, backlink_map
+        )
 
 
-def _project_affine_repository(repository: Any, state_root: Path, command: str | None, commit: str, backlink_map: dict[str, Any]) -> dict[str, Any]:
+def _project_affine_repository(
+    repository: Any,
+    state_root: Path,
+    command: str | None,
+    commit: str,
+    backlink_map: dict[str, Any],
+) -> dict[str, Any]:
     state = Path(state_root) / "affine"
     mapping_path = state / "mapping.json"
     outbox_path = state / "outbox" / f"{commit}.json"
     mapping = _load_mapping(mapping_path)
     if mapping.get("commits", {}).get(commit) == "complete":
-        return {"ok": True, "idempotent": True, "target": "affine", "memory_commit": commit, "pages": 0}
+        return {
+            "ok": True,
+            "idempotent": True,
+            "target": "affine",
+            "memory_commit": commit,
+            "pages": 0,
+        }
     pages = _pages(repository, backlink_map, commit)
-    request = {"operation": "upsert_pages", "memory_commit": commit, "pages": pages, "mapping": mapping.get("entities", {})}
+    request = {
+        "operation": "upsert_pages",
+        "memory_commit": commit,
+        "pages": pages,
+        "mapping": mapping.get("entities", {}),
+    }
     outbox_path.parent.mkdir(parents=True, exist_ok=True)
     outbox_temporary = outbox_path.with_suffix(".tmp")
-    outbox_temporary.write_text(json.dumps(request, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    outbox_temporary.write_text(
+        json.dumps(request, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     outbox_temporary.replace(outbox_path)
     bridge = command or os.getenv("PCO_AFFINE_COMMAND")
     if not bridge:
@@ -235,7 +399,15 @@ def _project_affine_repository(repository: Any, state_root: Path, command: str |
             "memory_commit": commit,
             "pages": len(pages),
             "outbox": str(outbox_path),
-            "error": {"code": "AFFINE_BRIDGE_NOT_CONFIGURED", "retryable": True, "recovery": ["Set PCO_AFFINE_COMMAND to an AFFiNE bridge CLI", "Use the Markdown projection target"]},
+            "error": {
+                "code": "AFFINE_BRIDGE_NOT_CONFIGURED",
+                "canonical_changed": False,
+                "retry_safe": True,
+                "recovery": [
+                    "Set PCO_AFFINE_COMMAND to an AFFiNE bridge CLI",
+                    "Use the Markdown projection target",
+                ],
+            },
         }
     try:
         result = subprocess.run(
@@ -253,7 +425,11 @@ def _project_affine_repository(repository: Any, state_root: Path, command: str |
             "target": "affine",
             "memory_commit": commit,
             "outbox": str(outbox_path),
-            "error": {"code": "AFFINE_SYNC_TIMEOUT", "retryable": True},
+            "error": {
+                "code": "AFFINE_SYNC_TIMEOUT",
+                "canonical_changed": False,
+                "retry_safe": True,
+            },
         }
     if result.returncode:
         diagnostic_path = state / "logs" / f"{commit}.log"
@@ -270,13 +446,20 @@ def _project_affine_repository(repository: Any, state_root: Path, command: str |
                 "code": "AFFINE_SYNC_FAILED",
                 "message": f"AFFiNE bridge exited with code {result.returncode}",
                 "diagnostic_path": str(diagnostic_path),
-                "retryable": True,
+                "canonical_changed": False,
+                "retry_safe": True,
             },
         }
     try:
         response = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise MemError("AFFINE_BRIDGE_INVALID_RESPONSE", "projection", str(exc), retryable=True) from exc
+        raise MemError(
+            "AFFINE_BRIDGE_INVALID_RESPONSE",
+            "projection",
+            str(exc),
+            canonical_changed=False,
+            retry_safe=True,
+        ) from exc
     response_mapping = response.get("mapping", {})
     expected_ids = {page["entity_id"] for page in pages}
     valid = (
@@ -284,21 +467,38 @@ def _project_affine_repository(repository: Any, state_root: Path, command: str |
         and response.get("memory_commit") == commit
         and isinstance(response_mapping, dict)
         and expected_ids.issubset(response_mapping)
-        and all(isinstance(response_mapping[entity_id], str) and response_mapping[entity_id] for entity_id in expected_ids)
+        and all(
+            isinstance(response_mapping[entity_id], str) and response_mapping[entity_id]
+            for entity_id in expected_ids
+        )
     )
     if not valid:
         raise MemError(
             "AFFINE_BRIDGE_INVALID_RESPONSE",
             "projection",
             "Bridge must acknowledge the same memory commit and map every requested entity",
-            retryable=True,
+            canonical_changed=False,
+            retry_safe=True,
         )
     for entity_id, target_id in response_mapping.items():
         existing = mapping["entities"].get(entity_id, {})
-        mapping["entities"][entity_id] = {**existing, "target_id": target_id, "last_commit": commit}
+        mapping["entities"][entity_id] = {
+            **existing,
+            "target_id": target_id,
+            "last_commit": commit,
+        }
     mapping.setdefault("commits", {})[commit] = "complete"
     mapping_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = mapping_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(mapping, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.write_text(
+        json.dumps(mapping, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     temporary.replace(mapping_path)
-    return {"ok": True, "idempotent": False, "target": "affine", "memory_commit": commit, "pages": len(pages)}
+    return {
+        "ok": True,
+        "idempotent": False,
+        "target": "affine",
+        "memory_commit": commit,
+        "pages": len(pages),
+    }

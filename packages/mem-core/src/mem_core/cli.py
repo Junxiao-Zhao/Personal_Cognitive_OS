@@ -26,7 +26,9 @@ def _input(args: argparse.Namespace) -> dict[str, Any]:
     return {}
 
 
-def _common(args: argparse.Namespace) -> tuple[Profile, MemoryRepository, TransactionManager]:
+def _common(
+    args: argparse.Namespace,
+) -> tuple[Profile, MemoryRepository, TransactionManager]:
     profile = Profile.load(Path(args.profile), default_registry())
     repository = MemoryRepository(Path(args.repo), profile)
     manager = TransactionManager(repository, Path(args.state))
@@ -91,12 +93,20 @@ def _add_input(parser: argparse.ArgumentParser) -> None:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     profile, repository, manager = _common(args)
     if args.command == "init":
-        return {"ok": True, "commit": repository.init(), "profile": f"{profile.name}@{profile.version}"}
+        return {
+            "ok": True,
+            "commit": repository.init(),
+            "profile": f"{profile.name}@{profile.version}",
+        }
     if args.command == "doctor":
         return repository.verify()
     if args.command == "profile":
         if args.profile_command == "describe":
-            return {"ok": True, "profile": profile.raw, "policy_hash": profile.policy_hash}
+            return {
+                "ok": True,
+                "profile": profile.raw,
+                "policy_hash": profile.policy_hash,
+            }
         if args.profile_command == "validate":
             return repository.validate_all()
         payload = _input(args)
@@ -105,13 +115,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "record":
         history = repository.record_history(args.stream, args.id)
         if args.record_command == "history":
-            return {"ok": True, "stream": args.stream, "id": args.id, "records": history}
+            return {
+                "ok": True,
+                "stream": args.stream,
+                "id": args.id,
+                "records": history,
+            }
         if not history:
-            raise MemError("RECORD_NOT_FOUND", "record", f"Record not found: {args.id}", stream=args.stream, record_id=args.id)
+            raise MemError(
+                "RECORD_NOT_FOUND",
+                "record",
+                f"Record not found: {args.id}",
+                stream=args.stream,
+                record_id=args.id,
+                canonical_changed=False,
+                retry_safe=False,
+            )
         return {"ok": True, "stream": args.stream, "record": history[-1]}
     if args.command == "txn":
         if args.txn_command == "begin":
-            state = manager.begin(fingerprint_context=_input(args), transaction_id=args.id)
+            state = manager.begin(
+                fingerprint_context=_input(args), transaction_id=args.id
+            )
             return {"ok": True, "transaction": state.model_dump(mode="json")}
         if args.txn_command == "append":
             state = manager.append(args.id, Operation.model_validate(_input(args)))
@@ -134,7 +159,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return manager.status(args.id)
     if args.command == "git" and args.git_command == "verify":
         return repository.verify()
-    raise MemError("COMMAND_INVALID", "cli", "Unsupported command")
+    raise MemError(
+        "COMMAND_INVALID",
+        "cli",
+        "Unsupported command",
+        canonical_changed=False,
+        retry_safe=False,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -144,7 +175,9 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(exc.as_dict(), ensure_ascii=False, separators=(",", ":")))
         raise SystemExit(1) from None
     except Exception as exc:
-        result = MemError("UNEXPECTED", "cli", str(exc)).as_dict()
+        result = MemError(
+            "UNEXPECTED", "cli", str(exc), canonical_changed=False, retry_safe=False
+        ).as_dict()
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
         raise SystemExit(1) from None
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))

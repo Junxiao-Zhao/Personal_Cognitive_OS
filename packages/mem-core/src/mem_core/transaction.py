@@ -13,7 +13,13 @@ from .application import (
     rmdir_if_empty,
 )
 from .approval import verify_approval_receipt
-from .delta import is_fast_path, latest_base_by_id, show_bytes, validate_delta_records, validate_structured_delta
+from .delta import (
+    is_fast_path,
+    latest_base_by_id,
+    show_bytes,
+    validate_delta_records,
+    validate_structured_delta,
+)
 from .errors import MemError, ensure
 from .models import (
     ApplicationCommitRequest,
@@ -43,6 +49,8 @@ class TransactionManager:
             "transaction",
             "Unsafe transaction ID",
             value=transaction_id,
+            canonical_changed=False,
+            retry_safe=False,
         )
         return self.transactions_root / transaction_id
 
@@ -62,11 +70,27 @@ class TransactionManager:
 
     def load(self, transaction_id: str) -> TransactionState:
         path = self._state_path(transaction_id)
-        ensure(path.is_file(), "TRANSACTION_NOT_FOUND", "transaction", f"Unknown transaction: {transaction_id}")
+        ensure(
+            path.is_file(),
+            "TRANSACTION_NOT_FOUND",
+            "transaction",
+            f"Unknown transaction: {transaction_id}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         try:
-            return TransactionState.model_validate_json(path.read_text(encoding="utf-8"))
+            return TransactionState.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
         except Exception as exc:
-            raise MemError("TRANSACTION_STATE_INVALID", "transaction", str(exc), path=str(path)) from exc
+            raise MemError(
+                "TRANSACTION_STATE_INVALID",
+                "transaction",
+                str(exc),
+                path=str(path),
+                canonical_changed=False,
+                retry_safe=False,
+            ) from exc
 
     def begin(
         self,
@@ -79,6 +103,8 @@ class TransactionManager:
             "DIRECT_PCO_STREAM_WRITE_FORBIDDEN",
             "write_policy",
             "PCO business streams can only be written through pco proposal commit",
+            canonical_changed=False,
+            retry_safe=False,
         )
         return self._begin_public(
             fingerprint_context=fingerprint_context,
@@ -93,7 +119,14 @@ class TransactionManager:
     ) -> TransactionState:
         self.repository.assert_clean()
         transaction_id = transaction_id or f"txn_{uuid.uuid4().hex}"
-        ensure(not self._state_path(transaction_id).exists(), "TRANSACTION_EXISTS", "transaction", f"Transaction already exists: {transaction_id}")
+        ensure(
+            not self._state_path(transaction_id).exists(),
+            "TRANSACTION_EXISTS",
+            "transaction",
+            f"Transaction already exists: {transaction_id}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         operations: list[Operation] = []
         base_commit = self.repository.head()
         state = TransactionState(
@@ -115,15 +148,43 @@ class TransactionManager:
         self._save(state)
         return state
 
-    def append(self, transaction_id: str, operation: Operation | dict[str, Any]) -> TransactionState:
+    def append(
+        self, transaction_id: str, operation: Operation | dict[str, Any]
+    ) -> TransactionState:
         state = self.load(transaction_id)
-        ensure(state.status in {"open", "validated"}, "TRANSACTION_CLOSED", "transaction", f"Transaction is {state.status}")
-        op = operation if isinstance(operation, Operation) else Operation.model_validate(operation)
+        ensure(
+            state.status in {"open", "validated"},
+            "TRANSACTION_CLOSED",
+            "transaction",
+            f"Transaction is {state.status}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        op = (
+            operation
+            if isinstance(operation, Operation)
+            else Operation.model_validate(operation)
+        )
         if op.op == "append":
-            ensure(op.record is not None, "RECORD_REQUIRED", "transaction", "append requires record", stream=op.stream)
+            ensure(
+                op.record is not None,
+                "RECORD_REQUIRED",
+                "transaction",
+                "append requires record",
+                stream=op.stream,
+                canonical_changed=False,
+                retry_safe=False,
+            )
             self.repository.profile.stream(op.stream or "")
         else:
-            ensure(op.path is not None and op.content is not None, "ARTIFACT_REQUIRED", "transaction", "write_artifact requires path and content")
+            ensure(
+                op.path is not None and op.content is not None,
+                "ARTIFACT_REQUIRED",
+                "transaction",
+                "write_artifact requires path and content",
+                canonical_changed=False,
+                retry_safe=False,
+            )
             self.repository.profile.artifact_path(self.repository.root, op.path)
         state.operations.append(op)
         state.status = "open"
@@ -151,6 +212,8 @@ class TransactionManager:
                     "write_policy",
                     f"Stream cannot be written: {operation.stream}",
                     stream=operation.stream,
+                    canonical_changed=False,
+                    retry_safe=False,
                 )
             if policy == "user_approval":
                 result.add(operation.stream)
@@ -170,14 +233,26 @@ class TransactionManager:
     ) -> ApprovalReceipt:
         state = self.load(transaction_id)
         protected = self.protected_streams(state)
-        ensure(protected, "APPROVAL_NOT_REQUIRED", "write_policy", "Transaction has no protected operations")
-        reviewed_proposal_hash = str(state.fingerprint_context.get("reviewed_proposal_hash") or state.proposal_hash)
+        ensure(
+            protected,
+            "APPROVAL_NOT_REQUIRED",
+            "write_policy",
+            "Transaction has no protected operations",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        reviewed_proposal_hash = str(
+            state.fingerprint_context.get("reviewed_proposal_hash")
+            or state.proposal_hash
+        )
         ensure(
             proposal_hash_value == reviewed_proposal_hash,
             "PROPOSAL_HASH_MISMATCH",
             "write_policy",
             "Approval does not match the proposal under review",
             value=proposal_hash_value,
+            canonical_changed=False,
+            retry_safe=False,
         )
         receipt = ApprovalReceipt(
             id=receipt_id or f"approval_{uuid.uuid4().hex}",
@@ -186,7 +261,9 @@ class TransactionManager:
             proposal_hash=reviewed_proposal_hash,
             transaction_proposal_hash=state.proposal_hash,
             transaction_fingerprint=state.transaction_fingerprint,
-            protected_operations_hash=protected_operations_hash(state.operations, protected),
+            protected_operations_hash=protected_operations_hash(
+                state.operations, protected
+            ),
             decided_at=utc_now(),
             decision_message_id=decision_message_id,
             authorization_id=authorization_id,
@@ -200,7 +277,10 @@ class TransactionManager:
     def _verify_approval(self, state: TransactionState, protected: set[str]) -> None:
         if not protected:
             return
-        reviewed_proposal_hash = str(state.fingerprint_context.get("reviewed_proposal_hash") or state.proposal_hash)
+        reviewed_proposal_hash = str(
+            state.fingerprint_context.get("reviewed_proposal_hash")
+            or state.proposal_hash
+        )
         verify_approval_receipt(
             receipt=state.approval_receipt,
             operations=state.operations,
@@ -222,23 +302,42 @@ class TransactionManager:
         for operation in operations:
             if operation.op == "append":
                 assert operation.stream is not None and operation.record is not None
-                self.repository.append_record(worktree, operation.stream, operation.record)
+                self.repository.append_record(
+                    worktree, operation.stream, operation.record
+                )
             else:
                 assert operation.path is not None and operation.content is not None
                 target = self.repository.profile.artifact_path(worktree, operation.path)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(operation.content, encoding="utf-8")
 
-    def validate(self, transaction_id: str, *, require_approval: bool = False) -> dict[str, Any]:
+    def validate(
+        self, transaction_id: str, *, require_approval: bool = False
+    ) -> dict[str, Any]:
         state = self.load(transaction_id)
-        ensure(state.status in {"open", "validated"}, "TRANSACTION_CLOSED", "transaction_validation", f"Transaction is {state.status}")
-        ensure(state.operations, "TRANSACTION_EMPTY", "transaction_validation", "Transaction has no operations")
+        ensure(
+            state.status in {"open", "validated"},
+            "TRANSACTION_CLOSED",
+            "transaction_validation",
+            f"Transaction is {state.status}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            state.operations,
+            "TRANSACTION_EMPTY",
+            "transaction_validation",
+            "Transaction has no operations",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         ensure(
             self.repository.head() == state.base_commit,
             "BASE_COMMIT_CHANGED",
             "transaction_validation",
             "Canonical memory advanced after transaction began",
-            retryable=True,
+            canonical_changed=False,
+            retry_safe=False,
             recovery=["Begin a new transaction on the current canonical commit"],
         )
         protected = self.protected_streams(state)
@@ -253,15 +352,24 @@ class TransactionManager:
             current: dict[str, dict[str, dict[str, Any]]] = {}
             for stream_name in delta:
                 stream_path = profile.stream(stream_name).path
-                base_bytes = show_bytes(self.repository.root, state.base_commit, stream_path)
-                stream_current, baseline_reliable = latest_base_by_id(base_bytes.decode("utf-8").splitlines())
+                base_bytes = show_bytes(
+                    self.repository.root, state.base_commit, stream_path
+                )
+                stream_current, baseline_reliable = latest_base_by_id(
+                    base_bytes.decode("utf-8").splitlines()
+                )
                 # 基线不可靠（历史含损坏行）时跳过该 stream 的 revision
                 # 连续性断言，避免误拒合法 delta（D6）。
                 if baseline_reliable:
                     current[stream_name] = stream_current
             count = validate_delta_records(profile, delta, current)
-            validation = {"ok": True, "profile": f"{profile.name}@{profile.version}", "mode": "incremental",
-                          "records": count, "delta": {name: len(records) for name, records in delta.items()}}
+            validation = {
+                "ok": True,
+                "profile": f"{profile.name}@{profile.version}",
+                "mode": "incremental",
+                "records": count,
+                "delta": {name: len(records) for name, records in delta.items()},
+            }
         else:
             worktree = self._prepare_worktree(state)
             # 严格 envelope 基线 + delta schema/revision + base+delta 合并 validator 视图。
@@ -276,8 +384,13 @@ class TransactionManager:
                 delta=delta,
                 root=worktree,
             )
-            validation = {"ok": True, "profile": f"{profile.name}@{profile.version}", "mode": "incremental",
-                          "records": count, "delta": {name: len(records) for name, records in delta.items()}}
+            validation = {
+                "ok": True,
+                "profile": f"{profile.name}@{profile.version}",
+                "mode": "incremental",
+                "records": count,
+                "delta": {name: len(records) for name, records in delta.items()},
+            }
         state.status = "validated"
         state.validation = {
             **validation,
@@ -315,12 +428,18 @@ class TransactionManager:
         return None
 
     def _application_attempt_dir(self, transaction_digest: str) -> Path:
-        return self.state_root / "application-worktrees" / application_transaction_id(transaction_digest)
+        return (
+            self.state_root
+            / "application-worktrees"
+            / application_transaction_id(transaction_digest)
+        )
 
     def _application_worktree_path(self, transaction_digest: str) -> Path:
         return self._application_attempt_dir(transaction_digest) / "worktree"
 
-    def _cleanup_application_attempt(self, transaction_digest: str, *, review_id: str) -> None:
+    def _cleanup_application_attempt(
+        self, transaction_digest: str, *, review_id: str
+    ) -> None:
         attempt = self._application_attempt_dir(transaction_digest)
         worktree = attempt / "worktree"
         self.repository.remove_worktree(worktree)
@@ -329,9 +448,8 @@ class TransactionManager:
             "CANONICAL_WORKTREE_CLEANUP_FAILED",
             "application_cleanup",
             "Committed application worktree could not be removed",
-            # Task 6 replaces this legacy compatibility field with
-            # canonical_changed=True and retry_safe=True.
-            retryable=True,
+            canonical_changed=True,
+            retry_safe=True,
             recovery=[f"pco proposal commit {review_id}"],
         )
         rmdir_if_empty(attempt)
@@ -354,6 +472,8 @@ class TransactionManager:
                     "write_policy",
                     f"Stream cannot be written: {operation.stream}",
                     stream=operation.stream,
+                    canonical_changed=False,
+                    retry_safe=False,
                 )
                 delta.setdefault(operation.stream, []).append(operation.record)
             else:
@@ -364,7 +484,9 @@ class TransactionManager:
             current: dict[str, dict[str, dict[str, Any]]] = {}
             for stream_name in delta:
                 stream_path = profile.stream(stream_name).path
-                base_bytes = show_bytes(self.repository.root, request.base_commit, stream_path)
+                base_bytes = show_bytes(
+                    self.repository.root, request.base_commit, stream_path
+                )
                 stream_current, baseline_reliable = latest_base_by_id(
                     base_bytes.decode("utf-8").splitlines()
                 )
@@ -390,7 +512,9 @@ class TransactionManager:
             "delta": {name: len(records) for name, records in delta.items()},
         }
 
-    def _commit_application_worktree(self, request: ApplicationCommitRequest) -> dict[str, Any]:
+    def _commit_application_worktree(
+        self, request: ApplicationCommitRequest
+    ) -> dict[str, Any]:
         transaction_id = application_transaction_id(request.transaction_digest)
         worktree = self._application_worktree_path(request.transaction_digest)
         self.repository.assert_clean()
@@ -409,7 +533,10 @@ class TransactionManager:
         }
         txn_log = worktree / "transactions" / "transactions.jsonl"
         with txn_log.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(transaction_record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(transaction_record, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            )
         self.repository._git("add", ".", cwd=worktree)
         # The generic hook verifies the public TransactionState receipt shape.
         # This internal path performs the same incremental validation above and
@@ -446,6 +573,8 @@ class TransactionManager:
             "DIRECT_PCO_STREAM_WRITE_FORBIDDEN",
             "write_policy",
             "Application commit policy mismatch",
+            canonical_changed=False,
+            retry_safe=False,
         )
         context = nullcontext() if lock_held else self.repository.lock()
         with context:
@@ -467,9 +596,8 @@ class TransactionManager:
                 "CANONICAL_HEAD_CHANGED",
                 "transaction_validation",
                 "Canonical HEAD changed before commit",
-                # Task 6 replaces this legacy compatibility field with
-                # canonical_changed=False and retry_safe=False.
-                retryable=False,
+                canonical_changed=False,
+                retry_safe=False,
                 recovery=[
                     "Create a new proposal from pco proposal scaffold against the current HEAD"
                 ],
@@ -489,7 +617,12 @@ class TransactionManager:
             }
         state = self.load(transaction_id)
         if state.status == "committed":
-            return {"ok": True, "idempotent": True, "transaction_id": state.id, "commit": state.commit}
+            return {
+                "ok": True,
+                "idempotent": True,
+                "transaction_id": state.id,
+                "commit": state.commit,
+            }
         duplicate = self._find_committed_fingerprint(state.transaction_fingerprint)
         if duplicate:
             state.status = "committed"
@@ -519,15 +652,24 @@ class TransactionManager:
             "fingerprint_context": state.fingerprint_context,
             "operation_count": len(state.operations),
             "operations": [operation.normalized() for operation in state.operations],
-            "approval_receipt": state.approval_receipt.model_dump(mode="json") if state.approval_receipt else None,
+            "approval_receipt": (
+                state.approval_receipt.model_dump(mode="json")
+                if state.approval_receipt
+                else None
+            ),
             "committed_at": utc_now(),
         }
         txn_log = worktree / "transactions" / "transactions.jsonl"
         with txn_log.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(transaction_record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(transaction_record, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            )
         self.repository.install_pre_commit_hook()
         self.repository._git("add", ".", cwd=worktree)
-        self.repository._git("commit", "-m", f"memory transaction {state.id}", cwd=worktree)
+        self.repository._git(
+            "commit", "-m", f"memory transaction {state.id}", cwd=worktree
+        )
         commit = self.repository._git("rev-parse", "HEAD", cwd=worktree)
         self.repository.fast_forward(commit)
         state.status = "committed"
@@ -545,7 +687,14 @@ class TransactionManager:
 
     def abort(self, transaction_id: str) -> dict[str, Any]:
         state = self.load(transaction_id)
-        ensure(state.status != "committed", "TRANSACTION_ALREADY_COMMITTED", "transaction", "Committed transactions cannot be aborted")
+        ensure(
+            state.status != "committed",
+            "TRANSACTION_ALREADY_COMMITTED",
+            "transaction",
+            "Committed transactions cannot be aborted",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         self.repository.remove_worktree(self._worktree_path(transaction_id))
         state.status = "aborted"
         self._save(state)

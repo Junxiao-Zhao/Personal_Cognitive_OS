@@ -29,7 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     init = commands.add_parser("init")
-    init.add_argument("--projection", choices=["affine", "markdown", "none"], default="affine")
+    init.add_argument(
+        "--projection", choices=["affine", "markdown", "none"], default="affine"
+    )
     commands.add_parser("doctor")
     run = commands.add_parser("run")
     run.add_argument("--project", type=Path, default=Path.cwd())
@@ -51,11 +53,17 @@ def build_parser() -> argparse.ArgumentParser:
     source_commands.add_parser("diff")
 
     checkpoint = commands.add_parser("checkpoint")
-    checkpoint_commands = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
+    checkpoint_commands = checkpoint.add_subparsers(
+        dest="checkpoint_command", required=True
+    )
     request = checkpoint_commands.add_parser("request")
     request.add_argument("--trigger", choices=["manual", "auto"], default="manual")
-    request.add_argument("--intent", choices=["consolidate", "compact"], default="compact")
-    request.add_argument("--origin", choices=["command", "idle_threshold", "harness_auto_compaction"])
+    request.add_argument(
+        "--intent", choices=["consolidate", "compact"], default="compact"
+    )
+    request.add_argument(
+        "--origin", choices=["command", "idle_threshold", "harness_auto_compaction"]
+    )
     # Private Host-to-Adapter fields. They are intentionally not exposed by
     # the pco_checkpoint tool; the Plugin supplies them only for compact.
     request.add_argument("--native-compact-token")
@@ -76,7 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     retrieval = commands.add_parser("search")
     retrieval.add_argument("query")
-    retrieval.add_argument("--mode", choices=["continuity", "current", "pattern", "historical", "change"], default="current")
+    retrieval.add_argument(
+        "--mode",
+        choices=["continuity", "current", "pattern", "historical", "change"],
+        default="current",
+    )
     retrieval.add_argument("--limit", type=int, default=10)
     retrieval.add_argument("--start")
     retrieval.add_argument("--end")
@@ -109,14 +121,23 @@ def _adapter(workspace: Workspace, args: argparse.Namespace) -> OpenCodeAdapter:
     native_token = getattr(args, "native_compact_token", None)
     native_attempt = getattr(args, "native_compact_attempt_id", None)
     native_expires = getattr(args, "native_compact_expires_at", None)
-    if native_token is not None or native_attempt is not None or native_expires is not None:
+    if (
+        native_token is not None
+        or native_attempt is not None
+        or native_expires is not None
+    ):
         ensure(
-            isinstance(native_token, str) and native_token
-            and isinstance(native_attempt, str) and native_attempt
-            and isinstance(native_expires, int) and native_expires > 0,
+            isinstance(native_token, str)
+            and native_token
+            and isinstance(native_attempt, str)
+            and native_attempt
+            and isinstance(native_expires, int)
+            and native_expires > 0,
             "NATIVE_COMPACT_TOKEN_INVALID",
             "cli",
             "Native compact token fields must be supplied together",
+            canonical_changed=False,
+            retry_safe=False,
         )
         native_compact_bypass = {
             "token": native_token,
@@ -143,12 +164,17 @@ def _native_compact_bypass(args: argparse.Namespace) -> dict[str, Any] | None:
     if token is None and attempt is None and expires is None:
         return None
     ensure(
-        isinstance(token, str) and token
-        and isinstance(attempt, str) and attempt
-        and isinstance(expires, int) and expires > 0,
+        isinstance(token, str)
+        and token
+        and isinstance(attempt, str)
+        and attempt
+        and isinstance(expires, int)
+        and expires > 0,
         "NATIVE_COMPACT_TOKEN_INVALID",
         "cli",
         "Native compact token fields must be supplied together",
+        canonical_changed=False,
+        retry_safe=False,
     )
     return {
         "token": token,
@@ -171,12 +197,16 @@ def _pending_compaction(args: argparse.Namespace) -> dict[str, Any] | None:
             "checkpoint",
             "Pending compaction payload must be valid JSON",
             recovery=["Retry with the durable pending-compaction payload intact"],
+            canonical_changed=False,
+            retry_safe=False,
         ) from exc
     ensure(
         isinstance(value, dict),
         "PENDING_COMPACTION_INVALID",
         "checkpoint",
         "Pending compaction payload must be an object",
+        canonical_changed=False,
+        retry_safe=False,
     )
     # The Plugin uses snake_case on the process boundary. Accept the legacy
     # camelCase spelling too so a request written by an older Plugin can be
@@ -192,18 +222,25 @@ def _pending_compaction(args: argparse.Namespace) -> dict[str, Any] | None:
 
 
 def _derivation_error_as_memerror(error: dict[str, Any]) -> MemError:
-    details = {key: error[key] for key in ("stream", "record_id", "path", "value") if key in error}
+    details = {
+        key: error[key]
+        for key in ("stream", "record_id", "path", "value")
+        if key in error
+    }
     return MemError(
         str(error["code"]),
         str(error["phase"]),
         str(error["message"]),
-        retryable=bool(error.get("retryable", True)),
+        canonical_changed=bool(error.get("canonical_changed", False)),
+        retry_safe=bool(error.get("retry_safe", False)),
         recovery=list(error.get("recovery", [])),
         **details,
     )
 
 
-def _invoke_derivation(workspace: Workspace, capability: str, phase: str, **kwargs: Any) -> dict[str, Any]:
+def _invoke_derivation(
+    workspace: Workspace, capability: str, phase: str, **kwargs: Any
+) -> dict[str, Any]:
     try:
         result = workspace.profile.invoke(capability, **kwargs)
     except MemError:
@@ -211,11 +248,15 @@ def _invoke_derivation(workspace: Workspace, capability: str, phase: str, **kwar
     except Exception as exc:
         raise _derivation_error_as_memerror(derivation_error(exc, phase)) from exc
     if isinstance(result, dict) and result.get("ok") is False:
-        raise _derivation_error_as_memerror(structured_error(result.get("error") or result, phase))
+        raise _derivation_error_as_memerror(
+            structured_error(result.get("error") or result, phase)
+        )
     return result
 
 
-def _install_opencode(workspace: Workspace, project: Path, *, force: bool) -> dict[str, Any]:
+def _install_opencode(
+    workspace: Workspace, project: Path, *, force: bool
+) -> dict[str, Any]:
     from importlib.resources import files
 
     source_root = Path(str(files("pco.resources.opencode")))
@@ -232,7 +273,9 @@ def _install_opencode(workspace: Workspace, project: Path, *, force: bool) -> di
             raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             raw_files = raw_manifest.get("files", {})
             if isinstance(raw_files, dict):
-                previous_files = {str(path): str(value) for path, value in raw_files.items()}
+                previous_files = {
+                    str(path): str(value) for path, value in raw_files.items()
+                }
         except (OSError, TypeError, ValueError):
             # A malformed manifest cannot authorize deletion. Normal file
             # conflict handling below remains the safe fallback.
@@ -241,7 +284,9 @@ def _install_opencode(workspace: Workspace, project: Path, *, force: bool) -> di
     source_files = {
         source.relative_to(source_root).as_posix(): source
         for source in source_root.rglob("*")
-        if source.is_file() and source.name != "__init__.py" and "__pycache__" not in source.parts
+        if source.is_file()
+        and source.name != "__init__.py"
+        and "__pycache__" not in source.parts
     }
     installed: list[str] = []
     updated: list[str] = []
@@ -265,7 +310,11 @@ def _install_opencode(workspace: Workspace, project: Path, *, force: bool) -> di
                 "install",
                 f"Managed manifest contains a path outside .opencode: {relative_name!r}",
                 path=relative_name,
-                recovery=["Remove or repair .opencode/.pco-managed.json and rerun installation"],
+                recovery=[
+                    "Remove or repair .opencode/.pco-managed.json and rerun installation"
+                ],
+                canonical_changed=False,
+                retry_safe=False,
             )
 
     # Complete every overwrite/conflict check before deleting legacy files or
@@ -286,7 +335,11 @@ def _install_opencode(workspace: Workspace, project: Path, *, force: bool) -> di
                 "install",
                 f"Refusing to overwrite an existing OpenCode file: {target}",
                 path=str(target),
-                recovery=["Review the file and rerun with --force if replacement is intended"],
+                recovery=[
+                    "Review the file and rerun with --force if replacement is intended"
+                ],
+                canonical_changed=False,
+                retry_safe=False,
             )
 
     # Explicit migration for the two PCO commands removed in this release.
@@ -320,10 +373,16 @@ def _install_opencode(workspace: Workspace, project: Path, *, force: bool) -> di
 
     manifest = {
         "version": 1,
-        "files": {relative_name: digest(data) for relative_name, data in sorted(source_bytes.items())},
+        "files": {
+            relative_name: digest(data)
+            for relative_name, data in sorted(source_bytes.items())
+        },
     }
     target_root.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     return {
         "ok": True,
         "project": str(project.resolve()),
@@ -345,7 +404,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.command == "run":
         _install_opencode(workspace, args.project, force=False)
         parsed = urlparse(args.server_url or workspace.config.harness.base_url)
-        command = ["opencode", str(args.project.resolve()), "--hostname", parsed.hostname or "127.0.0.1", "--port", str(parsed.port or 4096)]
+        command = [
+            "opencode",
+            str(args.project.resolve()),
+            "--hostname",
+            parsed.hostname or "127.0.0.1",
+            "--port",
+            str(parsed.port or 4096),
+        ]
         binding = workspace.binding()
         if binding.native_session_id:
             command.extend(["--session", binding.native_session_id])
@@ -375,14 +441,47 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "SOURCE_INPUT_CONFLICT",
                 "cli",
                 "source add accepts either a local path or --locator, not both",
-                recovery=["Use pco source add PATH", "Use pco source add --locator LOCATOR --reader READER"],
+                recovery=[
+                    "Use pco source add PATH",
+                    "Use pco source add --locator LOCATOR --reader READER",
+                ],
+                canonical_changed=False,
+                retry_safe=False,
             )
             if args.path is not None:
-                ensure(args.reader is None, "SOURCE_INPUT_CONFLICT", "cli", "--reader is only valid with --locator")
-                ensure(args.provider is None, "SOURCE_INPUT_CONFLICT", "cli", "--provider is only valid with --locator")
+                ensure(
+                    args.reader is None,
+                    "SOURCE_INPUT_CONFLICT",
+                    "cli",
+                    "--reader is only valid with --locator",
+                    canonical_changed=False,
+                    retry_safe=False,
+                )
+                ensure(
+                    args.provider is None,
+                    "SOURCE_INPUT_CONFLICT",
+                    "cli",
+                    "--provider is only valid with --locator",
+                    canonical_changed=False,
+                    retry_safe=False,
+                )
                 return manager.register_local(args.path, display_name=args.name)
-            ensure(args.locator, "SOURCE_LOCATOR_REQUIRED", "cli", "Remote source add requires --locator")
-            ensure(args.reader, "SOURCE_READER_REQUIRED", "cli", "Remote source add requires --reader")
+            ensure(
+                args.locator,
+                "SOURCE_LOCATOR_REQUIRED",
+                "cli",
+                "Remote source add requires --locator",
+                canonical_changed=False,
+                retry_safe=False,
+            )
+            ensure(
+                args.reader,
+                "SOURCE_READER_REQUIRED",
+                "cli",
+                "Remote source add requires --reader",
+                canonical_changed=False,
+                retry_safe=False,
+            )
             return manager.register_locator(
                 args.locator,
                 reader_skill=args.reader,
@@ -390,7 +489,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 display_name=args.name,
             )
         result = manager.collect_diffs()
-        return {"ok": True, "changes": result["changes"], "source_hashes": result["source_hashes"]}
+        return {
+            "ok": True,
+            "changes": result["changes"],
+            "source_hashes": result["source_hashes"],
+        }
     if args.command == "checkpoint":
         engine = CheckpointEngine(workspace, adapter)
         if args.checkpoint_command == "request":
@@ -402,22 +505,56 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 native_compact_bypass=_native_compact_bypass(args),
             )
         if args.checkpoint_command == "auto-if-needed":
-            intent = "compact" if engine.should_auto_checkpoint("compact") else "consolidate" if engine.should_auto_checkpoint("consolidate") else None
+            intent = (
+                "compact"
+                if engine.should_auto_checkpoint("compact")
+                else (
+                    "consolidate"
+                    if engine.should_auto_checkpoint("consolidate")
+                    else None
+                )
+            )
             if intent is None:
-                return {"ok": True, "triggered": False, "context_usage": adapter.estimate_context_usage()}
-            return {"triggered": True, "intent": intent, **engine.request("auto", intent)}
+                return {
+                    "ok": True,
+                    "triggered": False,
+                    "context_usage": adapter.estimate_context_usage(),
+                }
+            return {
+                "triggered": True,
+                "intent": intent,
+                **engine.request("auto", intent),
+            }
         if args.checkpoint_command == "auto-probe":
             compact_needed = engine.should_auto_checkpoint("compact")
             consolidate_needed = engine.should_auto_checkpoint("consolidate")
             return {
                 "ok": True,
                 "needed": compact_needed or consolidate_needed,
-                "intent": "compact" if compact_needed else "consolidate" if consolidate_needed else None,
+                "intent": (
+                    "compact"
+                    if compact_needed
+                    else "consolidate" if consolidate_needed else None
+                ),
                 "context_usage": adapter.estimate_context_usage(),
             }
         if args.checkpoint_command == "decide":
-            ensure(args.approval_grant, "APPROVAL_GRANT_REQUIRED", "approval", "Approval must come from the host-issued interaction")
-            ensure(args.question_request_id, "QUESTION_REQUEST_ID_REQUIRED", "approval", "A native question request ID is required for the decision")
+            ensure(
+                args.approval_grant,
+                "APPROVAL_GRANT_REQUIRED",
+                "approval",
+                "Approval must come from the host-issued interaction",
+                canonical_changed=False,
+                retry_safe=False,
+            )
+            ensure(
+                args.question_request_id,
+                "QUESTION_REQUEST_ID_REQUIRED",
+                "approval",
+                "A native question request ID is required for the decision",
+                canonical_changed=False,
+                retry_safe=False,
+            )
             return engine.decide(
                 args.decision,
                 reason=args.reason,
@@ -469,7 +606,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "backlinks.build",
                 "backlinks",
                 repo_root=workspace.config.memory_root,
-                output_path=workspace.config.state_root / "derivations" / "backlinks.json",
+                output_path=workspace.config.state_root
+                / "derivations"
+                / "backlinks.json",
                 source_commit=source_commit,
             )
         if args.derive_command == "context":
@@ -490,8 +629,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             kwargs["output_root"] = workspace.config.projection_root
         else:
             kwargs["state_root"] = workspace.config.state_root
-        return _invoke_derivation(workspace, f"projections.{target}", "projection", **kwargs)
-    raise MemError("COMMAND_INVALID", "cli", "Unsupported command")
+        return _invoke_derivation(
+            workspace, f"projections.{target}", "projection", **kwargs
+        )
+    raise MemError(
+        "COMMAND_INVALID",
+        "cli",
+        "Unsupported command",
+        canonical_changed=False,
+        retry_safe=False,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -501,11 +648,19 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(exc.as_dict(), ensure_ascii=False, separators=(",", ":")))
         raise SystemExit(1) from None
     except ValueError as exc:
-        error = MemError("INVALID_INPUT", "cli", str(exc)).as_dict()
+        error = MemError(
+            "INVALID_INPUT", "cli", str(exc), canonical_changed=False, retry_safe=False
+        ).as_dict()
         print(json.dumps(error, ensure_ascii=False, separators=(",", ":")))
         raise SystemExit(1) from None
     except Exception as exc:
-        error = MemError("UNEXPECTED", "cli", str(exc), retryable=True).as_dict()
+        error = MemError(
+            "UNEXPECTED",
+            "cli",
+            str(exc),
+            canonical_changed=False,
+            retry_safe=False,
+        ).as_dict()
         print(json.dumps(error, ensure_ascii=False, separators=(",", ":")))
         raise SystemExit(1) from None
     print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))

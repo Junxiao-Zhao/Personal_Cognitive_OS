@@ -114,7 +114,9 @@ def request_from_raw_snapshot(
 
 
 @pytest.fixture
-def application_request(raw_application_snapshot: Mapping[str, Any]) -> ApplicationCommitRequest:
+def application_request(
+    raw_application_snapshot: Mapping[str, Any],
+) -> ApplicationCommitRequest:
     return request_from_raw_snapshot(
         raw_application_snapshot,
         committed_at="2026-08-31T10:00:00+00:00",
@@ -178,7 +180,10 @@ def test_uncommitted_matching_ledger_line_does_not_report_idempotent_success(
             json.dumps(transaction_record, ensure_ascii=False, sort_keys=True) + "\n"
         )
 
-    assert count_transaction_digest(pco_repository, application_request.transaction_digest) == 0
+    assert (
+        count_transaction_digest(pco_repository, application_request.transaction_digest)
+        == 0
+    )
     with pytest.raises(MemError) as exc:
         TransactionManager(
             pco_repository, pco_repository.root.parent / "tmp"
@@ -226,9 +231,9 @@ def test_rebuilt_request_with_new_timestamps_is_still_idempotent(
         recorded_at="2026-08-31T11:00:01+00:00",
     )
     assert rebuilt.transaction_digest == application_request.transaction_digest
-    assert application_transaction_id(rebuilt.transaction_digest) == application_transaction_id(
-        application_request.transaction_digest
-    )
+    assert application_transaction_id(
+        rebuilt.transaction_digest
+    ) == application_transaction_id(application_request.transaction_digest)
     stored = next(
         record
         for record in read_transaction_lines(pco_repository.root, first["commit"])
@@ -259,13 +264,18 @@ def test_duplicate_with_forged_ledger_id_is_rejected(
     monkeypatch.setattr(
         manager,
         "_find_committed_fingerprint",
-        lambda digest: forged
-        if digest == application_request.transaction_digest
-        else None,
+        lambda digest: (
+            forged if digest == application_request.transaction_digest else None
+        ),
     )
     with pytest.raises(MemError) as exc:
         manager.commit_application(application_request)
     assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+    assert exc.value.detail.canonical_changed is False
+    assert exc.value.detail.retry_safe is False
+    assert exc.value.detail.recovery == [
+        "Restore the complete canonical repository from a trusted copy"
+    ]
 
 
 def test_application_commit_writes_no_transaction_state(
@@ -294,6 +304,11 @@ def test_application_commit_rejects_changed_head(
             pco_repository, pco_repository.root.parent / "tmp"
         ).commit_application(request)
     assert exc.value.detail.code == "CANONICAL_HEAD_CHANGED"
+    assert exc.value.detail.canonical_changed is False
+    assert exc.value.detail.retry_safe is False
+    assert exc.value.detail.recovery == [
+        "Create a new proposal from pco proposal scaffold against the current HEAD"
+    ]
 
 
 def test_receipt_is_in_same_git_commit_as_business_revision(
@@ -304,7 +319,9 @@ def test_receipt_is_in_same_git_commit_as_business_revision(
     ).commit_application(application_request)
     ledger = read_transaction_lines(pco_repository.root, result["commit"])
     assert ledger[-1]["receipt"] == application_request.receipt
-    assert ledger[-1]["transaction_fingerprint"] == application_request.transaction_digest
+    assert (
+        ledger[-1]["transaction_fingerprint"] == application_request.transaction_digest
+    )
     assert pco_repository._git(
         "show",
         f"{result['commit']}:session_handoffs/session_handoffs.jsonl",
@@ -348,10 +365,35 @@ def test_retry_after_crash_following_fast_forward_is_idempotent(
     retry_manager = TransactionManager(pco_repository, state_root)
     retried = retry_manager.commit_application(rebuilt)
     assert retried["idempotent"] is True
-    assert count_transaction_digest(pco_repository, first_request.transaction_digest) == 1
+    assert (
+        count_transaction_digest(pco_repository, first_request.transaction_digest) == 1
+    )
     assert git_worktree_paths(pco_repository) == before_worktrees
-    assert not retry_manager._application_attempt_dir(first_request.transaction_digest).exists()
+    assert not retry_manager._application_attempt_dir(
+        first_request.transaction_digest
+    ).exists()
     assert not (state_root / "application-worktrees").exists()
+
+
+def test_cleanup_failure_reports_committed_canonical_and_safe_retry(
+    pco_repository: MemoryRepository,
+    application_request: ApplicationCommitRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_commit = pco_repository.head()
+    manager = TransactionManager(
+        pco_repository, pco_repository.root.parent / "application-state"
+    )
+    monkeypatch.setattr(pco_repository, "remove_worktree", lambda _path: None)
+
+    with pytest.raises(MemError) as exc:
+        manager.commit_application(application_request)
+
+    assert pco_repository.head() != base_commit
+    assert exc.value.detail.code == "CANONICAL_WORKTREE_CLEANUP_FAILED"
+    assert exc.value.detail.canonical_changed is True
+    assert exc.value.detail.retry_safe is True
+    assert exc.value.detail.recovery == ["pco proposal commit review_application_1"]
 
 
 def test_unrelated_head_advance_without_digest_is_stale(

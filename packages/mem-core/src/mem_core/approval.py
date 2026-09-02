@@ -23,21 +23,52 @@ def verify_approval_receipt(
         "USER_APPROVAL_REQUIRED",
         "write_policy",
         f"Protected streams require approval: {', '.join(sorted(protected))}",
-        retryable=True,
-        recovery=["Show the exact protected diff to the user and attach a matching approval receipt"],
+        canonical_changed=False,
+        retry_safe=True,
+        recovery=[
+            "Show the exact protected diff to the user and attach a matching approval receipt"
+        ],
     )
     assert receipt is not None
-    ensure(receipt.proposal_hash == reviewed_proposal_hash, "APPROVAL_STALE", "write_policy", "Reviewed proposal changed after approval")
-    ensure(receipt.transaction_proposal_hash == transaction_proposal_hash, "APPROVAL_STALE", "write_policy", "Transaction proposal changed after approval")
-    ensure(receipt.transaction_fingerprint == transaction_fingerprint, "APPROVAL_STALE", "write_policy", "Transaction changed after approval")
     ensure(
-        receipt.protected_operations_hash == protected_operations_hash(operations, protected),
+        receipt.proposal_hash == reviewed_proposal_hash,
+        "APPROVAL_STALE",
+        "write_policy",
+        "Reviewed proposal changed after approval",
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    ensure(
+        receipt.transaction_proposal_hash == transaction_proposal_hash,
+        "APPROVAL_STALE",
+        "write_policy",
+        "Transaction proposal changed after approval",
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    ensure(
+        receipt.transaction_fingerprint == transaction_fingerprint,
+        "APPROVAL_STALE",
+        "write_policy",
+        "Transaction changed after approval",
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    ensure(
+        receipt.protected_operations_hash
+        == protected_operations_hash(operations, protected),
         "APPROVAL_STALE",
         "write_policy",
         "Protected operations changed after approval",
+        canonical_changed=False,
+        retry_safe=False,
     )
     for operation in operations:
-        if operation.op != "append" or operation.stream not in protected or operation.record is None:
+        if (
+            operation.op != "append"
+            or operation.stream not in protected
+            or operation.record is None
+        ):
             continue
         pointer = profile.stream(operation.stream).approval_ref_pointer
         if not pointer:
@@ -53,6 +84,8 @@ def verify_approval_receipt(
                 stream=operation.stream,
                 record_id=operation.record.get("id"),
                 path=pointer,
+                canonical_changed=False,
+                retry_safe=False,
             )
             value = value[key]
         ensure(
@@ -64,4 +97,6 @@ def verify_approval_receipt(
             record_id=operation.record.get("id"),
             path=pointer,
             value=value,
+            canonical_changed=False,
+            retry_safe=False,
         )

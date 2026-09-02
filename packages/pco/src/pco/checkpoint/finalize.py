@@ -17,7 +17,14 @@ from .state import CheckpointState
 
 
 def commit_and_finalize(engine: Any, state: CheckpointState) -> dict[str, Any]:
-    ensure(state.transaction_id is not None, "CHECKPOINT_STATE_INVALID", "commit", "Missing transaction")
+    ensure(
+        state.transaction_id is not None,
+        "CHECKPOINT_STATE_INVALID",
+        "commit",
+        "Missing transaction",
+        canonical_changed=False,
+        retry_safe=False,
+    )
     result = engine.manager.commit(state.transaction_id)
     state.content_commit = result["commit"]
     state.commit = state.content_commit
@@ -40,7 +47,11 @@ def commit_and_finalize(engine: Any, state: CheckpointState) -> dict[str, Any]:
 def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
     workspace = engine.workspace
     proposal_path = workspace.state_path(f"checkpoints/{state.id}/proposal.json")
-    proposal = workspace.load_json(f"checkpoints/{state.id}/proposal.json") if proposal_path.is_file() else {"operations": []}
+    proposal = (
+        workspace.load_json(f"checkpoints/{state.id}/proposal.json")
+        if proposal_path.is_file()
+        else {"operations": []}
+    )
     derivations = _checkpoint_derivations(state)
     counts = Counter(
         operation.get("stream", "artifacts")
@@ -48,20 +59,30 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
         if operation.get("stream") != "checkpoints"
     )
     meta_updated = counts.get("meta_revisions", 0) > 0
-    approval = state.decision or ("not_required" if not state.protected_streams else None)
+    approval = state.decision or (
+        "not_required" if not state.protected_streams else None
+    )
     promotion_hash = state.promotion_proposal_hash or state.proposal_hash
     promotion_streams = state.promotion_protected_streams or state.protected_streams
     intent = getattr(state, "intent", "compact")
     consolidation_status = getattr(state, "consolidation_status", None)
     if consolidation_status is None:
         consolidation_status = "committed"
-    compaction_requested = bool(getattr(state, "compaction_requested", intent == "compact"))
+    compaction_requested = bool(
+        getattr(state, "compaction_requested", intent == "compact")
+    )
     compaction_status = getattr(state, "compaction_status", None)
     if compaction_status is None:
-        compaction_status = "completed" if state.compacted else ("pending" if compaction_requested else "not_requested")
+        compaction_status = (
+            "completed"
+            if state.compacted
+            else ("pending" if compaction_requested else "not_requested")
+        )
     context_publication_status = getattr(state, "context_publication_status", None)
     if context_publication_status is None:
-        context_publication_status = "completed" if state.context_published else "pending"
+        context_publication_status = (
+            "completed" if state.context_published else "pending"
+        )
     summary = (
         f"记忆已更新，对话上下文 {'已压缩' if compaction_requested else '未压缩'}。"
         f"事件 {counts.get('events', 0)}，hypothesis {counts.get('hypotheses', 0)}；"
@@ -80,21 +101,34 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
         "parent_session_id": state.parent_session_id,
         "worker": state.worker_handle,
         "archive_cursor": state.archive_cursor,
-        "message_range": {"after": state.after_message_id, "through": state.through_message_id},
-        "consolidation_cursor_before": getattr(state, "consolidation_cursor_before", None),
-        "consolidation_cursor_after": getattr(state, "consolidation_cursor_after", None),
+        "message_range": {
+            "after": state.after_message_id,
+            "through": state.through_message_id,
+        },
+        "consolidation_cursor_before": getattr(
+            state, "consolidation_cursor_before", None
+        ),
+        "consolidation_cursor_after": getattr(
+            state, "consolidation_cursor_after", None
+        ),
         "compaction_cursor_before": getattr(state, "compaction_cursor_before", None),
         "compaction_cursor_after": getattr(state, "compaction_cursor_after", None),
         "source_hashes": state.source_hashes,
-        "consolidation_source_hashes": getattr(state, "consolidation_source_hashes", state.source_hashes),
+        "consolidation_source_hashes": getattr(
+            state, "consolidation_source_hashes", state.source_hashes
+        ),
         "operation_counts": dict(counts),
         "promotion_proposal": bool(promotion_streams),
         "protected_streams": promotion_streams,
         "approval_decision": approval,
         "authorization_id": state.decision_authorization_id,
-        "authorization_provenance": {
-            "question_request_id": state.decision_question_request_id,
-        } if state.decision_question_request_id else None,
+        "authorization_provenance": (
+            {
+                "question_request_id": state.decision_question_request_id,
+            }
+            if state.decision_question_request_id
+            else None
+        ),
         "proposal_hash": promotion_hash,
         "final_proposal_hash": state.proposal_hash,
         "transaction_proposal_hash": state.transaction_proposal_hash,
@@ -107,7 +141,11 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
         },
         "context_publication": {
             "status": context_publication_status,
-            "content_hash": (state.context_bundle or {}).get("content_hash") if isinstance(state.context_bundle, dict) else None,
+            "content_hash": (
+                (state.context_bundle or {}).get("content_hash")
+                if isinstance(state.context_bundle, dict)
+                else None
+            ),
         },
         "compaction": {
             "requested": compaction_requested,
@@ -127,7 +165,9 @@ def receipt(engine: Any, state: CheckpointState) -> dict[str, Any]:
                 getattr(state, "transaction_id", None)
                 and consolidation_status != "no_op"
             ),
-            "transaction_id": state.transaction_id if consolidation_status != "no_op" else None,
+            "transaction_id": (
+                state.transaction_id if consolidation_status != "no_op" else None
+            ),
         },
         "thread_runtime": {
             "consolidation_cursor": engine.workspace.thread().last_consolidated_message_id,
@@ -190,7 +230,9 @@ def _checkpoint_derivations(state: CheckpointState) -> dict[str, dict[str, Any]]
     return result
 
 
-def _checkpoint_payload(engine: Any, state: CheckpointState, *, audit_transaction_id: str | None = None) -> dict[str, Any]:
+def _checkpoint_payload(
+    engine: Any, state: CheckpointState, *, audit_transaction_id: str | None = None
+) -> dict[str, Any]:
     """Build the immutable consolidation-only checkpoint projection.
 
     Compact, receipt delivery, and lock state live in ``CheckpointState`` and
@@ -208,14 +250,18 @@ def _checkpoint_payload(engine: Any, state: CheckpointState, *, audit_transactio
     }
     pending = any(not item["ok"] for item in derivations.values())
     binding = workspace.binding()
-    approval = state.decision or ("not_required" if not state.protected_streams else "no")
+    approval = state.decision or (
+        "not_required" if not state.protected_streams else "no"
+    )
     return {
         "thread_id": binding.thread_id,
         "harness_binding_id": binding.id,
         "parent_session_id": state.parent_session_id,
         "archive_cursor": state.archive_cursor,
         "source_hashes": state.source_hashes,
-        "consolidation_source_hashes": getattr(state, "consolidation_source_hashes", state.source_hashes),
+        "consolidation_source_hashes": getattr(
+            state, "consolidation_source_hashes", state.source_hashes
+        ),
         "worker": state.worker_handle,
         "runtime": state.harness_runtime,
         "trigger": state.trigger,
@@ -223,9 +269,16 @@ def _checkpoint_payload(engine: Any, state: CheckpointState, *, audit_transactio
         "status": "committed_with_pending_derivations" if pending else "committed",
         "consolidation_status": getattr(state, "consolidation_status", "committed"),
         "archive_cursor": state.archive_cursor,
-        "consolidation_cursor_before": getattr(state, "consolidation_cursor_before", state.after_message_id),
-        "consolidation_cursor_after": getattr(state, "consolidation_cursor_after", state.through_message_id),
-        "message_range": {"after": state.after_message_id, "through": state.through_message_id},
+        "consolidation_cursor_before": getattr(
+            state, "consolidation_cursor_before", state.after_message_id
+        ),
+        "consolidation_cursor_after": getattr(
+            state, "consolidation_cursor_after", state.through_message_id
+        ),
+        "message_range": {
+            "after": state.after_message_id,
+            "through": state.through_message_id,
+        },
         "transaction_id": state.transaction_id,
         "audit_transaction_id": audit_transaction_id or state.audit_transaction_id,
         "git_commit": state.commit,
@@ -236,9 +289,13 @@ def _checkpoint_payload(engine: Any, state: CheckpointState, *, audit_transactio
         "promotion_proposal_hash": state.promotion_proposal_hash,
         "approval_decision": approval,
         "authorization_id": state.decision_authorization_id,
-        "authorization_provenance": {
-            "question_request_id": state.decision_question_request_id,
-        } if state.decision_question_request_id else None,
+        "authorization_provenance": (
+            {
+                "question_request_id": state.decision_question_request_id,
+            }
+            if state.decision_question_request_id
+            else None
+        ),
         "protected_streams": state.protected_streams,
         "promotion_protected_streams": state.promotion_protected_streams,
         "meta_revision": state.meta_revision,
@@ -259,30 +316,43 @@ def _checkpoint_payload(engine: Any, state: CheckpointState, *, audit_transactio
 
 def _raise_capability_error(value: Any, phase: str) -> None:
     error = structured_error(value, phase)
-    details = {key: error[key] for key in ("stream", "record_id", "path", "value") if key in error}
+    details = {
+        key: error[key]
+        for key in ("stream", "record_id", "path", "value")
+        if key in error
+    }
     raise MemError(
         str(error["code"]),
         str(error["phase"]),
         str(error["message"]),
-        retryable=bool(error.get("retryable", True)),
+        canonical_changed=bool(error.get("canonical_changed", False)),
+        retry_safe=bool(error.get("retry_safe", False)),
         recovery=list(error.get("recovery", [])),
         **details,
     )
 
 
-def _restore_audit_provenance(engine: Any, state: CheckpointState, payload: dict[str, Any]) -> str:
+def _restore_audit_provenance(
+    engine: Any, state: CheckpointState, payload: dict[str, Any]
+) -> str:
     """Recover audit metadata after a commit-before-state-save crash."""
 
-    audit_transaction_id = state.audit_transaction_id or payload.get("audit_transaction_id")
+    audit_transaction_id = state.audit_transaction_id or payload.get(
+        "audit_transaction_id"
+    )
     ensure(
         isinstance(audit_transaction_id, str) and audit_transaction_id,
         "CHECKPOINT_AUDIT_PROVENANCE_MISSING",
         "checkpoint",
         "Existing checkpoint record has no audit transaction ID",
+        canonical_changed=False,
+        retry_safe=False,
     )
     audit_commit = state.audit_commit or payload.get("audit_commit")
     if not audit_commit:
-        manager = TransactionManager(engine.workspace.repository, engine.workspace.config.state_root)
+        manager = TransactionManager(
+            engine.workspace.repository, engine.workspace.config.state_root
+        )
         try:
             audit_commit = manager.load(audit_transaction_id).commit
         except Exception:
@@ -303,6 +373,8 @@ def _restore_audit_provenance(engine: Any, state: CheckpointState, payload: dict
         "CHECKPOINT_AUDIT_PROVENANCE_MISSING",
         "checkpoint",
         "Existing audit transaction has no commit hash",
+        canonical_changed=False,
+        retry_safe=False,
     )
     state.audit_transaction_id = audit_transaction_id
     state.audit_commit = audit_commit
@@ -315,11 +387,16 @@ def write_checkpoint_record(engine: Any, state: CheckpointState) -> str | None:
     # Runtime-only no-op compactions must never enter the canonical memory
     # repository. A missing consolidation transaction is also a fail-closed
     # signal that this state has no canonical record to audit.
-    if getattr(state, "consolidation_status", None) == "no_op" or not state.transaction_id:
+    if (
+        getattr(state, "consolidation_status", None) == "no_op"
+        or not state.transaction_id
+    ):
         return None
     current = workspace.repository.current_records("checkpoints").get(state.id)
     audit_transaction_id = f"txn_checkpoint_{state.id[5:17]}_{uuid.uuid4().hex[:8]}"
-    payload = _checkpoint_payload(engine, state, audit_transaction_id=audit_transaction_id)
+    payload = _checkpoint_payload(
+        engine, state, audit_transaction_id=audit_transaction_id
+    )
     if current is not None:
         current_payload = current.get("payload", {})
         # Runtime timestamps and retry counters are not canonical state
@@ -355,7 +432,13 @@ def write_checkpoint_record(engine: Any, state: CheckpointState) -> str | None:
 
 
 def _compaction_requested(state: CheckpointState) -> bool:
-    return bool(getattr(state, "compaction_requested", getattr(state, "intent", "compact") == "compact"))
+    return bool(
+        getattr(
+            state,
+            "compaction_requested",
+            getattr(state, "intent", "compact") == "compact",
+        )
+    )
 
 
 def _sync_pending_compaction(engine: Any, state: CheckpointState) -> None:
@@ -389,7 +472,10 @@ def _advance_thread_compaction_cursor(engine: Any, state: CheckpointState) -> No
     if current == target:
         return
     if current:
-        message_ids = [record.get("id") for record in engine.workspace.repository.iter_records("messages")]
+        message_ids = [
+            record.get("id")
+            for record in engine.workspace.repository.iter_records("messages")
+        ]
         try:
             current_index = message_ids.index(current)
             target_index = message_ids.index(target)
@@ -398,13 +484,16 @@ def _advance_thread_compaction_cursor(engine: Any, state: CheckpointState) -> No
                 "COMPACTION_CURSOR_UNPROVEN",
                 "native_compact",
                 "Cannot prove the native compact cursor ordering",
-                retryable=True,
+                canonical_changed=False,
+                retry_safe=True,
             ) from exc
         ensure(
             target_index >= current_index,
             "COMPACTION_CURSOR_REGRESSION",
             "native_compact",
             "A compact retry cannot move the durable cursor backwards",
+            canonical_changed=False,
+            retry_safe=False,
         )
     thread.compaction_cursor = target
     engine.workspace.save_thread(thread)
@@ -417,17 +506,28 @@ def _run_native_compact(engine: Any, state: CheckpointState) -> None:
     # A previous process may have persisted compact success but stopped before
     # updating thread.json. Reconcile that durable success before deciding
     # whether the native side effect can be skipped.
-    if getattr(state, "compaction_status", None) == "completed" and getattr(state, "compaction_cursor_after", None):
+    if getattr(state, "compaction_status", None) == "completed" and getattr(
+        state, "compaction_cursor_after", None
+    ):
         _advance_thread_compaction_cursor(engine, state)
     if not _compaction_requested(state) or state.compacted:
         return
     if hasattr(state, "compaction_status"):
         state.compaction_status = "pending"
     state.failure_phase = "NATIVE_COMPACT"
-    if hasattr(state, "native_compact_attempt_id") and not state.native_compact_attempt_id:
+    if (
+        hasattr(state, "native_compact_attempt_id")
+        and not state.native_compact_attempt_id
+    ):
         supplied = getattr(engine.adapter, "native_compact_bypass", None)
-        supplied_attempt = supplied.get("attempt_id") if isinstance(supplied, dict) else getattr(supplied, "attempt_id", None)
-        state.native_compact_attempt_id = supplied_attempt or f"compact_{uuid.uuid4().hex}"
+        supplied_attempt = (
+            supplied.get("attempt_id")
+            if isinstance(supplied, dict)
+            else getattr(supplied, "attempt_id", None)
+        )
+        state.native_compact_attempt_id = (
+            supplied_attempt or f"compact_{uuid.uuid4().hex}"
+        )
     state_store.save(engine, state)
     try:
         engine.adapter.compact()
@@ -439,7 +539,8 @@ def _run_native_compact(engine: Any, state: CheckpointState) -> None:
             "code": "NATIVE_COMPACT_FAILED",
             "phase": "native_compact",
             "message": str(exc),
-            "retryable": True,
+            "canonical_changed": False,
+            "retry_safe": True,
             "recovery": ["Retry native compact from the persisted checkpoint boundary"],
         }
         state.status = "COMMITTED_CONTEXT_PENDING"
@@ -457,7 +558,9 @@ def _run_native_compact(engine: Any, state: CheckpointState) -> None:
     _advance_thread_compaction_cursor(engine, state)
 
 
-def _finish_receipt_and_unlock(engine: Any, state: CheckpointState, final_status: str) -> dict[str, Any]:
+def _finish_receipt_and_unlock(
+    engine: Any, state: CheckpointState, final_status: str
+) -> dict[str, Any]:
     """Publish one final receipt generation, then unlock exactly once.
 
     The operation lock closes the pending-acceptance window and makes the
@@ -473,7 +576,9 @@ def _finish_receipt_and_unlock(engine: Any, state: CheckpointState, final_status
             durable = state_store.load(engine)
             if durable.pending_compaction is not None:
                 state.pending_compaction = durable.pending_compaction
-                state.pending_compaction_request_ids = list(durable.pending_compaction_request_ids)
+                state.pending_compaction_request_ids = list(
+                    durable.pending_compaction_request_ids
+                )
                 state.compaction_requested = True
                 if state.compaction_status == "not_requested":
                     state.compaction_status = "pending"
@@ -481,13 +586,18 @@ def _finish_receipt_and_unlock(engine: Any, state: CheckpointState, final_status
             # do not publish a consolidate-only receipt. Native compact should
             # normally already have consumed it, but keep the lock fail-closed
             # if it did not.
-            if state.pending_compaction is not None and state.compaction_status != "completed":
+            if (
+                state.pending_compaction is not None
+                and state.compaction_status != "completed"
+            ):
                 state.failure_phase = "PENDING_COMPACTION"
                 state.completed_at = None
                 state.status = "COMMITTED_CONTEXT_PENDING"
                 state_store.save(engine, state)
                 current_receipt = receipt(engine, state)
-                workspace.save_json(f"checkpoints/{state.id}/receipt.json", current_receipt)
+                workspace.save_json(
+                    f"checkpoints/{state.id}/receipt.json", current_receipt
+                )
                 return {
                     "ok": True,
                     "checkpoint_id": state.id,
@@ -508,7 +618,11 @@ def _finish_receipt_and_unlock(engine: Any, state: CheckpointState, final_status
                 state.receipt_kind = "final"
                 state.receipt_inserted = False
                 state.receipt_outbox = None
-            elif state.receipt_inserted and not state.input_unlocked and state.receipt_generation == 0:
+            elif (
+                state.receipt_inserted
+                and not state.input_unlocked
+                and state.receipt_generation == 0
+            ):
                 # Legacy state may say that generation 0 was inserted even
                 # though a later pending compact reopened the operation. A
                 # modern generation with a failed unlock must be retried
@@ -536,7 +650,8 @@ def _finish_receipt_and_unlock(engine: Any, state: CheckpointState, final_status
                     "payload": {**current_receipt, "receipt_delivery": None},
                     "supersedes_key": (
                         f"{state.id}:{state.receipt_generation - 1}"
-                        if state.receipt_generation > 1 else None
+                        if state.receipt_generation > 1
+                        else None
                     ),
                     "delivery_status": "pending",
                     "host_resource_id": None,
@@ -556,18 +671,22 @@ def _finish_receipt_and_unlock(engine: Any, state: CheckpointState, final_status
                 state.receipt_outbox = outbox
                 state_store.save(engine, state)
                 immutable_receipt = dict(outbox["payload"])
-                acknowledgement = engine.adapter.publish_receipt(immutable_receipt, outbox)
+                acknowledgement = engine.adapter.publish_receipt(
+                    immutable_receipt, outbox
+                )
                 ensure(
                     isinstance(acknowledgement, dict)
                     and acknowledgement.get("key") == outbox["receipt_key"]
-                    and int(acknowledgement.get("generation", -1)) == int(outbox["generation"])
+                    and int(acknowledgement.get("generation", -1))
+                    == int(outbox["generation"])
                     and acknowledgement.get("payload_hash") == outbox["payload_hash"]
                     and isinstance(acknowledgement.get("host_resource_id"), str)
                     and acknowledgement.get("host_resource_id"),
                     "RECEIPT_ACK_INVALID",
                     "receipt",
                     "Host receipt acknowledgement did not prove key, generation, resource, and payload hash",
-                    retryable=True,
+                    canonical_changed=False,
+                    retry_safe=True,
                 )
                 state.receipt_outbox = {
                     **outbox,
@@ -592,7 +711,9 @@ def _finish_receipt_and_unlock(engine: Any, state: CheckpointState, final_status
             # the runtime receipt. This is not a Host notification retry; it
             # makes the local snapshot reflect the already acknowledged
             # generation without touching the canonical record.
-            workspace.save_json(f"checkpoints/{state.id}/receipt.json", receipt(engine, state))
+            workspace.save_json(
+                f"checkpoints/{state.id}/receipt.json", receipt(engine, state)
+            )
         except Exception as exc:
             state.failure_phase = phase
             state_store.save(engine, state)
@@ -614,11 +735,17 @@ def finalize_after_derivations(engine: Any, state: CheckpointState) -> dict[str,
 
     _sync_pending_compaction(engine, state)
     if state.worker_handle and "worker_cleanup" not in state.derivations:
-        state.derivations["worker_cleanup"] = {"ok": False, "pending": True, "status": "pending"}
+        state.derivations["worker_cleanup"] = {
+            "ok": False,
+            "pending": True,
+            "status": "pending",
+        }
         state_store.save(engine, state)
     # Cleanup is a prerequisite of the final snapshot. Its outcome must be
     # visible to both the canonical record and the Host receipt.
-    if state.worker_handle and state.derivations.get("worker_cleanup", {}).get("pending"):
+    if state.worker_handle and state.derivations.get("worker_cleanup", {}).get(
+        "pending"
+    ):
         derivations_steps.cleanup_worker(engine, state)
     _sync_pending_compaction(engine, state)
     pending = any(not item.get("ok", False) for item in state.derivations.values())
@@ -626,7 +753,9 @@ def finalize_after_derivations(engine: Any, state: CheckpointState) -> dict[str,
     # The durable checkpoint result is recorded after derivation outcomes and
     # native compact is invoked. This record audits the canonical consolidation
     # only; compact-only retries never append another canonical record.
-    current_record = engine.workspace.repository.current_records("checkpoints").get(state.id)
+    current_record = engine.workspace.repository.current_records("checkpoints").get(
+        state.id
+    )
     if not (
         getattr(state, "consolidation_status", None) == "no_op"
         or (state.pending_compaction is not None and current_record is not None)
@@ -647,8 +776,13 @@ def finalize_committed(engine: Any, state: CheckpointState) -> dict[str, Any]:
                 checkpoint_id=state.id,
                 source_commit=state.content_commit,
             )
-            if isinstance(rendered_context, dict) and rendered_context.get("ok") is False:
-                _raise_capability_error(rendered_context.get("error") or rendered_context, "context")
+            if (
+                isinstance(rendered_context, dict)
+                and rendered_context.get("ok") is False
+            ):
+                _raise_capability_error(
+                    rendered_context.get("error") or rendered_context, "context"
+                )
             state.context_bundle = rendered_context
             workspace.save_json("context/current.json", state.context_bundle)
             state_store.save(engine, state)
@@ -658,13 +792,17 @@ def finalize_committed(engine: Any, state: CheckpointState) -> dict[str, Any]:
             if hasattr(state, "context_publication_status"):
                 state.context_publication_status = "completed"
             state.derivations["context"] = {
-                **successful_attempt(state.derivations.get("context", {}), state.context_bundle),
+                **successful_attempt(
+                    state.derivations.get("context", {}), state.context_bundle
+                ),
                 "status": "completed",
             }
             state_store.transition(engine, state, "CONTEXT_PUBLISHED")
     except Exception as exc:
         state.status = "COMMITTED_CONTEXT_PENDING"
-        state.derivations["context"] = failed_attempt(state.derivations.get("context", {}), exc, "context")
+        state.derivations["context"] = failed_attempt(
+            state.derivations.get("context", {}), exc, "context"
+        )
         state.derivations["context"]["status"] = "failed"
         state.error = state.derivations["context"]["error"]
         if hasattr(state, "context_publication_status"):
@@ -684,11 +822,18 @@ def finalize_noop_compact(engine: Any, state: CheckpointState) -> dict[str, Any]
 
     No worker, transaction, canonical content commit, or derivation is
     created for this path.  The durable state and receipt still make the
-    operation observable and retryable.
+    operation observable and safe to retry.
     """
     if state.context_bundle is None:
         context_path = engine.workspace.state_path("context/current.json")
-        ensure(context_path.is_file(), "CONTEXT_BUNDLE_MISSING", "context", "No published context bundle is available to reuse")
+        ensure(
+            context_path.is_file(),
+            "CONTEXT_BUNDLE_MISSING",
+            "context",
+            "No published context bundle is available to reuse",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         state.context_bundle = engine.workspace.load_json("context/current.json")
     state.context_published = True
     if hasattr(state, "context_publication_status"):

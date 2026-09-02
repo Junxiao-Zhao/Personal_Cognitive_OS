@@ -196,11 +196,15 @@ def migrate_checkpoint_state(value: Any) -> Any:
 
     if "consolidation_source_hashes" not in data:
         data["consolidation_source_hashes"] = (
-            dict(data.get("source_hashes") or {}) if data.get("consolidation_cursor_after") else {}
+            dict(data.get("source_hashes") or {})
+            if data.get("consolidation_cursor_after")
+            else {}
         )
 
     if "consolidation_status" not in data:
-        data["consolidation_status"] = "committed" if data.get("consolidation_cursor_after") else "pending"
+        data["consolidation_status"] = (
+            "committed" if data.get("consolidation_cursor_after") else "pending"
+        )
     if "context_publication_status" not in data:
         data["context_publication_status"] = (
             "completed" if data.get("context_published") else "pending"
@@ -209,15 +213,20 @@ def migrate_checkpoint_state(value: Any) -> Any:
         data["compaction_requested"] = legacy or data.get("intent") == "compact"
     if "compaction_status" not in data:
         data["compaction_status"] = (
-            "completed" if compacted else "pending" if data["compaction_requested"] else "not_requested"
+            "completed"
+            if compacted
+            else "pending" if data["compaction_requested"] else "not_requested"
         )
     data.setdefault("compaction_origin", None)
     data.setdefault("pending_compaction", None)
     data.setdefault(
         "pending_compaction_request_ids",
-        [data["pending_compaction"]["request_id"]]
-        if isinstance(data.get("pending_compaction"), dict) and data["pending_compaction"].get("request_id")
-        else [],
+        (
+            [data["pending_compaction"]["request_id"]]
+            if isinstance(data.get("pending_compaction"), dict)
+            and data["pending_compaction"].get("request_id")
+            else []
+        ),
     )
     data.setdefault("native_compact_attempt_id", None)
     data.setdefault("pending_acceptance", "open")
@@ -242,7 +251,9 @@ def checkpoint_dir(engine: Any, checkpoint_id: str) -> Path:
 def save(engine: Any, state: CheckpointState) -> None:
     state.updated_at = utc_now()
     engine.workspace.save_json("active-checkpoint.json", state.model_dump(mode="json"))
-    engine.workspace.save_json(f"checkpoints/{state.id}/state.json", state.model_dump(mode="json"))
+    engine.workspace.save_json(
+        f"checkpoints/{state.id}/state.json", state.model_dump(mode="json")
+    )
 
 
 @contextmanager
@@ -265,7 +276,9 @@ def operation_lock(engine: Any) -> Iterator[None]:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def merge_pending_compaction(engine: Any, state: CheckpointState, pending: PendingCompaction | dict[str, Any]) -> bool:
+def merge_pending_compaction(
+    engine: Any, state: CheckpointState, pending: PendingCompaction | dict[str, Any]
+) -> bool:
     """Attach a Harness compaction request to the one durable checkpoint.
 
     The active checkpoint remains authoritative: a pending compact never
@@ -274,7 +287,11 @@ def merge_pending_compaction(engine: Any, state: CheckpointState, pending: Pendi
     the first request's boundary.
     """
 
-    request = pending if isinstance(pending, PendingCompaction) else PendingCompaction.model_validate(pending)
+    request = (
+        pending
+        if isinstance(pending, PendingCompaction)
+        else PendingCompaction.model_validate(pending)
+    )
     with operation_lock(engine):
         # Never merge into a stale object that a finalizer may have already
         # persisted. Reloading here prevents a late hook from being lost by a
@@ -285,7 +302,8 @@ def merge_pending_compaction(engine: Any, state: CheckpointState, pending: Pendi
             "CHECKPOINT_ACCEPTANCE_CLOSED",
             "checkpoint",
             "The checkpoint final outcome is already frozen; create a new compact attempt",
-            retryable=True,
+            canonical_changed=False,
+            retry_safe=True,
         )
         request_ids = list(state.pending_compaction_request_ids)
         changed = False
@@ -323,12 +341,18 @@ def retire_pending_compaction(engine: Any, state: CheckpointState) -> None:
         "PENDING_COMPACTION_NOT_FOUND",
         "checkpoint",
         "Checkpoint has no pending Harness compaction",
+        canonical_changed=False,
+        retry_safe=False,
     )
     ensure(
-        state.compaction_status == "completed" and state.receipt_inserted and state.input_unlocked,
+        state.compaction_status == "completed"
+        and state.receipt_inserted
+        and state.input_unlocked,
         "PENDING_COMPACTION_NOT_COMPLETE",
         "checkpoint",
         "Pending Harness compaction cannot retire before compact, receipt, and unlock succeed",
+        canonical_changed=False,
+        retry_safe=False,
     )
     state.pending_compaction = None
     save(engine, state)
@@ -343,7 +367,14 @@ def transition(engine: Any, state: CheckpointState, new_status: str) -> None:
 
 
 def load(engine: Any) -> CheckpointState:
-    ensure(active_path(engine).is_file(), "CHECKPOINT_NOT_FOUND", "checkpoint", "There is no active checkpoint")
+    ensure(
+        active_path(engine).is_file(),
+        "CHECKPOINT_NOT_FOUND",
+        "checkpoint",
+        "There is no active checkpoint",
+        canonical_changed=False,
+        retry_safe=False,
+    )
     return CheckpointState.model_validate(
         migrate_checkpoint_state(engine.workspace.load_json("active-checkpoint.json"))
     )
@@ -362,13 +393,19 @@ def status(engine: Any) -> dict[str, Any]:
             "compaction_cursor": engine.workspace.thread().compaction_cursor,
         },
         "canonical_transaction": {
-            "created": bool(state.transaction_id and state.consolidation_status != "no_op"),
-            "transaction_id": state.transaction_id if state.consolidation_status != "no_op" else None,
+            "created": bool(
+                state.transaction_id and state.consolidation_status != "no_op"
+            ),
+            "transaction_id": (
+                state.transaction_id if state.consolidation_status != "no_op" else None
+            ),
         },
     }
     proposal_path = checkpoint_dir(engine, state.id) / "proposal.json"
     if proposal_path.is_file() and state.status == "AWAITING_META_APPROVAL":
-        result["proposal"] = engine.workspace.load_json(f"checkpoints/{state.id}/proposal.json")
+        result["proposal"] = engine.workspace.load_json(
+            f"checkpoints/{state.id}/proposal.json"
+        )
     return result
 
 
@@ -379,7 +416,11 @@ def should_auto_checkpoint(engine: Any, intent: str = "compact") -> bool:
             return False
     checkpoint = engine.workspace.config.checkpoint
     if intent == "compact":
-        return bool(checkpoint.auto_compact.enabled and engine.adapter.estimate_context_usage() >= checkpoint.auto_compact.context_ratio)
+        return bool(
+            checkpoint.auto_compact.enabled
+            and engine.adapter.estimate_context_usage()
+            >= checkpoint.auto_compact.context_ratio
+        )
     if not checkpoint.auto_consolidate.enabled:
         return False
     thread = engine.workspace.thread()
@@ -394,11 +435,19 @@ def should_auto_checkpoint(engine: Any, intent: str = "compact") -> bool:
         payload = message.get("payload", {})
         if payload.get("role") not in {"user", "assistant"}:
             continue
-        estimated += sum(1 if ord(char) > 127 else 0.25 for char in str(payload.get("content", "")))
+        estimated += sum(
+            1 if ord(char) > 127 else 0.25 for char in str(payload.get("content", ""))
+        )
     return estimated >= checkpoint.auto_consolidate.new_public_tokens
 
 
-def recover(engine: Any, state: CheckpointState, exc: Exception, *, preserve_status: bool = False) -> None:
+def recover(
+    engine: Any,
+    state: CheckpointState,
+    exc: Exception,
+    *,
+    preserve_status: bool = False,
+) -> None:
     state.failure_phase = state.status
     if isinstance(exc, MemError):
         state.error = exc.as_dict()["error"]
@@ -407,7 +456,8 @@ def recover(engine: Any, state: CheckpointState, exc: Exception, *, preserve_sta
             "code": "UNEXPECTED",
             "phase": str(state.status).lower(),
             "message": str(exc),
-            "retryable": True,
+            "canonical_changed": False,
+            "retry_safe": True,
             "recovery": ["Run /pco-retry with the same checkpoint"],
         }
     if not preserve_status:

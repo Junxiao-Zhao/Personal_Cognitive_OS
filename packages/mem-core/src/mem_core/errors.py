@@ -9,11 +9,12 @@ class ErrorDetail:
     code: str
     phase: str
     message: str
+    canonical_changed: bool = False
+    retry_safe: bool = False
     stream: str | None = None
     record_id: str | None = None
     path: str | None = None
     value: Any = None
-    retryable: bool = False
     recovery: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -21,7 +22,8 @@ class ErrorDetail:
             "code": self.code,
             "phase": self.phase,
             "message": self.message,
-            "retryable": self.retryable,
+            "canonical_changed": self.canonical_changed,
+            "retry_safe": self.retry_safe,
             "recovery": self.recovery,
         }
         for key in ("stream", "record_id", "path", "value"):
@@ -40,11 +42,12 @@ class MemError(Exception):
         phase: str,
         message: str,
         *,
+        canonical_changed: bool,
+        retry_safe: bool,
         stream: str | None = None,
         record_id: str | None = None,
         path: str | None = None,
         value: Any = None,
-        retryable: bool = False,
         recovery: list[str] | None = None,
     ) -> None:
         super().__init__(message)
@@ -52,11 +55,12 @@ class MemError(Exception):
             code=code,
             phase=phase,
             message=message,
+            canonical_changed=canonical_changed,
+            retry_safe=retry_safe,
             stream=stream,
             record_id=record_id,
             path=path,
             value=value,
-            retryable=retryable,
             recovery=recovery or [],
         )
 
@@ -69,7 +73,17 @@ def ensure(
     code: str,
     phase: str,
     message: str,
+    *,
+    canonical_changed: bool,
+    retry_safe: bool,
     **details: Any,
 ) -> None:
     if not condition:
-        raise MemError(code, phase, message, **details)
+        raise MemError(
+            code,
+            phase,
+            message,
+            canonical_changed=canonical_changed,
+            retry_safe=retry_safe,
+            **details,
+        )

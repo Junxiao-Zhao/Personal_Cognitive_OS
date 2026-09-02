@@ -9,14 +9,16 @@ from mem_core.errors import MemError
 from omegaconf import OmegaConf
 from pydantic import BaseModel, ConfigDict, Field
 
-
 LEGACY_TRIGGER_RATIO_FIELD = "checkpoint.trigger_ratio"
 LEGACY_TRIGGER_RATIO_NOTICE = {
     "code": "CONFIG_MIGRATION_REQUIRED",
     "kind": "migration_error",
     "machine_detectable": True,
     "field": LEGACY_TRIGGER_RATIO_FIELD,
-    "replacement": ["checkpoint.auto_consolidate.new_public_tokens", "checkpoint.auto_compact.context_ratio"],
+    "replacement": [
+        "checkpoint.auto_consolidate.new_public_tokens",
+        "checkpoint.auto_compact.context_ratio",
+    ],
     "action": "Remove checkpoint.trigger_ratio and set both v0.4.0 thresholds explicitly.",
     "next": "Run /consolidate before migrating the configuration.",
 }
@@ -47,7 +49,9 @@ class AutoCompactConfig(BaseModel):
 class CheckpointConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    auto_consolidate: AutoConsolidateConfig = Field(default_factory=AutoConsolidateConfig)
+    auto_consolidate: AutoConsolidateConfig = Field(
+        default_factory=AutoConsolidateConfig
+    )
     auto_compact: AutoCompactConfig = Field(default_factory=AutoCompactConfig)
     derivations: DerivationConfig = Field(default_factory=DerivationConfig)
 
@@ -92,7 +96,9 @@ class PCOConfig(BaseModel):
         return self.workspace_root / self.projection_dir
 
 
-def load_config(*, workspace: Path | None = None, overrides: list[str] | None = None) -> PCOConfig:
+def load_config(
+    *, workspace: Path | None = None, overrides: list[str] | None = None
+) -> PCOConfig:
     config_dir = Path(str(files("pco.resources.config"))).resolve()
     effective_overrides = list(overrides or [])
     for override in effective_overrides:
@@ -116,7 +122,11 @@ def load_config(*, workspace: Path | None = None, overrides: list[str] | None = 
 
 
 def _has_legacy_trigger_ratio(value: object) -> bool:
-    return isinstance(value, dict) and isinstance(value.get("checkpoint"), dict) and "trigger_ratio" in value["checkpoint"]
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("checkpoint"), dict)
+        and "trigger_ratio" in value["checkpoint"]
+    )
 
 
 def _legacy_trigger_ratio_error(source: object) -> MemError:
@@ -136,4 +146,6 @@ def _legacy_trigger_ratio_error(source: object) -> MemError:
             "Set checkpoint.auto_consolidate.new_public_tokens",
             "Set checkpoint.auto_compact.context_ratio",
         ],
+        canonical_changed=False,
+        retry_safe=False,
     )

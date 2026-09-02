@@ -18,7 +18,6 @@ from json_repair import repair_json
 from mem_core.errors import MemError, ensure
 from mem_core.models import Operation
 
-
 _EXTERNAL_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
 
 
@@ -43,13 +42,18 @@ def normalize_external_url(value: Any) -> str | None:
         if parsed.password is not None:
             credentials += f":{parsed.password}"
         netloc = f"{credentials}@{netloc}"
-    if port is not None and not ((parsed.scheme.lower() == "http" and port == 80) or (parsed.scheme.lower() == "https" and port == 443)):
+    if port is not None and not (
+        (parsed.scheme.lower() == "http" and port == 80)
+        or (parsed.scheme.lower() == "https" and port == 443)
+    ):
         netloc = f"{netloc}:{port}"
     path = parsed.path or "/"
     return urlunsplit((parsed.scheme.lower(), netloc, path, parsed.query, ""))
 
 
-def extract_result_urls(tool: str, tool_input: Any, tool_output: Any, *, status: str, error: Any = None) -> list[str]:
+def extract_result_urls(
+    tool: str, tool_input: Any, tool_output: Any, *, status: str, error: Any = None
+) -> list[str]:
     """Extract only wrapper-observed result URLs from a completed tool call.
 
     Search results come exclusively from the tool output.  Fetch results use
@@ -61,13 +65,17 @@ def extract_result_urls(tool: str, tool_input: Any, tool_output: Any, *, status:
         if isinstance(tool_output, str):
             output_text = tool_output
         else:
-            output_text = json.dumps(tool_output, ensure_ascii=False, sort_keys=True, default=str)
+            output_text = json.dumps(
+                tool_output, ensure_ascii=False, sort_keys=True, default=str
+            )
         candidates = _EXTERNAL_URL_RE.findall(output_text)
     elif tool == "webfetch":
         candidates = [tool_input.get("url")] if isinstance(tool_input, dict) else []
     else:
         candidates = []
-    normalized = {url for candidate in candidates if (url := normalize_external_url(candidate))}
+    normalized = {
+        url for candidate in candidates if (url := normalize_external_url(candidate))
+    }
     return sorted(normalized)
 
 
@@ -109,9 +117,14 @@ def receipt_payload_hash(receipt: dict[str, Any]) -> str:
         for key, value in receipt.items()
         if key not in {"host_receipt_generation", "receipt_delivery"}
     }
-    return "sha256:" + hashlib.sha256(
-        json.dumps(immutable, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                immutable, ensure_ascii=False, sort_keys=True, default=str
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
 WORKER_RESULT_SCHEMA: dict[str, Any] = {
@@ -147,7 +160,10 @@ WORKER_RESULT_SCHEMA: dict[str, Any] = {
             },
         },
         "diagnostics": {"type": "array", "items": {"type": "object"}},
-        "skill_versions": {"type": "object", "additionalProperties": {"type": "string"}},
+        "skill_versions": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
     },
 }
 
@@ -159,7 +175,11 @@ class WorkerHandle:
     native_session_id: str
 
     def as_dict(self) -> dict[str, str]:
-        return {"id": self.id, "backend": self.backend, "native_session_id": self.native_session_id}
+        return {
+            "id": self.id,
+            "backend": self.backend,
+            "native_session_id": self.native_session_id,
+        }
 
 
 @dataclass(slots=True)
@@ -182,7 +202,9 @@ class NativeCompactBypass:
     expires_at: int
 
     @classmethod
-    def from_value(cls, value: "NativeCompactBypass | dict[str, Any]") -> "NativeCompactBypass":
+    def from_value(
+        cls, value: "NativeCompactBypass | dict[str, Any]"
+    ) -> "NativeCompactBypass":
         if isinstance(value, cls):
             return value
         checkpoint_id = value.get("checkpoint_id", value.get("checkpointID"))
@@ -194,30 +216,40 @@ class NativeCompactBypass:
             "NATIVE_COMPACT_TOKEN_INVALID",
             "native_compact",
             "Missing native compact bypass token",
+            canonical_changed=False,
+            retry_safe=False,
         )
         ensure(
             isinstance(checkpoint_id, str) and checkpoint_id,
             "NATIVE_COMPACT_TOKEN_INVALID",
             "native_compact",
             "Missing native compact checkpoint binding",
+            canonical_changed=False,
+            retry_safe=False,
         )
         ensure(
             isinstance(session_id, str) and session_id,
             "NATIVE_COMPACT_TOKEN_INVALID",
             "native_compact",
             "Missing native compact session binding",
+            canonical_changed=False,
+            retry_safe=False,
         )
         ensure(
             isinstance(attempt_id, str) and attempt_id,
             "NATIVE_COMPACT_TOKEN_INVALID",
             "native_compact",
             "Missing native compact attempt binding",
+            canonical_changed=False,
+            retry_safe=False,
         )
         ensure(
             isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool),
             "NATIVE_COMPACT_TOKEN_INVALID",
             "native_compact",
             "Missing native compact token expiry",
+            canonical_changed=False,
+            retry_safe=False,
         )
         return cls(
             token=value["token"],
@@ -245,11 +277,17 @@ class HarnessAdapter(Protocol):
     def lock_input(self, checkpoint_id: str, state: str) -> None: ...
     def unlock_input(self) -> None: ...
     def spawn_worker(self, spec: dict[str, Any]) -> WorkerHandle: ...
-    def resume_worker(self, handle: WorkerHandle, payload: dict[str, Any]) -> WorkerResult: ...
+    def resume_worker(
+        self, handle: WorkerHandle, payload: dict[str, Any]
+    ) -> WorkerResult: ...
     def close_worker(self, handle: WorkerHandle) -> None: ...
-    def compact(self, bypass: NativeCompactBypass | dict[str, Any] | None = None) -> None: ...
+    def compact(
+        self, bypass: NativeCompactBypass | dict[str, Any] | None = None
+    ) -> None: ...
     def publish_context(self, bundle: dict[str, Any]) -> None: ...
-    def publish_receipt(self, receipt: dict[str, Any], outbox: dict[str, Any]) -> dict[str, Any]: ...
+    def publish_receipt(
+        self, receipt: dict[str, Any], outbox: dict[str, Any]
+    ) -> dict[str, Any]: ...
 
 
 class FakeHarnessAdapter:
@@ -302,12 +340,18 @@ class FakeHarnessAdapter:
         return self.context_usage
 
     def runtime_info(self) -> dict[str, Any]:
-        exposed = any(message.get("reasoning") for message in self.messages if message.get("role") == "assistant")
+        exposed = any(
+            message.get("reasoning")
+            for message in self.messages
+            if message.get("role") == "assistant"
+        )
         return {
             "harness": "fake",
             "provider": "fixture",
             "model": "fixture",
-            "reasoning_capability": "exposed_in_range" if exposed else "not_exposed_in_range",
+            "reasoning_capability": (
+                "exposed_in_range" if exposed else "not_exposed_in_range"
+            ),
         }
 
     def lock_input(self, checkpoint_id: str, state: str) -> None:
@@ -315,7 +359,12 @@ class FakeHarnessAdapter:
         self.actions.append(f"lock:{state}")
         path = self.state_root / "checkpoint-lock.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"checkpoint_id": checkpoint_id, "state": state}, sort_keys=True), encoding="utf-8")
+        path.write_text(
+            json.dumps(
+                {"checkpoint_id": checkpoint_id, "state": state}, sort_keys=True
+            ),
+            encoding="utf-8",
+        )
 
     def unlock_input(self) -> None:
         self.actions.append("unlock")
@@ -326,9 +375,15 @@ class FakeHarnessAdapter:
         self._maybe_fail("spawn_worker")
         self.worker_calls += 1
         self.actions.append("spawn_worker")
-        return WorkerHandle(f"worker_{uuid.uuid4().hex}", "native_subagent", f"ses_fake_child_{self.worker_calls}")
+        return WorkerHandle(
+            f"worker_{uuid.uuid4().hex}",
+            "native_subagent",
+            f"ses_fake_child_{self.worker_calls}",
+        )
 
-    def resume_worker(self, handle: WorkerHandle, payload: dict[str, Any]) -> WorkerResult:
+    def resume_worker(
+        self, handle: WorkerHandle, payload: dict[str, Any]
+    ) -> WorkerResult:
         self._maybe_fail("resume_worker")
         self.resume_calls += 1
         self.actions.append(f"resume_worker:{payload.get('kind')}")
@@ -339,7 +394,9 @@ class FakeHarnessAdapter:
         self.actions.append("close_worker")
         self.closed_workers.append(handle.id)
 
-    def compact(self, bypass: NativeCompactBypass | dict[str, Any] | None = None) -> None:
+    def compact(
+        self, bypass: NativeCompactBypass | dict[str, Any] | None = None
+    ) -> None:
         self._maybe_fail("compact")
         self.compact_calls += 1
         self.actions.append("compact")
@@ -349,14 +406,22 @@ class FakeHarnessAdapter:
         self.published.append(bundle)
         self.actions.append("publish_context")
 
-    def publish_receipt(self, receipt: dict[str, Any], outbox: dict[str, Any]) -> dict[str, Any]:
+    def publish_receipt(
+        self, receipt: dict[str, Any], outbox: dict[str, Any]
+    ) -> dict[str, Any]:
         self._maybe_fail("publish_receipt")
         key = str(outbox["receipt_key"])
         payload_hash = str(outbox["payload_hash"])
         existing = self.receipt_resources.get(key)
         if existing is not None:
             if existing["payload_hash"] != payload_hash:
-                raise MemError("RECEIPT_KEY_CONFLICT", "receipt", "Receipt key was reused with a different payload", retryable=False)
+                raise MemError(
+                    "RECEIPT_KEY_CONFLICT",
+                    "receipt",
+                    "Receipt key was reused with a different payload",
+                    canonical_changed=False,
+                    retry_safe=False,
+                )
             self.actions.append("receipt_existing")
             return {**existing, "disposition": "existing"}
         resource = {
@@ -375,7 +440,11 @@ class FakeHarnessAdapter:
         # Compatibility entry point for older direct adapter callers. The
         # checkpoint finalizer uses publish_receipt and its durable outbox.
         key = str(receipt.get("receipt_key") or f"legacy:{uuid.uuid4().hex}")
-        outbox = {"receipt_key": key, "generation": int(receipt.get("receipt_generation", 0)), "payload_hash": receipt_payload_hash(receipt)}
+        outbox = {
+            "receipt_key": key,
+            "generation": int(receipt.get("receipt_generation", 0)),
+            "payload_hash": receipt_payload_hash(receipt),
+        }
         self.publish_receipt(receipt, outbox)
 
 
@@ -400,7 +469,9 @@ class OpenCodeAdapter:
         self.model_context_tokens = model_context_tokens
         self.timeout_seconds = timeout
         self.native_compact_bypass = native_compact_bypass
-        self.client = httpx.Client(base_url=self.base_url, timeout=timeout, trust_env=False)
+        self.client = httpx.Client(
+            base_url=self.base_url, timeout=timeout, trust_env=False
+        )
         self._runtime_info: dict[str, Any] = {
             "harness": "opencode",
             "server_url": self.base_url,
@@ -429,7 +500,10 @@ class OpenCodeAdapter:
 
     def _clear_stale_runtime_context_limit(self) -> tuple[str | None, str | None]:
         key = self._active_model_key()
-        if self._runtime_context_limit_key is not None and self._runtime_context_limit_key != key:
+        if (
+            self._runtime_context_limit_key is not None
+            and self._runtime_context_limit_key != key
+        ):
             self._runtime_info.pop("context_limit", None)
             self._runtime_context_limit_key = None
         return key
@@ -440,7 +514,11 @@ class OpenCodeAdapter:
             model_limit = value.get("limit")
             if isinstance(model_limit, dict):
                 candidate = model_limit.get("context")
-                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool) and candidate > 0:
+                if (
+                    isinstance(candidate, (int, float))
+                    and not isinstance(candidate, bool)
+                    and candidate > 0
+                ):
                     return int(candidate)
             for key in (
                 "context_limit",
@@ -453,7 +531,11 @@ class OpenCodeAdapter:
                 "maxInputTokens",
             ):
                 candidate = value.get(key)
-                if isinstance(candidate, (int, float)) and not isinstance(candidate, bool) and candidate > 0:
+                if (
+                    isinstance(candidate, (int, float))
+                    and not isinstance(candidate, bool)
+                    and candidate > 0
+                ):
                     return int(candidate)
             for key in ("model", "metadata", "limits", "capabilities"):
                 candidate = value.get(key)
@@ -481,7 +563,9 @@ class OpenCodeAdapter:
                 limit = self._context_limit_from(model)
                 if limit is not None:
                     self._model_context_limits[(provider_id, model_id)] = limit
-                    if provider_id == self._runtime_info.get("provider") and model_id == self._runtime_info.get("model"):
+                    if provider_id == self._runtime_info.get(
+                        "provider"
+                    ) and model_id == self._runtime_info.get("model"):
                         self._runtime_info["context_limit"] = limit
                         self._runtime_context_limit_key = (provider_id, model_id)
 
@@ -511,7 +595,13 @@ class OpenCodeAdapter:
 
     @staticmethod
     def _numeric(value: Any) -> float | None:
-        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else None
+        return (
+            float(value)
+            if isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value >= 0
+            else None
+        )
 
     @classmethod
     def _usage_tokens(cls, value: Any) -> float | None:
@@ -523,9 +613,16 @@ class OpenCodeAdapter:
         fields = [cls._numeric(value.get("input")), cls._numeric(value.get("output"))]
         cache = value.get("cache")
         if isinstance(cache, dict):
-            fields.extend([cls._numeric(cache.get("read")), cls._numeric(cache.get("write"))])
+            fields.extend(
+                [cls._numeric(cache.get("read")), cls._numeric(cache.get("write"))]
+            )
         else:
-            fields.extend([cls._numeric(value.get("cache.read")), cls._numeric(value.get("cache.write"))])
+            fields.extend(
+                [
+                    cls._numeric(value.get("cache.read")),
+                    cls._numeric(value.get("cache.write")),
+                ]
+            )
         usable = [field for field in fields if field is not None]
         return sum(usable) if usable else None
 
@@ -539,13 +636,24 @@ class OpenCodeAdapter:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         params = dict(kwargs.pop("params", {}))
-        if path.startswith("/session") or path.startswith("/tui") or path == "/provider":
+        if (
+            path.startswith("/session")
+            or path.startswith("/tui")
+            or path == "/provider"
+        ):
             params.setdefault("directory", str(self.directory))
         try:
             response = self.client.request(method, path, params=params, **kwargs)
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise MemError("HARNESS_REQUEST_FAILED", "harness", str(exc), retryable=True, recovery=["Check the OpenCode server and retry the checkpoint"]) from exc
+            raise MemError(
+                "HARNESS_REQUEST_FAILED",
+                "harness",
+                str(exc),
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=["Check the OpenCode server and retry the checkpoint"],
+            ) from exc
         if response.status_code == 204 or not response.content:
             return None
         return response.json()
@@ -557,7 +665,9 @@ class OpenCodeAdapter:
         except MemError:
             self._runtime_info["harness_version"] = "unknown"
         if self.session_id:
-            self._remember_context_limit(self._request("GET", f"/session/{self.session_id}"))
+            self._remember_context_limit(
+                self._request("GET", f"/session/{self.session_id}")
+            )
             return self.session_id
         session = self._request("POST", "/session", json={"title": "PCO 主会话"})
         self._remember_context_limit(session)
@@ -605,7 +715,14 @@ class OpenCodeAdapter:
         }
 
     def archive_messages_since(self, cursor: str | None) -> list[dict[str, Any]]:
-        ensure(self.session_id is not None, "HARNESS_NOT_ATTACHED", "harness", "OpenCode session is not attached")
+        ensure(
+            self.session_id is not None,
+            "HARNESS_NOT_ATTACHED",
+            "harness",
+            "OpenCode session is not attached",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         page_size = 1000
         items: list[dict[str, Any]] = []
         before: str | None = None
@@ -615,22 +732,55 @@ class OpenCodeAdapter:
             params: dict[str, Any] = {"limit": page_size}
             if before is not None:
                 params["before"] = before
-            page = self._request("GET", f"/session/{self.session_id}/message", params=params)
-            ensure(isinstance(page, list), "HARNESS_RESPONSE_INVALID", "harness", "OpenCode messages response is not a list")
+            page = self._request(
+                "GET", f"/session/{self.session_id}/message", params=params
+            )
+            ensure(
+                isinstance(page, list),
+                "HARNESS_RESPONSE_INVALID",
+                "harness",
+                "OpenCode messages response is not a list",
+                canonical_changed=False,
+                retry_safe=False,
+            )
             if not page:
                 break
             items = page + items
-            if cursor is not None and any(item.get("info", {}).get("id") == cursor for item in page):
+            if cursor is not None and any(
+                item.get("info", {}).get("id") == cursor for item in page
+            ):
                 cursor_found = True
                 break
             if len(page) < page_size:
                 break
             boundary = page[0].get("info", {}).get("id")
-            ensure(boundary, "HARNESS_RESPONSE_INVALID", "harness", "OpenCode message page has no boundary ID")
-            ensure(boundary not in seen_boundaries, "HARNESS_PAGINATION_STALLED", "harness", "OpenCode message pagination did not advance")
+            ensure(
+                boundary,
+                "HARNESS_RESPONSE_INVALID",
+                "harness",
+                "OpenCode message page has no boundary ID",
+                canonical_changed=False,
+                retry_safe=False,
+            )
+            ensure(
+                boundary not in seen_boundaries,
+                "HARNESS_PAGINATION_STALLED",
+                "harness",
+                "OpenCode message pagination did not advance",
+                canonical_changed=False,
+                retry_safe=False,
+            )
             seen_boundaries.add(boundary)
             before = boundary
-        ensure(cursor_found, "ARCHIVE_CURSOR_NOT_FOUND", "harness", "The archive cursor is no longer present in the complete OpenCode history", value=cursor)
+        ensure(
+            cursor_found,
+            "ARCHIVE_CURSOR_NOT_FOUND",
+            "harness",
+            "The archive cursor is no longer present in the complete OpenCode history",
+            value=cursor,
+            canonical_changed=False,
+            retry_safe=False,
+        )
         for item in reversed(items):
             info = item.get("info", {})
             if info.get("role") != "assistant":
@@ -639,11 +789,18 @@ class OpenCodeAdapter:
             self._remember_context_limit(info)
             self._runtime_info["reasoning_capability"] = (
                 "exposed_in_range"
-                if any(part.get("type") == "reasoning" and part.get("text") for part in item.get("parts", []))
+                if any(
+                    part.get("type") == "reasoning" and part.get("text")
+                    for part in item.get("parts", [])
+                )
                 else "not_exposed_in_range"
             )
             break
-        visible = [message for item in items if (message := self._visible_message(item)) is not None]
+        visible = [
+            message
+            for item in items
+            if (message := self._visible_message(item)) is not None
+        ]
         if cursor is None:
             return visible
         for index, message in enumerate(visible):
@@ -652,26 +809,37 @@ class OpenCodeAdapter:
         return visible
 
     def estimate_context_usage(self) -> float:
-        ensure(self.session_id is not None, "HARNESS_NOT_ATTACHED", "harness", "OpenCode session is not attached")
+        ensure(
+            self.session_id is not None,
+            "HARNESS_NOT_ATTACHED",
+            "harness",
+            "OpenCode session is not attached",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         response = self._request("GET", f"/api/session/{self.session_id}/context")
         items = response.get("data", []) if isinstance(response, dict) else []
         assistant_indexes = [
             index
             for index, item in enumerate(items)
-            if isinstance(item, dict) and item.get("info", item).get("role") == "assistant"
+            if isinstance(item, dict)
+            and item.get("info", item).get("role") == "assistant"
         ]
         if not assistant_indexes:
             # Older OpenCode fixtures omitted role while still returning usage.
             assistant_indexes = [
                 index
                 for index, item in enumerate(items)
-                if isinstance(item, dict) and isinstance(item.get("info", item).get("tokens"), dict)
+                if isinstance(item, dict)
+                and isinstance(item.get("info", item).get("tokens"), dict)
             ]
         latest_index = assistant_indexes[-1] if assistant_indexes else None
         if latest_index is not None:
             latest_info = items[latest_index].get("info", items[latest_index])
             if latest_info.get("providerID") or latest_info.get("modelID"):
-                self._set_model_identity(latest_info.get("providerID"), latest_info.get("modelID"))
+                self._set_model_identity(
+                    latest_info.get("providerID"), latest_info.get("modelID")
+                )
         current_model_key = self._clear_stale_runtime_context_limit()
         # A context response may carry the active model's limit. Associate it
         # only after the active model has been identified; never let it remain
@@ -686,13 +854,21 @@ class OpenCodeAdapter:
         else:
             usage = None
         if usage is None:
-            used = sum(self._text_tokens(item) for item in items if isinstance(item, dict))
+            used = sum(
+                self._text_tokens(item) for item in items if isinstance(item, dict)
+            )
         else:
             used = usage
             for item in items[latest_index + 1 :] if latest_index is not None else []:
-                if isinstance(item, dict) and item.get("info", item).get("role") == "user":
+                if (
+                    isinstance(item, dict)
+                    and item.get("info", item).get("role") == "user"
+                ):
                     used += self._text_tokens(item)
-        limit = self._model_context_limits.get(current_model_key) or self.model_context_tokens
+        limit = (
+            self._model_context_limits.get(current_model_key)
+            or self.model_context_tokens
+        )
         ratio = used / float(limit) if limit else 0.0
         return max(0.0, min(1.0, ratio))
 
@@ -702,21 +878,43 @@ class OpenCodeAdapter:
     def lock_input(self, checkpoint_id: str, state: str) -> None:
         path = self.state_root / "checkpoint-lock.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"checkpoint_id": checkpoint_id, "state": state}, sort_keys=True), encoding="utf-8")
+        path.write_text(
+            json.dumps(
+                {"checkpoint_id": checkpoint_id, "state": state}, sort_keys=True
+            ),
+            encoding="utf-8",
+        )
 
     def unlock_input(self) -> None:
         (self.state_root / "checkpoint-lock.json").unlink(missing_ok=True)
 
     def spawn_worker(self, spec: dict[str, Any]) -> WorkerHandle:
-        ensure(self.session_id is not None, "HARNESS_NOT_ATTACHED", "harness", "OpenCode session is not attached")
+        ensure(
+            self.session_id is not None,
+            "HARNESS_NOT_ATTACHED",
+            "harness",
+            "OpenCode session is not attached",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         session = self._request(
             "POST",
             "/session",
-            json={"parentID": self.session_id, "title": f"PCO consolidate {spec['checkpoint_id']}", "agent": "pco-consolidator", "metadata": {"pco_worker_id": spec["worker_id"], "checkpoint_id": spec["checkpoint_id"]}},
+            json={
+                "parentID": self.session_id,
+                "title": f"PCO consolidate {spec['checkpoint_id']}",
+                "agent": "pco-consolidator",
+                "metadata": {
+                    "pco_worker_id": spec["worker_id"],
+                    "checkpoint_id": spec["checkpoint_id"],
+                },
+            },
         )
         return WorkerHandle(spec["worker_id"], "native_subagent", session["id"])
 
-    def resume_worker(self, handle: WorkerHandle, payload: dict[str, Any]) -> WorkerResult:
+    def resume_worker(
+        self, handle: WorkerHandle, payload: dict[str, Any]
+    ) -> WorkerResult:
         model = None
         if self._runtime_info.get("provider") and self._runtime_info.get("model"):
             model = {
@@ -725,8 +923,14 @@ class OpenCodeAdapter:
             }
         body: dict[str, Any] = {
             "agent": "pco-consolidator",
-            "format": {"type": "json_schema", "schema": WORKER_RESULT_SCHEMA, "retryCount": 1},
-            "parts": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}],
+            "format": {
+                "type": "json_schema",
+                "schema": WORKER_RESULT_SCHEMA,
+                "retryCount": 1,
+            },
+            "parts": [
+                {"type": "text", "text": json.dumps(payload, ensure_ascii=False)}
+            ],
         }
         if model is not None:
             body["model"] = model
@@ -775,7 +979,11 @@ class OpenCodeAdapter:
             )
             try:
                 proposal, repaired = self._worker_proposal(response, structured=False)
-                output_mode = "validated_json_text_repair" if repaired else "validated_json_text_fallback"
+                output_mode = (
+                    "validated_json_text_repair"
+                    if repaired
+                    else "validated_json_text_fallback"
+                )
             except MemError as fallback_error:
                 try:
                     self._request("POST", f"/session/{handle.native_session_id}/abort")
@@ -805,11 +1013,24 @@ class OpenCodeAdapter:
                     json=correction_body,
                 )
                 proposal, repaired = self._worker_proposal(response, structured=False)
-                output_mode = "validated_json_text_correction_repair" if repaired else "validated_json_text_correction"
+                output_mode = (
+                    "validated_json_text_correction_repair"
+                    if repaired
+                    else "validated_json_text_correction"
+                )
         try:
-            operations = [Operation.model_validate(item) for item in proposal["operations"]]
+            operations = [
+                Operation.model_validate(item) for item in proposal["operations"]
+            ]
         except Exception as exc:
-            raise MemError("WORKER_RESULT_INVALID", "worker", str(exc), retryable=True, recovery=["Retry with the same frozen checkpoint input"]) from exc
+            raise MemError(
+                "WORKER_RESULT_INVALID",
+                "worker",
+                str(exc),
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=["Retry with the same frozen checkpoint input"],
+            ) from exc
         info = response.get("info", {})
         runtime_info = {
             "worker_provider": info.get("providerID"),
@@ -817,7 +1038,10 @@ class OpenCodeAdapter:
             "worker_output_mode": output_mode,
             "worker_reasoning_capability": (
                 "exposed"
-                if any(part.get("type") == "reasoning" and part.get("text") for part in response.get("parts", []))
+                if any(
+                    part.get("type") == "reasoning" and part.get("text")
+                    for part in response.get("parts", [])
+                )
                 else "not_exposed"
             ),
         }
@@ -825,7 +1049,11 @@ class OpenCodeAdapter:
         for part in response.get("parts", []):
             state = part.get("state", {})
             tool_name = part.get("tool")
-            if part.get("type") != "tool" or tool_name not in {"websearch", "webfetch"} or state.get("status") != "completed":
+            if (
+                part.get("type") != "tool"
+                or tool_name not in {"websearch", "webfetch"}
+                or state.get("status") != "completed"
+            ):
                 continue
             call_id = str(part.get("callID") or part.get("id") or "")
             tool_input = state.get("input", {})
@@ -839,7 +1067,12 @@ class OpenCodeAdapter:
             )
             digest = hashlib.sha256(
                 json.dumps(
-                    {"call_id": call_id, "tool": tool_name, "input": tool_input, "output": tool_output},
+                    {
+                        "call_id": call_id,
+                        "tool": tool_name,
+                        "input": tool_input,
+                        "output": tool_output,
+                    },
                     ensure_ascii=False,
                     sort_keys=True,
                     default=str,
@@ -871,17 +1104,26 @@ class OpenCodeAdapter:
         )
 
     @staticmethod
-    def _worker_proposal(response: dict[str, Any], *, structured: bool) -> tuple[dict[str, Any], bool]:
+    def _worker_proposal(
+        response: dict[str, Any], *, structured: bool
+    ) -> tuple[dict[str, Any], bool]:
         info = response.get("info", {})
         if info.get("error"):
             error = info["error"]
-            message = error.get("data", {}).get("message") if isinstance(error, dict) else str(error)
+            message = (
+                error.get("data", {}).get("message")
+                if isinstance(error, dict)
+                else str(error)
+            )
             raise MemError(
                 "WORKER_MODEL_FAILED",
                 "worker",
                 message or "OpenCode worker model returned an error",
-                retryable=True,
-                recovery=["Retry with a model that supports the worker result contract"],
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=[
+                    "Retry with a model that supports the worker result contract"
+                ],
             )
         proposal = info.get("structured") if structured else None
         repaired = False
@@ -893,14 +1135,17 @@ class OpenCodeAdapter:
             ).strip()
             if text.startswith("```"):
                 lines = text.splitlines()
-                text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+                text = "\n".join(
+                    lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+                )
             start = text.find("{")
             if start < 0:
                 raise MemError(
                     "WORKER_RESULT_INVALID",
                     "worker",
                     "OpenCode worker returned neither structured output nor a JSON object",
-                    retryable=True,
+                    canonical_changed=False,
+                    retry_safe=True,
                 )
             try:
                 proposal, _end = json.JSONDecoder().raw_decode(text[start:])
@@ -914,9 +1159,21 @@ class OpenCodeAdapter:
                     )
                     repaired = True
                 except Exception as repair_exc:
-                    raise MemError("WORKER_RESULT_INVALID", "worker", str(exc), retryable=True) from repair_exc
+                    raise MemError(
+                        "WORKER_RESULT_INVALID",
+                        "worker",
+                        str(exc),
+                        canonical_changed=False,
+                        retry_safe=True,
+                    ) from repair_exc
         if not isinstance(proposal, dict):
-            raise MemError("WORKER_RESULT_INVALID", "worker", "OpenCode worker output must be an object", retryable=True)
+            raise MemError(
+                "WORKER_RESULT_INVALID",
+                "worker",
+                "OpenCode worker output must be an object",
+                canonical_changed=False,
+                retry_safe=True,
+            )
         return proposal, repaired
 
     def close_worker(self, handle: WorkerHandle) -> None:
@@ -930,19 +1187,43 @@ class OpenCodeAdapter:
 
     def _active_checkpoint_binding(self) -> tuple[str, str]:
         path = self.state_root / "active-checkpoint.json"
-        ensure(path.is_file(), "NATIVE_COMPACT_CHECKPOINT_MISSING", "native_compact", "No durable checkpoint is available for native compact")
+        ensure(
+            path.is_file(),
+            "NATIVE_COMPACT_CHECKPOINT_MISSING",
+            "native_compact",
+            "No durable checkpoint is available for native compact",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise MemError("NATIVE_COMPACT_CHECKPOINT_INVALID", "native_compact", "Durable checkpoint state is unreadable", retryable=True) from exc
+            raise MemError(
+                "NATIVE_COMPACT_CHECKPOINT_INVALID",
+                "native_compact",
+                "Durable checkpoint state is unreadable",
+                canonical_changed=False,
+                retry_safe=True,
+            ) from exc
         checkpoint_id = value.get("id") if isinstance(value, dict) else None
-        ensure(isinstance(checkpoint_id, str) and checkpoint_id, "NATIVE_COMPACT_CHECKPOINT_INVALID", "native_compact", "Durable checkpoint has no ID")
-        attempt_id = value.get("native_compact_attempt_id") if isinstance(value, dict) else None
+        ensure(
+            isinstance(checkpoint_id, str) and checkpoint_id,
+            "NATIVE_COMPACT_CHECKPOINT_INVALID",
+            "native_compact",
+            "Durable checkpoint has no ID",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        attempt_id = (
+            value.get("native_compact_attempt_id") if isinstance(value, dict) else None
+        )
         ensure(
             isinstance(attempt_id, str) and attempt_id,
             "NATIVE_COMPACT_ATTEMPT_MISSING",
             "native_compact",
             "Durable NATIVE_COMPACT state has no attempt ID",
+            canonical_changed=False,
+            retry_safe=False,
         )
         return checkpoint_id, attempt_id
 
@@ -953,7 +1234,9 @@ class OpenCodeAdapter:
         path = self._native_bypass_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(bypass.as_dict(), sort_keys=True), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(bypass.as_dict(), sort_keys=True), encoding="utf-8"
+        )
         temporary.replace(path)
 
     def _retire_native_bypass(self, bypass: NativeCompactBypass) -> None:
@@ -968,23 +1251,51 @@ class OpenCodeAdapter:
         if not isinstance(stored, dict) or stored.get("token") == bypass.token:
             path.unlink(missing_ok=True)
 
-    def _bind_native_bypass(self, value: NativeCompactBypass | dict[str, Any] | None) -> NativeCompactBypass:
-        ensure(value is not None, "NATIVE_COMPACT_TOKEN_REQUIRED", "native_compact", "PCO native compact requires a one-shot bypass token")
+    def _bind_native_bypass(
+        self, value: NativeCompactBypass | dict[str, Any] | None
+    ) -> NativeCompactBypass:
+        ensure(
+            value is not None,
+            "NATIVE_COMPACT_TOKEN_REQUIRED",
+            "native_compact",
+            "PCO native compact requires a one-shot bypass token",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         bypass = NativeCompactBypass.from_value(value)
-        ensure(bypass.session_id == self.session_id, "NATIVE_COMPACT_TOKEN_SESSION_MISMATCH", "native_compact", "Native compact token is bound to another session")
-        ensure(bypass.expires_at > int(time.time() * 1000), "NATIVE_COMPACT_TOKEN_EXPIRED", "native_compact", "Native compact bypass token has expired")
+        ensure(
+            bypass.session_id == self.session_id,
+            "NATIVE_COMPACT_TOKEN_SESSION_MISMATCH",
+            "native_compact",
+            "Native compact token is bound to another session",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            bypass.expires_at > int(time.time() * 1000),
+            "NATIVE_COMPACT_TOKEN_EXPIRED",
+            "native_compact",
+            "Native compact bypass token has expired",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         checkpoint_id, attempt_id = self._active_checkpoint_binding()
         ensure(
-            bypass.checkpoint_id in {"pending", ""} or bypass.checkpoint_id == checkpoint_id,
+            bypass.checkpoint_id in {"pending", ""}
+            or bypass.checkpoint_id == checkpoint_id,
             "NATIVE_COMPACT_TOKEN_CHECKPOINT_MISMATCH",
             "native_compact",
             "Native compact token is bound to another checkpoint",
+            canonical_changed=False,
+            retry_safe=False,
         )
         ensure(
             bypass.attempt_id == attempt_id,
             "NATIVE_COMPACT_TOKEN_ATTEMPT_MISMATCH",
             "native_compact",
             "Native compact token is bound to another attempt",
+            canonical_changed=False,
+            retry_safe=False,
         )
         bound = NativeCompactBypass(
             token=bypass.token,
@@ -998,12 +1309,20 @@ class OpenCodeAdapter:
             try:
                 stored = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise MemError("NATIVE_COMPACT_TOKEN_INVALID", "native_compact", "Existing native compact token is unreadable", retryable=False) from exc
+                raise MemError(
+                    "NATIVE_COMPACT_TOKEN_INVALID",
+                    "native_compact",
+                    "Existing native compact token is unreadable",
+                    canonical_changed=False,
+                    retry_safe=False,
+                ) from exc
             ensure(
                 isinstance(stored, dict) and stored.get("token") == bypass.token,
                 "NATIVE_COMPACT_TOKEN_REPLAY",
                 "native_compact",
                 "A different native compact token is already pending",
+                canonical_changed=False,
+                retry_safe=False,
             )
         self._persist_native_bypass(bound)
         return bound
@@ -1023,6 +1342,8 @@ class OpenCodeAdapter:
             "NATIVE_COMPACT_TOKEN_REPLAY",
             "native_compact",
             "A native compact bypass token is already pending",
+            canonical_changed=False,
+            retry_safe=False,
         )
         token = NativeCompactBypass(
             token=secrets.token_urlsafe(32),
@@ -1034,15 +1355,30 @@ class OpenCodeAdapter:
         self._persist_native_bypass(token)
         return token
 
-    def compact(self, bypass: NativeCompactBypass | dict[str, Any] | None = None) -> None:
-        ensure(self.session_id is not None, "HARNESS_NOT_ATTACHED", "harness", "OpenCode session is not attached")
+    def compact(
+        self, bypass: NativeCompactBypass | dict[str, Any] | None = None
+    ) -> None:
+        ensure(
+            self.session_id is not None,
+            "HARNESS_NOT_ATTACHED",
+            "harness",
+            "OpenCode session is not attached",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         supplied = bypass if bypass is not None else self.native_compact_bypass
         bound: NativeCompactBypass | None = None
         try:
             # Explicit values remain supported for adapter-level compatibility,
             # but the normal durable checkpoint path mints the token here.
-            bound = self._bind_native_bypass(supplied) if supplied is not None else self._mint_native_bypass()
-            items = self._request("GET", f"/session/{self.session_id}/message", params={"limit": 10000})
+            bound = (
+                self._bind_native_bypass(supplied)
+                if supplied is not None
+                else self._mint_native_bypass()
+            )
+            items = self._request(
+                "GET", f"/session/{self.session_id}/message", params={"limit": 10000}
+            )
         except Exception:
             if bound is not None:
                 self._retire_native_bypass(bound)
@@ -1053,7 +1389,11 @@ class OpenCodeAdapter:
         model_id: str | None = None
         for index, item in enumerate(items):
             info = item.get("info", {})
-            if info.get("role") == "assistant" and info.get("providerID") and info.get("modelID"):
+            if (
+                info.get("role") == "assistant"
+                and info.get("providerID")
+                and info.get("modelID")
+            ):
                 provider_id = info["providerID"]
                 model_id = info["modelID"]
             if info.get("summary") is True:
@@ -1071,7 +1411,14 @@ class OpenCodeAdapter:
             return
 
         try:
-            ensure(provider_id is not None and model_id is not None, "HARNESS_MODEL_UNKNOWN", "harness", "Cannot compact without an OpenCode provider/model")
+            ensure(
+                provider_id is not None and model_id is not None,
+                "HARNESS_MODEL_UNKNOWN",
+                "harness",
+                "Cannot compact without an OpenCode provider/model",
+                canonical_changed=False,
+                retry_safe=False,
+            )
             result = self._request(
                 "POST",
                 f"/session/{self.session_id}/summarize",
@@ -1088,13 +1435,21 @@ class OpenCodeAdapter:
                     },
                 },
             )
-            ensure(result is True, "HARNESS_COMPACTION_FAILED", "harness", "OpenCode did not confirm native compaction")
+            ensure(
+                result is True,
+                "HARNESS_COMPACTION_FAILED",
+                "harness",
+                "OpenCode did not confirm native compaction",
+                canonical_changed=False,
+                retry_safe=False,
+            )
             ensure(
                 not self._native_bypass_path().exists(),
                 "NATIVE_COMPACT_GATE_NOT_CONSUMED",
                 "native_compact",
                 "OpenCode did not consume the bound PCO native compact token",
-                retryable=True,
+                canonical_changed=False,
+                retry_safe=True,
             )
         except Exception:
             # A failed, timed-out, or unconsumed attempt may never be replayed.
@@ -1104,14 +1459,19 @@ class OpenCodeAdapter:
     def publish_context(self, bundle: dict[str, Any]) -> None:
         target = self.state_root / "context" / "bundle.json"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        target.write_text(
+            json.dumps(bundle, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     def _receipt_inbox(self) -> Path:
         path = self.state_root / "receipt-inbox"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def publish_receipt(self, receipt: dict[str, Any], outbox: dict[str, Any]) -> dict[str, Any]:
+    def publish_receipt(
+        self, receipt: dict[str, Any], outbox: dict[str, Any]
+    ) -> dict[str, Any]:
         """Publish into the Plugin's durable, keyed receipt inbox.
 
         OpenCode 1.17's toast endpoint has no idempotency or lookup contract,
@@ -1123,20 +1483,38 @@ class OpenCodeAdapter:
         key = str(outbox.get("receipt_key") or "")
         payload_hash = str(outbox.get("payload_hash") or receipt_payload_hash(receipt))
         generation = int(outbox.get("generation", receipt.get("receipt_generation", 0)))
-        ensure(key, "RECEIPT_KEY_INVALID", "receipt", "Receipt publish requires a stable receipt key")
-        path = self._receipt_inbox() / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json")
-        resource_id = f"opencode_receipt_{hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]}"
+        ensure(
+            key,
+            "RECEIPT_KEY_INVALID",
+            "receipt",
+            "Receipt publish requires a stable receipt key",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        path = self._receipt_inbox() / (
+            hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json"
+        )
+        resource_id = (
+            f"opencode_receipt_{hashlib.sha256(key.encode('utf-8')).hexdigest()[:24]}"
+        )
         if path.is_file():
             try:
                 existing = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
-                raise MemError("RECEIPT_INBOX_CORRUPT", "receipt", "Durable Host receipt inbox entry is unreadable", retryable=True) from exc
+                raise MemError(
+                    "RECEIPT_INBOX_CORRUPT",
+                    "receipt",
+                    "Durable Host receipt inbox entry is unreadable",
+                    canonical_changed=False,
+                    retry_safe=True,
+                ) from exc
             ensure(
                 existing.get("payload_hash") == payload_hash,
                 "RECEIPT_KEY_CONFLICT",
                 "receipt",
                 "Receipt key was reused with a different payload",
-                retryable=False,
+                canonical_changed=False,
+                retry_safe=False,
             )
             return {
                 "host_resource_id": existing.get("host_resource_id", resource_id),
@@ -1154,7 +1532,10 @@ class OpenCodeAdapter:
             "payload": receipt,
         }
         temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         temporary.replace(path)
         return {
             "host_resource_id": resource_id,
@@ -1168,5 +1549,9 @@ class OpenCodeAdapter:
         # Compatibility alias. Final checkpoint publication always goes
         # through the durable keyed inbox above; never fall back to toast.
         key = str(receipt.get("receipt_key") or f"legacy:{uuid.uuid4().hex}")
-        outbox = {"receipt_key": key, "generation": int(receipt.get("receipt_generation", 0)), "payload_hash": receipt_payload_hash(receipt)}
+        outbox = {
+            "receipt_key": key,
+            "generation": int(receipt.get("receipt_generation", 0)),
+            "payload_hash": receipt_payload_hash(receipt),
+        }
         self.publish_receipt(receipt, outbox)

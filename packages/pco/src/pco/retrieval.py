@@ -15,8 +15,12 @@ from mem_core.repository import MemoryRepository
 from mem_core.errors import MemError
 
 from .backlinks import build as build_backlinks
-from .repo_loader import profile_for_repo, repository_at, repository_for_repo, resolve_derivation_source_commit
-
+from .repo_loader import (
+    profile_for_repo,
+    repository_at,
+    repository_for_repo,
+    resolve_derivation_source_commit,
+)
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]")
 CURRENT_ONLY = {"events", "psychologies", "philosophies", "archetypes", "hypotheses"}
@@ -48,7 +52,13 @@ def _text(record: dict[str, Any]) -> str:
     sections = payload.get("sections", {})
     for values in sections.values():
         parts.extend(str(value) for value in values)
-    for key in ("current_topics", "open_questions", "active_tensions", "recent_decisions", "next_possible_directions"):
+    for key in (
+        "current_topics",
+        "open_questions",
+        "active_tensions",
+        "recent_decisions",
+        "next_possible_directions",
+    ):
         parts.extend(str(value) for value in payload.get(key, []))
     return "\n".join(parts)
 
@@ -93,13 +103,17 @@ def _split_message_text(text: str, token_budget: int) -> list[str]:
     return fragments or [""]
 
 
-def _turn_units(turns: list[list[dict[str, Any]]], token_budget: int) -> list[list[tuple[dict[str, Any], str]]]:
+def _turn_units(
+    turns: list[list[dict[str, Any]]], token_budget: int
+) -> list[list[tuple[dict[str, Any], str]]]:
     units: list[list[tuple[dict[str, Any], str]]] = []
     for turn in turns:
         unit: list[tuple[dict[str, Any], str]] = []
         cost = 0
         for message in turn:
-            for fragment in _split_message_text(message["payload"]["content"], token_budget):
+            for fragment in _split_message_text(
+                message["payload"]["content"], token_budget
+            ):
                 fragment_cost = max(1, len(tokenize(fragment)))
                 if unit and cost + fragment_cost > token_budget:
                     units.append(unit)
@@ -135,7 +149,9 @@ def _chunks(
         selected: list[list[tuple[dict[str, Any], str]]] = []
         selected_cost = 0
         for unit in units[start : start + turns_per_chunk]:
-            unit_cost = sum(max(1, len(tokenize(fragment))) for _message, fragment in unit)
+            unit_cost = sum(
+                max(1, len(tokenize(fragment))) for _message, fragment in unit
+            )
             if selected and selected_cost + unit_cost > token_budget:
                 break
             selected.append(unit)
@@ -144,10 +160,17 @@ def _chunks(
             break
         flattened = [pair for unit in selected for pair in unit]
         messages_in_chunk = [message for message, _fragment in flattened]
-        unique_messages = list(dict.fromkeys(message["id"] for message in messages_in_chunk))
-        text = "\n".join(f"{message['payload']['role']}: {fragment}" for message, fragment in flattened)
+        unique_messages = list(
+            dict.fromkeys(message["id"] for message in messages_in_chunk)
+        )
+        text = "\n".join(
+            f"{message['payload']['role']}: {fragment}"
+            for message, fragment in flattened
+        )
         digest = hashlib.sha256(
-            ("|".join(unique_messages) + f"|unit:{start}|" + text + "|chunker@2").encode()
+            (
+                "|".join(unique_messages) + f"|unit:{start}|" + text + "|chunker@2"
+            ).encode()
         ).hexdigest()[:20]
         chunks.append(
             {
@@ -166,8 +189,12 @@ def _chunks(
                 ),
                 "links": {"message_ids": unique_messages},
                 "current": True,
-                "assistant_context": any(item["payload"]["role"] == "assistant" for item in messages_in_chunk),
-                "user_evidence_eligible": any(item["payload"]["role"] == "user" for item in messages_in_chunk),
+                "assistant_context": any(
+                    item["payload"]["role"] == "assistant" for item in messages_in_chunk
+                ),
+                "user_evidence_eligible": any(
+                    item["payload"]["role"] == "user" for item in messages_in_chunk
+                ),
                 "prev_id": None,
                 "next_id": None,
             }
@@ -184,7 +211,10 @@ def _chunks(
 def _documents(repository: MemoryRepository) -> list[dict[str, Any]]:
     records = repository.records_by_stream()
     current_ids = {
-        stream: {record_id: item["revision"] for record_id, item in repository.current_records(stream).items()}
+        stream: {
+            record_id: item["revision"]
+            for record_id, item in repository.current_records(stream).items()
+        }
         for stream in records
     }
     docs: list[dict[str, Any]] = []
@@ -206,7 +236,8 @@ def _documents(repository: MemoryRepository) -> list[dict[str, Any]]:
                     "links": payload.get("links", {}),
                     "status": payload.get("status"),
                     "policy_version": payload.get("policy_version"),
-                    "revision_reason": payload.get("revision_reason") or payload.get("change_summary"),
+                    "revision_reason": payload.get("revision_reason")
+                    or payload.get("change_summary"),
                     "previous_revision": payload.get("previous_revision"),
                     "current": current,
                     "assistant_context": False,
@@ -272,7 +303,9 @@ def _build_milvus(path: Path, docs: list[dict[str, Any]]) -> None:
                 data.append(
                     {
                         "key": f"{doc['stream']}:{doc['id']}@{doc['revision']}",
-                        "vector": [float(vector.get(index, 0.0)) for index in range(256)],
+                        "vector": [
+                            float(vector.get(index, 0.0)) for index in range(256)
+                        ],
                     }
                 )
             client.insert("memory", data)
@@ -288,7 +321,14 @@ def _merge_no_proxy(value: str | None) -> str:
     return ",".join(entries)
 
 
-def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = False, source_commit: str | None = None, **_: Any) -> dict[str, Any]:
+def build_index(
+    *,
+    repo_root: Path,
+    indexes_root: str | Path,
+    force: bool = False,
+    source_commit: str | None = None,
+    **_: Any,
+) -> dict[str, Any]:
     repo_root = Path(repo_root)
     source_commit = resolve_derivation_source_commit(
         repo_root,
@@ -296,22 +336,37 @@ def build_index(*, repo_root: Path, indexes_root: str | Path, force: bool = Fals
         source_commit=source_commit,
     )
     with repository_at(repo_root, source_commit) as repository:
-        return _build_index_repository(repository, repo_root, Path(indexes_root), force, source_commit)
+        return _build_index_repository(
+            repository, repo_root, Path(indexes_root), force, source_commit
+        )
 
 
-def _build_index_repository(repository: Any, repo_root: Path, indexes_root: Path, force: bool, commit: str) -> dict[str, Any]:
+def _build_index_repository(
+    repository: Any, repo_root: Path, indexes_root: Path, force: bool, commit: str
+) -> dict[str, Any]:
     profile = repository.profile
     generation = indexes_root / "generations" / commit
     manifest_path = generation / "manifest.json"
     if manifest_path.exists() and not force:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return {"ok": True, "idempotent": True, **manifest, "generation_path": str(generation)}
+        return {
+            "ok": True,
+            "idempotent": True,
+            **manifest,
+            "generation_path": str(generation),
+        }
     if generation.exists():
         shutil.rmtree(generation)
     generation.mkdir(parents=True, exist_ok=True)
     docs = _documents(repository)
-    (generation / "documents.json").write_text(json.dumps(docs, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    backlink_result = build_backlinks(repo_root=repo_root, output_path=generation / "backlinks.json", memory_commit=commit)
+    (generation / "documents.json").write_text(
+        json.dumps(docs, ensure_ascii=False, sort_keys=True), encoding="utf-8"
+    )
+    backlink_result = build_backlinks(
+        repo_root=repo_root,
+        output_path=generation / "backlinks.json",
+        memory_commit=commit,
+    )
     try:
         _build_tantivy(generation / "tantivy", docs)
     except MemError:
@@ -321,8 +376,12 @@ def _build_index_repository(repository: Any, repo_root: Path, indexes_root: Path
             "INDEX_BACKEND_FAILED",
             "index",
             f"Tantivy index build failed: {exc}",
-            retryable=True,
-            recovery=["Verify the local backend installation and retry", "Run `pco derive index --force`"],
+            canonical_changed=False,
+            retry_safe=True,
+            recovery=[
+                "Verify the local backend installation and retry",
+                "Run `pco derive index --force`",
+            ],
         ) from exc
     try:
         _build_milvus(generation / "milvus.db", docs)
@@ -333,8 +392,12 @@ def _build_index_repository(repository: Any, repo_root: Path, indexes_root: Path
             "INDEX_BACKEND_FAILED",
             "index",
             f"Milvus index build failed: {exc}",
-            retryable=True,
-            recovery=["Verify the local backend installation and retry", "Run `pco derive index --force`"],
+            canonical_changed=False,
+            retry_safe=True,
+            recovery=[
+                "Verify the local backend installation and retry",
+                "Run `pco derive index --force`",
+            ],
         ) from exc
     manifest = {
         "memory_commit": commit,
@@ -344,13 +407,27 @@ def _build_index_repository(repository: Any, repo_root: Path, indexes_root: Path
         "lexical_backend": "tantivy",
         "backlinks": len(backlink_result["backlinks"]),
     }
-    (generation / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    (generation / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     active = indexes_root / "active.json"
     active.parent.mkdir(parents=True, exist_ok=True)
     temporary = active.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"generation": commit, "manifest": str(generation / "manifest.json")}, sort_keys=True), encoding="utf-8")
+    temporary.write_text(
+        json.dumps(
+            {"generation": commit, "manifest": str(generation / "manifest.json")},
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     temporary.replace(active)
-    return {"ok": True, "idempotent": False, **manifest, "generation_path": str(generation)}
+    return {
+        "ok": True,
+        "idempotent": False,
+        **manifest,
+        "generation_path": str(generation),
+    }
 
 
 def _index_scores(
@@ -382,8 +459,12 @@ def _index_scores(
                 "INDEX_BACKEND_FAILED",
                 "retrieval",
                 f"Tantivy search failed: {exc}",
-                retryable=True,
-                recovery=["Verify the local backend installation and retry", "Run `pco derive index --force`"],
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=[
+                    "Verify the local backend installation and retry",
+                    "Run `pco derive index --force`",
+                ],
             ) from exc
     if manifest.get("dense_backend") == "milvus-lite" and eligible_keys:
         try:
@@ -401,7 +482,11 @@ def _index_scores(
                     output_fields=["key"],
                 )
                 for hit in response[0]:
-                    key = hit.get("entity", {}).get("key") or hit.get("key") or hit.get("id")
+                    key = (
+                        hit.get("entity", {}).get("key")
+                        or hit.get("key")
+                        or hit.get("id")
+                    )
                     if str(key) in eligible_keys:
                         dense[str(key)] = float(hit.get("distance", 0.0))
             finally:
@@ -413,8 +498,12 @@ def _index_scores(
                 "INDEX_BACKEND_FAILED",
                 "retrieval",
                 f"Milvus search failed: {exc}",
-                retryable=True,
-                recovery=["Verify the local backend installation and retry", "Run `pco derive index --force`"],
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=[
+                    "Verify the local backend installation and retry",
+                    "Run `pco derive index --force`",
+                ],
             ) from exc
     return dense, lexical
 
@@ -450,7 +539,9 @@ def _linked_ids(value: Any) -> set[str]:
     return set()
 
 
-def _graph_neighbors(doc: dict[str, Any], backlinks: dict[str, list[dict[str, Any]]]) -> set[str]:
+def _graph_neighbors(
+    doc: dict[str, Any], backlinks: dict[str, list[dict[str, Any]]]
+) -> set[str]:
     result = _linked_ids(doc.get("links", {}))
     result.update(doc.get("evidence_refs", []))
     for key in (doc["id"], *doc.get("evidence_refs", [])):
@@ -471,11 +562,17 @@ def _change_window_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
     timed = [
         (when, item)
         for item in items
-        if (when := _parse_time(item.get("occurred_at") or item.get("recorded_at"))) is not None
+        if (when := _parse_time(item.get("occurred_at") or item.get("recorded_at")))
+        is not None
     ]
     timed.sort(key=lambda pair: pair[0])
     if not timed:
-        return {"split_at": None, "earlier": {}, "later": {}, "caution": "No comparable timestamps are available."}
+        return {
+            "split_at": None,
+            "earlier": {},
+            "later": {},
+            "caution": "No comparable timestamps are available.",
+        }
     split = timed[len(timed) // 2][0]
     earlier: Counter[str] = Counter()
     later: Counter[str] = Counter()
@@ -508,17 +605,25 @@ def search(
     profile = repository.profile
     retrieval_config = profile.raw.get("retrieval", {})
     candidate_limit = max(limit, int(retrieval_config.get("candidate_count", 200)))
-    candidate_overfetch_factor = max(1, int(retrieval_config.get("candidate_overfetch_factor", 4)))
+    candidate_overfetch_factor = max(
+        1, int(retrieval_config.get("candidate_overfetch_factor", 4))
+    )
     max_fetch_limit = candidate_limit * candidate_overfetch_factor
     rrf_k = float(retrieval_config.get("rrf_k", 60))
-    recency_half_life_days = max(0.000001, float(retrieval_config.get("recency_half_life_days", 180)))
-    indexes_root = Path(indexes_root) if indexes_root is not None else repo_root.parent / "indexes"
+    recency_half_life_days = max(
+        0.000001, float(retrieval_config.get("recency_half_life_days", 180))
+    )
+    indexes_root = (
+        Path(indexes_root) if indexes_root is not None else repo_root.parent / "indexes"
+    )
     source_commit = resolve_derivation_source_commit(
         repo_root,
         state_root=Path(indexes_root).parent / "state",
         source_commit=source_commit,
     )
-    index_result = build_index(repo_root=repo_root, indexes_root=indexes_root, source_commit=source_commit)
+    index_result = build_index(
+        repo_root=repo_root, indexes_root=indexes_root, source_commit=source_commit
+    )
     generation = Path(index_result["generation_path"])
     docs_path = generation / "documents.json"
     if docs_path.is_file():
@@ -533,23 +638,50 @@ def search(
             continue
         if end_at and when and when > end_at:
             continue
-        if mode in {"current", "continuity", "pattern"} and doc["stream"] in CURRENT_ONLY and not doc["current"]:
+        if (
+            mode in {"current", "continuity", "pattern"}
+            and doc["stream"] in CURRENT_ONLY
+            and not doc["current"]
+        ):
             continue
-        if mode in {"current", "continuity"} and doc["stream"] in {"meta_revisions", "continuations"} and not doc["current"]:
+        if (
+            mode in {"current", "continuity"}
+            and doc["stream"] in {"meta_revisions", "continuations"}
+            and not doc["current"]
+        ):
             continue
-        if mode == "current" and doc.get("status") in {"disputed", "rejected", "superseded", "tombstone"}:
+        if mode == "current" and doc.get("status") in {
+            "disputed",
+            "rejected",
+            "superseded",
+            "tombstone",
+        }:
             continue
-        if mode == "continuity" and doc["stream"] not in {"continuations", "conversation_chunks"}:
+        if mode == "continuity" and doc["stream"] not in {
+            "continuations",
+            "conversation_chunks",
+        }:
             continue
-        if mode == "pattern" and doc["stream"] not in {"events", "hypotheses", "conversation_chunks", "psychologies", "philosophies", "archetypes"}:
+        if mode == "pattern" and doc["stream"] not in {
+            "events",
+            "hypotheses",
+            "conversation_chunks",
+            "psychologies",
+            "philosophies",
+            "archetypes",
+        }:
             continue
-        if mode == "change" and doc["stream"] not in {"events", "hypotheses", "meta_revisions", "conversation_chunks"}:
+        if mode == "change" and doc["stream"] not in {
+            "events",
+            "hypotheses",
+            "meta_revisions",
+            "conversation_chunks",
+        }:
             continue
         filtered.append(doc)
 
     eligible_keys = {
-        f"{doc['stream']}:{doc['id']}@{doc['revision']}"
-        for doc in filtered
+        f"{doc['stream']}:{doc['id']}@{doc['revision']}" for doc in filtered
     }
     backend_dense, backend_lexical = _index_scores(
         generation=generation,
@@ -569,14 +701,18 @@ def search(
             remaining = [
                 doc
                 for doc in filtered
-                if f"{doc['stream']}:{doc['id']}@{doc['revision']}" not in backend_candidates
+                if f"{doc['stream']}:{doc['id']}@{doc['revision']}"
+                not in backend_candidates
             ]
             remaining = sorted(
                 remaining,
                 key=lambda doc: doc.get("occurred_at") or doc.get("recorded_at") or "",
                 reverse=True,
             )
-            filtered = [*backend_filtered, *remaining[: max(0, candidate_limit - len(backend_filtered))]]
+            filtered = [
+                *backend_filtered,
+                *remaining[: max(0, candidate_limit - len(backend_filtered))],
+            ]
         else:
             backend_candidates = set()
     if not backend_candidates and len(filtered) > candidate_limit:
@@ -597,8 +733,18 @@ def search(
     for index, doc in enumerate(filtered):
         key = f"{doc['stream']}:{doc['id']}@{doc['revision']}"
         lexical[index] = backend_lexical.get(key, 0.0)
-    dense_rank = {index: rank for rank, (index, _) in enumerate(sorted(dense.items(), key=lambda item: item[1], reverse=True), 1)}
-    lexical_rank = {index: rank for rank, (index, _) in enumerate(sorted(lexical.items(), key=lambda item: item[1], reverse=True), 1)}
+    dense_rank = {
+        index: rank
+        for rank, (index, _) in enumerate(
+            sorted(dense.items(), key=lambda item: item[1], reverse=True), 1
+        )
+    }
+    lexical_rank = {
+        index: rank
+        for rank, (index, _) in enumerate(
+            sorted(lexical.items(), key=lambda item: item[1], reverse=True), 1
+        )
+    }
     now = datetime.now(timezone.utc)
     scored: list[dict[str, Any]] = []
     for index, doc in enumerate(filtered):
@@ -625,19 +771,27 @@ def search(
     if mode in {"pattern", "historical", "change"} and scored:
         backlink_path = generation / "backlinks.json"
         if backlink_path.is_file():
-            backlink_map = json.loads(backlink_path.read_text(encoding="utf-8"))["backlinks"]
+            backlink_map = json.loads(backlink_path.read_text(encoding="utf-8"))[
+                "backlinks"
+            ]
         else:
             backlink_map = build_backlinks(
                 repo_root=repo_root,
                 source_commit=source_commit,
                 state_root=Path(indexes_root).parent / "state",
             )["backlinks"]
-        seeds = sorted(scored, key=lambda item: (item["rrf_score"], item["time_score"]), reverse=True)[:5]
+        seeds = sorted(
+            scored,
+            key=lambda item: (item["rrf_score"], item["time_score"]),
+            reverse=True,
+        )[:5]
         neighbors: set[str] = set()
         for seed in seeds:
             neighbors.update(_graph_neighbors(seed, backlink_map))
         for item in scored:
-            matches = sum(1 for neighbor in neighbors if _matches_neighbor(item, neighbor))
+            matches = sum(
+                1 for neighbor in neighbors if _matches_neighbor(item, neighbor)
+            )
             if matches:
                 item["graph_score"] = round(min(0.02, matches * 0.004), 8)
                 item["rrf_score"] = round(item["rrf_score"] + item["graph_score"], 8)
@@ -648,7 +802,10 @@ def search(
         "mode": mode,
         "memory_commit": index_result.get("memory_commit", source_commit),
         "derivation_source_commit": index_result.get("memory_commit", source_commit),
-        "backends": {"dense": index_result["dense_backend"], "lexical": index_result["lexical_backend"]},
+        "backends": {
+            "dense": index_result["dense_backend"],
+            "lexical": index_result["lexical_backend"],
+        },
         "retrieval_policy": {
             "candidate_count": candidate_limit,
             "candidate_overfetch_factor": candidate_overfetch_factor,

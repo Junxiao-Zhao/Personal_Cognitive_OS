@@ -14,7 +14,9 @@ from pco.paths import bundled_profile
 from pco.validation import validate_profile
 
 
-def _records(minimal_records: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def _records(
+    minimal_records: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
     records = {stream: [deepcopy(record)] for stream, record in minimal_records.items()}
     for stream_records in records.values():
         for record in stream_records:
@@ -57,13 +59,17 @@ def _first_problem(records: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     return next(iter(validate_profile(Path("."), records)))
 
 
-def test_assistant_summary_cannot_support_personal_fact(minimal_records: dict[str, dict[str, Any]]) -> None:
+def test_assistant_summary_cannot_support_personal_fact(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
     """Changing the personal-evidence policy to accept assistant output must fail."""
     records = _records(minimal_records)
     records["evidence"].append(
         _evidence("ev_assistant", speaker="assistant", user_authored=False)
     )
-    records["events"] = [_record_with_evidence(records, "events", "evidence:ev_assistant")]
+    records["events"] = [
+        _record_with_evidence(records, "events", "evidence:ev_assistant")
+    ]
 
     problem = _first_problem(records)
 
@@ -72,7 +78,9 @@ def test_assistant_summary_cannot_support_personal_fact(minimal_records: dict[st
     assert problem["path"] == "/payload/evidence_refs/0"
 
 
-@pytest.mark.parametrize("stream", ["events", "archetypes", "hypotheses", "meta_revisions"])
+@pytest.mark.parametrize(
+    "stream", ["events", "archetypes", "hypotheses", "meta_revisions"]
+)
 def test_external_evidence_cannot_support_personal_records(
     minimal_records: dict[str, dict[str, Any]], stream: str
 ) -> None:
@@ -120,7 +128,9 @@ def test_registered_material_without_user_authorship_cannot_support_personal_fac
     records["evidence"].append(
         _evidence("ev_registered", source_kind="registered", user_authored=False)
     )
-    records["events"] = [_record_with_evidence(records, "events", "evidence:ev_registered")]
+    records["events"] = [
+        _record_with_evidence(records, "events", "evidence:ev_registered")
+    ]
 
     assert _first_problem(records)["code"] == "EVIDENCE_INELIGIBLE"
 
@@ -167,12 +177,14 @@ def test_assistant_registered_evidence_cannot_support_a_psychology_concept(
 
     problems = list(validate_profile(Path("."), records))
 
-    assert [(problem["code"], problem["stream"], problem["path"]) for problem in problems] == [
-        ("EVIDENCE_INELIGIBLE", "psychologies", "/payload/evidence_refs/0")
-    ]
+    assert [
+        (problem["code"], problem["stream"], problem["path"]) for problem in problems
+    ] == [("EVIDENCE_INELIGIBLE", "psychologies", "/payload/evidence_refs/0")]
 
 
-def test_retired_target_is_not_a_current_reference(minimal_records: dict[str, dict[str, Any]]) -> None:
+def test_retired_target_is_not_a_current_reference(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
     """Treating a tombstoned hypothesis as current would revive retired memory."""
     records = _records(minimal_records)
     tombstone = deepcopy(records["hypotheses"][0])
@@ -188,7 +200,9 @@ def test_retired_target_is_not_a_current_reference(minimal_records: dict[str, di
     assert problem["path"] == "/payload/promotion_refs/0"
 
 
-def test_invalid_fidelity_returns_a_structured_problem(minimal_records: dict[str, dict[str, Any]]) -> None:
+def test_invalid_fidelity_returns_a_structured_problem(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
     """Accepting a fourth fidelity value would weaken the evidence contract."""
     records = _records(minimal_records)
     records["evidence"][0]["payload"]["fidelity"] = "summary"
@@ -198,7 +212,8 @@ def test_invalid_fidelity_returns_a_structured_problem(minimal_records: dict[str
     assert problem["code"] == "EVIDENCE_FIDELITY_INVALID"
     assert problem["stream"] == "evidence"
     assert problem["path"] == "/payload/fidelity"
-    assert problem["retryable"] is True
+    assert problem["canonical_changed"] is False
+    assert problem["retry_safe"] is True
     assert problem["recovery"]
 
 
@@ -238,7 +253,9 @@ def test_source_schema_allows_explicit_user_authorship_for_full_transcript(
     record["payload"]["fidelity"] = "full_user_provided_transcript"
     record["payload"]["user_authored"] = True
 
-    Profile.load(bundled_profile(), default_registry()).validate_record_schema("sources", record)
+    Profile.load(bundled_profile(), default_registry()).validate_record_schema(
+        "sources", record
+    )
 
 
 def test_historical_reference_remains_valid_after_current_records_retire(
@@ -258,7 +275,13 @@ def test_historical_reference_remains_valid_after_current_records_retire(
     evidence_tombstone["payload"]["status"] = "tombstone"
     records["events"] = [old_event, current_event]
     records["evidence"] = [records["evidence"][0], evidence_tombstone, current_evidence]
-    for stream in ("psychologies", "philosophies", "archetypes", "hypotheses", "meta_revisions"):
+    for stream in (
+        "psychologies",
+        "philosophies",
+        "archetypes",
+        "hypotheses",
+        "meta_revisions",
+    ):
         records[stream][0]["payload"]["evidence_refs"] = ["evidence:ev_current"]
 
     assert list(validate_profile(Path("."), records)) == []
@@ -353,7 +376,9 @@ def test_unknown_list_valued_stream_is_rejected_deterministically(
     assert problem["path"] == "/transactions"
 
 
-def test_commit_ref_must_identify_a_proposal_receipt(minimal_records: dict[str, dict[str, Any]]) -> None:
+def test_commit_ref_must_identify_a_proposal_receipt(
+    minimal_records: dict[str, dict[str, Any]],
+) -> None:
     """Accepting non-receipt commit references would sever the canonical audit link."""
     records = _records(minimal_records)
     records["events"][0]["commit_ref"] = "proposal:receipt_1"
