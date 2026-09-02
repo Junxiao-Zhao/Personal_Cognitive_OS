@@ -18,7 +18,7 @@ class ErrorDetail:
     recovery: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
+        return {
             "code": self.code,
             "phase": self.phase,
             "message": self.message,
@@ -26,6 +26,9 @@ class ErrorDetail:
             "retry_safe": self.retry_safe,
             "recovery": self.recovery,
         }
+
+    def diagnostic_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
         for key in ("stream", "record_id", "path", "value"):
             value = getattr(self, key)
             if value is not None:
@@ -65,7 +68,11 @@ class MemError(Exception):
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return {"ok": False, "error": self.detail.as_dict()}
+        result: dict[str, Any] = {"ok": False, "error": self.detail.as_dict()}
+        diagnostic = self.detail.diagnostic_dict()
+        if diagnostic:
+            result["diagnostic"] = diagnostic
+        return result
 
 
 def ensure(

@@ -25,6 +25,23 @@ STREAM_TITLES = {
 ENTITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
+def _projection_error(
+    code: str,
+    message: str,
+    *,
+    retry_safe: bool,
+    recovery: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "phase": "projection",
+        "message": message,
+        "canonical_changed": False,
+        "retry_safe": retry_safe,
+        "recovery": recovery or [],
+    }
+
+
 def _projection_path(target_root: Path, stream: str, entity_id: str) -> Path:
     if not ENTITY_ID_PATTERN.fullmatch(entity_id) or not ENTITY_ID_PATTERN.fullmatch(
         stream
@@ -399,15 +416,15 @@ def _project_affine_repository(
             "memory_commit": commit,
             "pages": len(pages),
             "outbox": str(outbox_path),
-            "error": {
-                "code": "AFFINE_BRIDGE_NOT_CONFIGURED",
-                "canonical_changed": False,
-                "retry_safe": True,
-                "recovery": [
+            "error": _projection_error(
+                "AFFINE_BRIDGE_NOT_CONFIGURED",
+                "AFFiNE bridge is not configured",
+                retry_safe=True,
+                recovery=[
                     "Set PCO_AFFINE_COMMAND to an AFFiNE bridge CLI",
                     "Use the Markdown projection target",
                 ],
-            },
+            ),
         }
     try:
         result = subprocess.run(
@@ -425,11 +442,12 @@ def _project_affine_repository(
             "target": "affine",
             "memory_commit": commit,
             "outbox": str(outbox_path),
-            "error": {
-                "code": "AFFINE_SYNC_TIMEOUT",
-                "canonical_changed": False,
-                "retry_safe": True,
-            },
+            "error": _projection_error(
+                "AFFINE_SYNC_TIMEOUT",
+                "AFFiNE bridge timed out",
+                retry_safe=True,
+                recovery=["Retry the AFFiNE projection after checking the bridge"],
+            ),
         }
     if result.returncode:
         diagnostic_path = state / "logs" / f"{commit}.log"
@@ -442,13 +460,13 @@ def _project_affine_repository(
             "target": "affine",
             "memory_commit": commit,
             "outbox": str(outbox_path),
-            "error": {
-                "code": "AFFINE_SYNC_FAILED",
-                "message": f"AFFiNE bridge exited with code {result.returncode}",
-                "diagnostic_path": str(diagnostic_path),
-                "canonical_changed": False,
-                "retry_safe": True,
-            },
+            "error": _projection_error(
+                "AFFINE_SYNC_FAILED",
+                f"AFFiNE bridge exited with code {result.returncode}",
+                retry_safe=True,
+                recovery=["Inspect the AFFiNE bridge diagnostic log and retry"],
+            ),
+            "diagnostic": {"diagnostic_path": str(diagnostic_path)},
         }
     try:
         response = json.loads(result.stdout)

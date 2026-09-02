@@ -86,3 +86,70 @@ Complete. This report is included in the Task 6 commit. Because a commit hash ca
 ## Concerns
 
 - The stricter `MemError`/`ensure` API is intentionally breaking for old in-repo callers that omit canonical fields. All in-repo call sites have been repaired and verified; external callers using the old constructor shape must migrate.
+
+## Fix Round 1 Addendum
+
+### Inherited and Review Audit
+
+- Starting fix round from committed Task 6 baseline: `f9f48c00cf821070d8246363cd3cafcb9c12ab7c`.
+- Re-audited the combined Task 6 diff from `b819f4aeb37f7e8eb77e09f5749d05f10a1a4c5e` before committing this fix round:
+  - `git diff --stat b819f4aeb37f7e8eb77e09f5749d05f10a1a4c5e -- packages tests .superpowers/sdd/2026-08-30-pco-v0.5-canonical-core/task-6-report.md`: 40 files changed, 4589 insertions, 902 deletions.
+  - `git diff --name-only b819f4aeb37f7e8eb77e09f5749d05f10a1a4c5e -- packages tests`: expected Task 6 mem-core, PCO, and test surface only.
+- Confirmed the review findings were valid:
+  - pre-commit policy loaded `.mem-profile.json` and Profile content from the unstaged working tree.
+  - hook `write_artifact` receipt validation did not call `profile.artifact_path(...)`.
+  - `ErrorDetail.as_dict()` leaked diagnostics inside public `error`.
+  - AFFiNE projection returned retained public error mappings with missing `phase`, `message`, or `recovery`, and placed `diagnostic_path` inside `error`.
+- Workspace root `workspace.json` initialization remains intentionally out of scope for this fix round per the reviewer note; hook enforcement remains ready to enforce it when present.
+
+### Fix Round TDD Evidence
+
+- RED: added regression tests before production changes, then ran `pytest tests/test_v05_append_only.py tests/test_error_contract.py -v`.
+  - Result: 20 collected, 5 failed, 15 passed.
+  - Expected failures:
+    - same-length historical JSONL rewrite with unstaged Profile omission committed successfully instead of failing with `APPEND_ONLY_VIOLATION`.
+    - crafted `write_artifact` outside allowed artifact roots committed successfully instead of failing with `ARTIFACT_PATH_NOT_ALLOWED`.
+    - public `MemError.as_dict()["error"]` included diagnostic keys (`stream`, `record_id`, `path`, `value`).
+    - AFFiNE no-bridge result omitted required public error fields.
+    - AFFiNE failed-bridge result kept `diagnostic_path` inside `error` and omitted required public error fields.
+- GREEN after implementation:
+  - `pytest tests/test_v05_append_only.py tests/test_error_contract.py -v`: 20 passed.
+- During full verification, Python 3.13 emitted a tar extraction deprecation warning from the new trusted-tree Profile archive loader.
+  - Added a compatibility-safe `extractall(..., filter="data")` path with fallback for older Python.
+  - `pytest -W error::DeprecationWarning tests/test_profile_validation_modes.py::test_logs_stream_uses_profile_fast_path_for_transaction_and_hook -q`: 1 passed.
+
+### Fix Round Migration Inventory
+
+- Hook policy now resolves `.mem-profile.json` and Profile bytes from trusted Git trees:
+  - non-root commits use `HEAD`, so unstaged marker/Profile edits cannot omit protected streams.
+  - root initialization uses the staged tree produced by `git write-tree`, then returns root-initialization success without weakening later commits.
+  - marker/Profile paths are constrained to relative non-escaping paths before archive extraction.
+  - archive extraction rejects symlinks, hardlinks, devices, and escaping paths; safe tar filtering is requested when supported.
+- Hook `write_artifact` receipt authorization now validates every operation path through `Profile.artifact_path(...)`, enforcing Profile artifact roots.
+- Public `MemError.as_dict()["error"]` is exactly six fields: `code`, `phase`, `message`, `canonical_changed`, `retry_safe`, `recovery`.
+- Optional `stream`, `record_id`, `path`, and `value` diagnostics now appear only in top-level `diagnostic`.
+- PCO checkpoint structured errors and retained AFFiNE projection error results now expose exact six-field `error` mappings; AFFiNE bridge diagnostics are top-level `diagnostic`.
+
+### Fix Round Verification
+
+- `pytest tests/test_v05_append_only.py tests/test_error_contract.py tests/test_registry_discovery.py -v`: 23 passed.
+- `pytest tests/test_v05_profile.py tests/test_v05_validation.py tests/test_v05_append_only.py tests/test_error_contract.py tests/test_application_commit.py tests/test_mem_core_locking.py tests/test_registry_discovery.py -v`: 83 passed.
+- `pytest -q`: exit 0, no warning summary.
+- `git diff --check`: exit 0, no output.
+- `rg -n "retryable|['\"]error['\"]\s*:\s*\{" packages tests`: no matches.
+
+### Fix Round Files
+
+- `packages/mem-core/src/mem_core/errors.py`
+- `packages/mem-core/src/mem_core/hook.py`
+- `packages/pco/src/pco/checkpoint/errors.py`
+- `packages/pco/src/pco/projections.py`
+- `tests/test_error_contract.py`
+- `tests/test_v05_append_only.py`
+- `.superpowers/sdd/2026-08-30-pco-v0.5-canonical-core/task-6-report.md`
+
+### Fix Round Commit and Concerns
+
+- Fix commit: final hash reported in the handoff response because embedding the hash in the committed report would change the hash.
+- Concern: external consumers that expected diagnostics inside `error` must read top-level `diagnostic` instead.
+- Concern: root `workspace.json` bootstrap is still owned by Workspace-and-Skills Task 5, not Task 6.

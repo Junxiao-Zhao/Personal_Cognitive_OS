@@ -60,11 +60,6 @@ def structured_error(value: Any, phase: str) -> dict[str, Any]:
                 "canonical_changed": bool(value.get("canonical_changed", False)),
                 "retry_safe": bool(value.get("retry_safe", False)),
                 "recovery": list(value.get("recovery", _RECOVERY.get(phase, []))),
-                **{
-                    key: value[key]
-                    for key in ("stream", "record_id", "path", "value")
-                    if key in value
-                },
             }
         )
     return derivation_error(RuntimeError(str(value)), phase)

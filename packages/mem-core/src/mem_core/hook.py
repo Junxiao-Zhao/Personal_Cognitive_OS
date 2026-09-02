@@ -43,6 +43,14 @@ def _git(root: Path, *args: str, text: bool = True) -> str | bytes:
     return result.stdout
 
 
+def _has_head(root: Path) -> bool:
+    try:
+        _git(root, "rev-parse", "--verify", "HEAD")
+    except MemError:
+        return False
+    return True
+
+
 def _old_bytes(root: Path, relative: str) -> bytes:
     """Read a path's bytes at HEAD without materializing the whole tree."""
     try:
@@ -65,6 +73,13 @@ def _root_bytes(root: Path, relative: str) -> bytes:
     root_commit = str(_git(root, "rev-list", "--max-parents=0", "HEAD")).strip()
     try:
         return _git(root, "show", f"{root_commit}:{relative}", text=False)
+    except MemError:
+        return b""
+
+
+def _tree_bytes(root: Path, revision: str, relative: str) -> bytes:
+    try:
+        return _git(root, "show", f"{revision}:{relative}", text=False)
     except MemError:
         return b""
 
@@ -99,41 +114,74 @@ def _extract_archive(
                     canonical_changed=False,
                     retry_safe=False,
                 )
-        bundle.extractall(target)
+        try:
+            bundle.extractall(target, filter="data")
+        except TypeError:
+            bundle.extractall(target)
 
 
-def _load_profile(root: Path) -> Profile:
-    marker_path = root / ".mem-profile.json"
-    if not marker_path.is_file():
+def _trusted_relative_path(raw_path: str, *, phase: str) -> Path:
+    relative = Path(raw_path)
+    ensure(
+        not relative.is_absolute(),
+        "PROFILE_PATH_UNSAFE",
+        phase,
+        "Profile paths must be relative",
+        value=raw_path,
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    ensure(
+        ".." not in relative.parts,
+        "PROFILE_PATH_UNSAFE",
+        phase,
+        "Profile paths cannot escape their root",
+        value=raw_path,
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    return relative
+
+
+def _load_profile_from_tree(root: Path, revision: str, target: Path) -> Profile:
+    marker_bytes = _tree_bytes(root, revision, ".mem-profile.json")
+    if not marker_bytes:
         raise MemError(
             "PROFILE_MARKER_NOT_FOUND",
             "pre_commit",
-            f"Missing {marker_path}",
+            "Missing .mem-profile.json",
             canonical_changed=False,
             retry_safe=False,
         )
     try:
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        raw_profile_path = Path(marker["path"])
+        marker = json.loads(marker_bytes.decode("utf-8"))
+        profile_relative = _trusted_relative_path(
+            str(marker["path"]), phase="pre_commit"
+        )
     except Exception as exc:
         raise MemError(
             "PROFILE_MARKER_INVALID",
             "pre_commit",
             str(exc),
-            path=str(marker_path),
+            path=".mem-profile.json",
             canonical_changed=False,
             retry_safe=False,
         ) from exc
-    profile_path = (
-        raw_profile_path if raw_profile_path.is_absolute() else root / raw_profile_path
+    target.mkdir(parents=True, exist_ok=True)
+    _extract_archive(
+        root,
+        revision,
+        target,
+        [".mem-profile.json", profile_relative.as_posix()],
     )
+    profile_path = target / profile_relative
     profile = Profile.load(profile_path, default_registry())
     if profile.name != marker.get("name") or profile.version != marker.get("version"):
         raise MemError(
             "PROFILE_MARKER_MISMATCH",
             "pre_commit",
             "Canonical Profile does not match .mem-profile.json",
-            path=str(marker_path),
+            path=".mem-profile.json",
             canonical_changed=False,
             retry_safe=False,
         )
@@ -249,6 +297,7 @@ def _verify_increment(
             expected_paths.add(Path(stream.path).as_posix())
         else:
             assert operation.path is not None and operation.content is not None
+            profile.artifact_path(root, operation.path)
             ensure(
                 operation.path in changed,
                 "ARTIFACT_MISSING",
@@ -487,7 +536,26 @@ def _materialize_artifact_roots(
 
 def validate_repository(repo_root: Path) -> dict[str, object]:
     root = repo_root.resolve()
-    profile = _load_profile(root)
+    has_head = _has_head(root)
+    profile_tree = "HEAD" if has_head else str(_git(root, "write-tree")).strip()
+    with tempfile.TemporaryDirectory(prefix="mem-core-profile-") as temporary:
+        profile = _load_profile_from_tree(
+            root,
+            profile_tree,
+            Path(temporary) / "trusted",
+        )
+        if not has_head:
+            return {
+                "ok": True,
+                "profile": f"{profile.name}@{profile.version}",
+                "mode": "root_initialization",
+                "records": 0,
+                "increment": {"root_initialization": True},
+            }
+        return _validate_increment(root, profile)
+
+
+def _validate_increment(root: Path, profile: Profile) -> dict[str, object]:
     changed = set(
         str(_git(root, "diff", "--cached", "--name-only", "HEAD")).splitlines()
     )
