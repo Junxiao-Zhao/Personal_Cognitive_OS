@@ -14,6 +14,7 @@ from .errors import MemError, ensure
 from .locking import canonical_lock
 from .models import RecordEnvelope, latest_by_id
 from .profile import Profile
+from .profile_identity import profile_tree_digest
 
 
 class MemoryRepository:
@@ -81,20 +82,22 @@ class MemoryRepository:
         (self.root / "transactions").mkdir(parents=True, exist_ok=True)
         (self.root / "transactions" / "transactions.jsonl").touch()
         (self.root / ".gitignore").write_text("*.lock\n", encoding="utf-8")
-        profile_location = (
-            f"profiles/{self.profile.name}" if copy_profile else str(self.profile.root)
-        )
-        (self.root / ".mem-profile.json").write_text(
-            json.dumps(
-                {
-                    "name": self.profile.name,
-                    "version": self.profile.version,
-                    "path": profile_location,
-                },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
+        marker = {
+            "name": self.profile.name,
+            "version": self.profile.version,
+            "path": (
+                f"profiles/{self.profile.name}"
+                if copy_profile
+                else str(self.profile.root)
+            ),
+        }
+        if not copy_profile:
+            marker["policy_hash"] = self.profile.policy_hash
+            marker["profile_tree_digest"] = profile_tree_digest(
+                self.profile.root, phase="init"
             )
+        (self.root / ".mem-profile.json").write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True)
             + "\n",
             encoding="utf-8",
         )

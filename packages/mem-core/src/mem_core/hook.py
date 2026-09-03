@@ -19,6 +19,7 @@ from .models import (
     transaction_fingerprint,
 )
 from .profile import Profile
+from .profile_identity import snapshot_profile_tree
 from .registry import default_registry
 
 
@@ -143,6 +144,63 @@ def _trusted_relative_path(raw_path: str, *, phase: str) -> Path:
     return relative
 
 
+def _marker_string(marker: dict[str, object], key: str) -> str:
+    value = marker.get(key)
+    ensure(
+        isinstance(value, str) and bool(value),
+        "PROFILE_MARKER_INVALID",
+        "pre_commit",
+        f".mem-profile.json field must be a non-empty string: {key}",
+        path=".mem-profile.json",
+        value={key: value},
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    return value
+
+
+def _load_external_profile(marker: dict[str, object], target: Path) -> Profile:
+    profile_path = Path(_marker_string(marker, "path"))
+    ensure(
+        profile_path.is_absolute(),
+        "PROFILE_PATH_UNSAFE",
+        "pre_commit",
+        "External Profile paths must be absolute",
+        value=str(profile_path),
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    expected_digest = _marker_string(marker, "profile_tree_digest")
+    expected_policy_hash = _marker_string(marker, "policy_hash")
+    target.mkdir(parents=True, exist_ok=True)
+    actual_digest = snapshot_profile_tree(profile_path, target, phase="pre_commit")
+    ensure(
+        actual_digest == expected_digest,
+        "PROFILE_TREE_MISMATCH",
+        "pre_commit",
+        "External Profile tree does not match .mem-profile.json",
+        path=str(profile_path),
+        value={"expected": expected_digest, "actual": actual_digest},
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    profile = Profile.load(target, default_registry())
+    ensure(
+        profile.policy_hash == expected_policy_hash,
+        "PROFILE_POLICY_MISMATCH",
+        "pre_commit",
+        "External Profile policy does not match .mem-profile.json",
+        path=str(profile_path),
+        value={
+            "expected": expected_policy_hash,
+            "actual": profile.policy_hash,
+        },
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    return profile
+
+
 def _load_profile_from_tree(root: Path, revision: str, target: Path) -> Profile:
     marker_bytes = _tree_bytes(root, revision, ".mem-profile.json")
     if not marker_bytes:
@@ -155,9 +213,6 @@ def _load_profile_from_tree(root: Path, revision: str, target: Path) -> Profile:
         )
     try:
         marker = json.loads(marker_bytes.decode("utf-8"))
-        profile_relative = _trusted_relative_path(
-            str(marker["path"]), phase="pre_commit"
-        )
     except Exception as exc:
         raise MemError(
             "PROFILE_MARKER_INVALID",
@@ -167,6 +222,31 @@ def _load_profile_from_tree(root: Path, revision: str, target: Path) -> Profile:
             canonical_changed=False,
             retry_safe=False,
         ) from exc
+    ensure(
+        isinstance(marker, dict),
+        "PROFILE_MARKER_INVALID",
+        "pre_commit",
+        ".mem-profile.json must contain a JSON object",
+        path=".mem-profile.json",
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    raw_path = _marker_string(marker, "path")
+    if Path(raw_path).is_absolute():
+        profile = _load_external_profile(marker, target)
+        if profile.name != marker.get("name") or profile.version != marker.get(
+            "version"
+        ):
+            raise MemError(
+                "PROFILE_MARKER_MISMATCH",
+                "pre_commit",
+                "Canonical Profile does not match .mem-profile.json",
+                path=".mem-profile.json",
+                canonical_changed=False,
+                retry_safe=False,
+            )
+        return profile
+    profile_relative = _trusted_relative_path(raw_path, phase="pre_commit")
     target.mkdir(parents=True, exist_ok=True)
     _extract_archive(
         root,

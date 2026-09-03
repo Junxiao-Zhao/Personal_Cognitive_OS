@@ -153,3 +153,66 @@ Complete. This report is included in the Task 6 commit. Because a commit hash ca
 - Fix commit: final hash reported in the handoff response because embedding the hash in the committed report would change the hash.
 - Concern: external consumers that expected diagnostics inside `error` must read top-level `diagnostic` instead.
 - Concern: root `workspace.json` bootstrap is still owned by Workspace-and-Skills Task 5, not Task 6.
+
+## Fix Round 2 Addendum
+
+### Inherited and Review Audit
+
+- Starting fix round from committed Task 6 fix baseline: `3fb1eb33ee7b9d46715eda88543ca14d115ca1b1`.
+- Confirmed `MemoryRepository.init(copy_profile=False)` writes the resolved absolute external Profile path to committed `.mem-profile.json`.
+- Confirmed the hook trusted-tree loader rejected every absolute marker path through `_trusted_relative_path(...)`, so init succeeded but the first verified transaction commit failed with `PROFILE_MARKER_INVALID`.
+- Confirmed the secure root cause was not just "allow absolute paths": without a committed external Profile identity, the hook would have to trust mutable Profile bytes outside Git and could reintroduce the protected-stream/artifact-root bypass fixed in round 1.
+
+### Fix Round 2 TDD Evidence
+
+- RED: added `test_copy_profile_false_external_profile_commits_public_transaction` and `test_external_profile_mutation_after_init_fails_closed_before_policy_can_weaken` before production changes, then ran `pytest tests/test_mem_core.py::test_copy_profile_false_external_profile_commits_public_transaction tests/test_mem_core.py::test_external_profile_mutation_after_init_fails_closed_before_policy_can_weaken -v`.
+  - Result after fixing one test import typo and rerunning RED: 2 collected, 2 failed.
+  - Expected failures:
+    - public external-Profile commit raised `MemError` from Git commit hook with `PROFILE_MARKER_INVALID` and message `Profile paths must be relative`.
+    - weakened external-Profile test got `PROFILE_MARKER_INVALID` instead of the required committed-identity failure `PROFILE_TREE_MISMATCH`.
+- GREEN after implementation:
+  - `pytest tests/test_mem_core.py::test_copy_profile_false_external_profile_commits_public_transaction tests/test_mem_core.py::test_external_profile_mutation_after_init_fails_closed_before_policy_can_weaken -v`: 2 passed in 2.62s.
+- Post-GREEN readability cleanup rerun:
+  - `pytest tests/test_mem_core.py tests/test_v05_append_only.py tests/test_profile_validation_modes.py -v`: 28 passed in 28.95s.
+
+### Fix Round 2 Implementation
+
+- Added `mem_core.profile_identity` to compute a deterministic SHA-256 digest over sorted regular Profile files and to snapshot verified external Profile bytes into hook-local temporary storage.
+- External Profile identity is committed only for `copy_profile=False` markers:
+  - `profile_tree_digest`: exact regular-file tree content identity.
+  - `policy_hash`: parsed Profile policy identity.
+- Hook loading behavior:
+  - relative copied Profile markers still load from the trusted Git tree exactly as before.
+  - absolute external Profile markers require `profile_tree_digest` and `policy_hash`.
+  - the hook snapshots only regular files from the external Profile, rejects symlinks and special entries, compares the snapshot digest with the committed marker, loads the Profile from the snapshot, and verifies the parsed policy hash.
+  - missing, mutated, or unsafe external Profiles fail closed before transaction policy can be weakened.
+- `copy_profile=False` remains external; the full Profile is not copied into the canonical repository.
+
+### Fix Round 2 Verification
+
+- Covering external-profile/append-only/profile-mode gate:
+  - `pytest tests/test_mem_core.py tests/test_v05_append_only.py tests/test_profile_validation_modes.py -v`: 28 passed in 28.95s.
+- Task 6 focused gate:
+  - `pytest tests/test_v05_append_only.py tests/test_error_contract.py tests/test_registry_discovery.py -v`: 23 passed in 21.33s.
+- Canonical-core gate:
+  - `pytest tests/test_v05_profile.py tests/test_v05_validation.py tests/test_v05_append_only.py tests/test_error_contract.py tests/test_application_commit.py tests/test_mem_core_locking.py tests/test_registry_discovery.py -v`: 83 passed in 26.89s.
+- Full suite:
+  - `pytest -q`: exit 0. Because `pyproject.toml` already adds `-q`, this ran double-quiet and emitted progress only:
+    - `......................................................`
+    - `.................. [ 74%]`
+    - `.........................                                                [100%]`
+- `git diff --check`: exit 0, no output.
+
+### Fix Round 2 Files
+
+- `packages/mem-core/src/mem_core/profile_identity.py`
+- `packages/mem-core/src/mem_core/repository.py`
+- `packages/mem-core/src/mem_core/hook.py`
+- `tests/test_mem_core.py`
+- `.superpowers/sdd/2026-08-30-pco-v0.5-canonical-core/task-6-report.md`
+
+### Fix Round 2 Commit and Concerns
+
+- Fix commit: final hash reported in the handoff response because embedding the hash in the committed report would change the hash.
+- Self-review: the fix preserves copied-relative Profile behavior, keeps non-root hook policy anchored to committed `HEAD`, keeps root/no-HEAD validation on the staged tree, and limits the absolute-path exception to external Profiles with committed identity fields.
+- Concern: existing external-Profile repositories initialized by the vulnerable marker shape without `profile_tree_digest` and `policy_hash` will fail closed until re-initialized or migrated with a trusted identity marker.
