@@ -102,6 +102,24 @@ def test_bundled_skill_rejects_a_traversal_name() -> None:
     assert exc.value.detail.code == "WORKSPACE_SKILL_INVALID"
 
 
+def test_pco_memory_skill_requires_verified_projection_or_canonical_fallback() -> None:
+    """Projection reads require verification, with canonical read fallback."""
+    text = bundled_skill("pco-memory").joinpath("SKILL.md").read_text()
+
+    assert "pco verify --path PCO_MEMORY" in text
+    assert "pco search" in text
+    assert "pco history" in text
+
+
+def test_pco_memory_skill_forbids_projection_edits_and_permanent_grants() -> None:
+    """The read-only projection may not gain temporary or permanent writes."""
+    skill = bundled_skill("pco-memory")
+    text = skill.joinpath("SKILL.md").read_text() + skill.joinpath("PERMISSIONS.md").read_text()
+
+    assert "Do not edit PCO_MEMORY" in text
+    assert "permanent workspace write permission is unsupported" in text
+
+
 def test_verify_skill_tree_accepts_a_matching_manifest(tmp_path: Path) -> None:
     """A manifest matching every ordinary file is accepted read-only."""
     skill = make_skill_tree(tmp_path, files={"SKILL.md": b"body\n"})
