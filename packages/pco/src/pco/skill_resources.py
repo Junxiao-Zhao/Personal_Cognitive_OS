@@ -15,9 +15,6 @@ from mem_core.errors import MemError, ensure
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion, Version
 
-from .config import COMPATIBILITY_RANGE
-
-
 _INVALID_CODE = "WORKSPACE_SKILL_INVALID"
 _INVALID_PHASE = "verify"
 
@@ -229,18 +226,9 @@ def _manifest_files(manifest: Mapping[str, Any]) -> dict[str, str]:
 
 
 def _ensure_supported_requirement(requirement: Any, package_version: str) -> None:
-    ensure(
-        requirement == COMPATIBILITY_RANGE,
-        _INVALID_CODE,
-        _INVALID_PHASE,
-        "SKILL manifest requires the v0.5 PCO compatibility range",
-        canonical_changed=False,
-        retry_safe=False,
-        value=requirement,
-    )
     try:
-        compatible = Version(package_version) in SpecifierSet(requirement)
-    except (InvalidVersion, InvalidSpecifier):
+        compatible = Version(package_version) in SpecifierSet(str(requirement))
+    except (InvalidVersion, InvalidSpecifier, TypeError):
         compatible = False
     ensure(
         compatible,

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,7 +22,12 @@ def _sha256(contents: bytes) -> str:
     return hashlib.sha256(contents).hexdigest()
 
 
-def make_skill_tree(tmp_path: Path, files: dict[str, bytes]) -> Path:
+def make_skill_tree(
+    tmp_path: Path,
+    files: dict[str, bytes],
+    *,
+    requires_pco: str = ">=0.5.0,<0.6.0",
+) -> Path:
     """Create a manifest-backed SKILL tree from independently hashed bytes."""
     skill = tmp_path / "example-skill"
     skill.mkdir()
@@ -32,7 +40,7 @@ def make_skill_tree(tmp_path: Path, files: dict[str, bytes]) -> Path:
         {
             "name": "example-skill",
             "skill_set_version": "0.5.0",
-            "requires_pco": ">=0.5.0,<0.6.0",
+            "requires_pco": requires_pco,
             "files": {path: _sha256(contents) for path, contents in files.items()},
         },
     )
@@ -49,6 +57,43 @@ def make_regular_tree(tmp_path: Path, files: dict[str, bytes]) -> Path:
     return tree
 
 
+def snapshot_tree(root: Path) -> dict[str, tuple[Any, ...]]:
+    """Capture every entry without following symlinks for read-only assertions."""
+    root_info = root.lstat()
+    snapshot: dict[str, tuple[Any, ...]] = {
+        ".": (
+            stat.S_IFMT(root_info.st_mode),
+            stat.S_IMODE(root_info.st_mode),
+            root_info.st_size,
+            root_info.st_mtime_ns,
+            root_info.st_ctime_ns,
+        )
+    }
+    pending = [(root, Path("."))]
+    while pending:
+        directory, prefix = pending.pop()
+        for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+            relative = (prefix / entry.name).as_posix()
+            entry_path = Path(entry.path)
+            info = entry.stat(follow_symlinks=False)
+            metadata = (
+                stat.S_IFMT(info.st_mode),
+                stat.S_IMODE(info.st_mode),
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+            if stat.S_ISREG(info.st_mode):
+                snapshot[relative] = (*metadata, _sha256(entry_path.read_bytes()))
+            elif stat.S_ISLNK(info.st_mode):
+                snapshot[relative] = (*metadata, os.readlink(entry.path))
+            else:
+                snapshot[relative] = metadata
+            if stat.S_ISDIR(info.st_mode):
+                pending.append((entry_path, prefix / entry.name))
+    return snapshot
+
+
 def test_bundled_skill_rejects_a_traversal_name() -> None:
     """Passing a traversal name must not escape the packaged skills resource."""
     with pytest.raises(MemError) as exc:
@@ -60,34 +105,53 @@ def test_bundled_skill_rejects_a_traversal_name() -> None:
 def test_verify_skill_tree_accepts_a_matching_manifest(tmp_path: Path) -> None:
     """A manifest matching every ordinary file is accepted read-only."""
     skill = make_skill_tree(tmp_path, files={"SKILL.md": b"body\n"})
+    before = snapshot_tree(skill)
 
     assert verify_skill_tree(skill, package_version="0.5.1") == {
         "ok": True,
         "name": "example-skill",
         "version": "0.5.0",
     }
+    assert snapshot_tree(skill) == before
+
+
+def test_verify_skill_tree_accepts_a_manifest_declared_compatible_range(
+    tmp_path: Path,
+) -> None:
+    """Replacing a manifest range with a valid narrower range must stay valid."""
+    skill = make_skill_tree(
+        tmp_path,
+        files={"SKILL.md": b"body\n"},
+        requires_pco=">=0.5.0,<0.5.2",
+    )
+
+    assert verify_skill_tree(skill, package_version="0.5.1")["ok"] is True
 
 
 def test_verify_skill_tree_rejects_unlisted_file(tmp_path: Path) -> None:
     """Ignoring files absent from a manifest would execute unreviewed content."""
     skill = make_skill_tree(tmp_path, files={"SKILL.md": b"body\n"})
     (skill / "extra.txt").write_text("unexpected\n")
+    before = snapshot_tree(skill)
 
     with pytest.raises(MemError) as exc:
         verify_skill_tree(skill, package_version="0.5.0")
 
     assert exc.value.detail.code == "WORKSPACE_SKILL_INVALID"
+    assert snapshot_tree(skill) == before
 
 
 def test_verify_skill_tree_rejects_symlink(tmp_path: Path) -> None:
     """Following a linked resource would let a tree escape its signed contents."""
     skill = make_skill_tree(tmp_path, files={"SKILL.md": b"body\n"})
     (skill / "linked.md").symlink_to(skill / "SKILL.md")
+    before = snapshot_tree(skill)
 
     with pytest.raises(MemError) as exc:
         verify_skill_tree(skill, package_version="0.5.0")
 
     assert exc.value.detail.code == "WORKSPACE_SKILL_INVALID"
+    assert snapshot_tree(skill) == before
 
 
 def test_verify_skill_tree_rejects_incompatible_package(tmp_path: Path) -> None:
@@ -96,6 +160,20 @@ def test_verify_skill_tree_rejects_incompatible_package(tmp_path: Path) -> None:
 
     with pytest.raises(MemError) as exc:
         verify_skill_tree(skill, package_version="0.6.0")
+
+    assert exc.value.detail.code == "WORKSPACE_SKILL_INVALID"
+
+
+def test_verify_skill_tree_rejects_an_invalid_manifest_specifier(tmp_path: Path) -> None:
+    """Parsing malformed manifest compatibility syntax must stay structured."""
+    skill = make_skill_tree(
+        tmp_path,
+        files={"SKILL.md": b"body\n"},
+        requires_pco="not a specifier",
+    )
+
+    with pytest.raises(MemError) as exc:
+        verify_skill_tree(skill, package_version="0.5.0")
 
     assert exc.value.detail.code == "WORKSPACE_SKILL_INVALID"
 
