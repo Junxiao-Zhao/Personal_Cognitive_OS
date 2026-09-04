@@ -1,262 +1,172 @@
+"""PCO v0.5 dedicated workspace initialization and opening."""
+
 from __future__ import annotations
 
 import json
-import os
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mem_core.errors import MemError, ensure
+from mem_core.errors import ensure
 from mem_core.profile import Profile
 from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
-from pydantic import BaseModel, ConfigDict, Field
-import yaml
 
-from .config import PCOConfig
-from .paths import bundled_profile
-
-
-class ThreadState(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    thread_id: str
-    active_epoch_id: str
-    last_archived_message_id: str | None = None
-    last_consolidated_message_id: str | None = None
-    # Native Harness compaction advances independently from consolidation.
-    # ``None`` is intentionally an unknown/unproven historical baseline.
-    compaction_cursor: str | None = None
-    archive_cursor: str | None = None
-    created_at: str
+from . import __version__
+from .config import PROFILE_VERSION, WORKSPACE_FORMAT_VERSION
+from .init_safety import (
+    canonical_json_bytes,
+    claim_workspace,
+    copy_regular_tree_anchored,
+)
+from .paths import WorkspacePaths, bundled_profile
+from .skill_resources import bundled_skill, verify_skill_tree
 
 
-class HarnessBinding(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: str
-    thread_id: str
-    epoch_id: str
-    harness: str
-    native_session_id: str | None = None
-    status: str = "active"
+_BUNDLED_SKILLS = ("pco-memory", "pco-consolidate")
 
 
 class Workspace:
-    def __init__(self, config: PCOConfig) -> None:
-        self.config = config
-        self.root = config.workspace_root.resolve()
-        self.profile_path = bundled_profile(config.profile)
-        self.profile = Profile.load(self.profile_path, default_registry())
-        self.repository = MemoryRepository(config.memory_root, self.profile)
+    """A fixed-layout PCO workspace."""
 
-    def init(self) -> dict[str, Any]:
+    def __init__(
+        self,
+        paths: WorkspacePaths,
+        profile: Profile,
+        repository: MemoryRepository,
+        identity: dict[str, Any],
+    ) -> None:
+        self.paths = paths
+        self.root = paths.root
+        self.profile_path = profile.root
+        self.profile = profile
+        self.repository = repository
+        self.identity = identity
+
+    @classmethod
+    def init(cls, root: Path) -> dict[str, Any]:
+        """Create a complete dedicated workspace through a stable root anchor."""
+
+        paths = WorkspacePaths.from_root(Path(root))
+        profile = Profile.load(bundled_profile(), default_registry())
         ensure(
-            not self.root.exists() or not any(self.root.iterdir()),
-            "WORKSPACE_NOT_EMPTY",
+            profile.version == PROFILE_VERSION,
+            "WORKSPACE_FORMAT_MISMATCH",
             "init",
-            f"Workspace is not empty: {self.root}",
+            "Bundled Profile version does not match the workspace format",
             canonical_changed=False,
             retry_safe=False,
         )
-        self.root.mkdir(parents=True, exist_ok=True)
-        for path in (
-            self.config.state_root,
-            self.config.indexes_root,
-            self.config.projection_root,
-        ):
-            path.mkdir(parents=True, exist_ok=True)
-        (self.root / "config.yaml").write_text(
-            yaml.safe_dump(
-                self.config.model_dump(mode="json"),
-                allow_unicode=True,
-                sort_keys=False,
-            ),
-            encoding="utf-8",
-        )
-        commit = self.repository.init(copy_profile=True)
-        now = datetime.now(timezone.utc).isoformat()
-        thread_id = f"thread_{uuid.uuid4().hex}"
-        epoch_id = f"epoch_{uuid.uuid4().hex}"
-        thread = ThreadState(
-            thread_id=thread_id, active_epoch_id=epoch_id, created_at=now
-        )
-        binding = HarnessBinding(
-            id=f"binding_{uuid.uuid4().hex}",
-            thread_id=thread_id,
-            epoch_id=epoch_id,
-            harness=self.config.harness.kind,
-            native_session_id=self.config.harness.main_session_id,
-        )
-        self.save_json("thread.json", thread.model_dump(mode="json"))
-        self.save_json("harness-binding.json", binding.model_dump(mode="json"))
-        (self.config.state_root / "workers").mkdir(exist_ok=True)
-        (self.config.state_root / "context").mkdir(exist_ok=True)
-        (self.config.state_root / "derivations").mkdir(exist_ok=True)
+
+        skill_sources: dict[str, Path] = {}
+        for skill_name in _BUNDLED_SKILLS:
+            source = Path(str(bundled_skill(skill_name)))
+            verify_skill_tree(source, __version__)
+            skill_sources[skill_name] = source
+
+        workspace_id = f"workspace_{uuid.uuid4().hex}"
+        identity = {
+            "workspace_id": workspace_id,
+            "workspace_format_version": WORKSPACE_FORMAT_VERSION,
+            "profile_version": PROFILE_VERSION,
+        }
+        repository = MemoryRepository(paths.canonical, profile, _resolve_root=False)
+
+        with claim_workspace(paths.root) as anchor:
+            with anchor.open_directory(".pco") as pco_root:
+                anchor.assert_target_identity()
+                pco_root.assert_target_identity()
+                for relative in ("canonical", "indexes", "tmp"):
+                    pco_root.mkdir(relative, parents=True)
+                for relative in (
+                    "PCO_PROPOSALS",
+                    "PCO_MEMORY",
+                    ".agents/skills",
+                ):
+                    anchor.mkdir(relative, parents=True)
+                anchor.assert_target_identity()
+                pco_root.assert_target_identity()
+
+                with pco_root.open_directory("canonical") as canonical:
+                    anchor.assert_target_identity()
+                    pco_root.assert_target_identity()
+                    commit = repository.init_anchored(
+                        canonical,
+                        initial_files={
+                            "workspace.json": canonical_json_bytes(identity),
+                        },
+                    )
+                anchor.assert_target_identity()
+                pco_root.assert_target_identity()
+
+                with anchor.open_directory(".agents/skills") as skills_root:
+                    for skill_name in _BUNDLED_SKILLS:
+                        anchor.assert_target_identity()
+                        pco_root.assert_target_identity()
+                        skills_root.assert_target_identity()
+                        skills_root.mkdir(skill_name)
+                        with skills_root.open_directory(skill_name) as skill_root:
+                            copy_regular_tree_anchored(
+                                skill_root, skill_sources[skill_name]
+                            )
+                    anchor.assert_target_identity()
+                    pco_root.assert_target_identity()
+                    skills_root.assert_target_identity()
+
         return {
             "ok": True,
-            "workspace": str(self.root),
+            "workspace": str(paths.root),
+            "workspace_id": workspace_id,
             "memory_commit": commit,
-            "thread_id": thread_id,
-            "epoch_id": epoch_id,
         }
 
-    def assert_initialized(self) -> None:
+    @classmethod
+    def open(cls, root: Path) -> "Workspace":
+        """Open the fixed workspace layout without mutating it."""
+
+        paths = WorkspacePaths.from_root(Path(root))
+        identity_path = paths.canonical / "workspace.json"
         ensure(
-            (self.config.state_root / "thread.json").is_file(),
+            identity_path.is_file(),
+            "WORKSPACE_NOT_INITIALIZED",
+            "workspace",
+            f"Not a PCO workspace: {paths.root}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        profile_path = paths.canonical / "profiles/pco"
+        profile = Profile.load(profile_path, default_registry())
+        repository = MemoryRepository(paths.canonical, profile)
+        repository.assert_initialized()
+        try:
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            ensure(
+                False,
+                "WORKSPACE_NOT_INITIALIZED",
+                "workspace",
+                f"Invalid workspace identity: {identity_path}: {exc}",
+                canonical_changed=False,
+                retry_safe=False,
+            )
+            raise AssertionError("unreachable")
+        ensure(
+            isinstance(identity, dict),
+            "WORKSPACE_NOT_INITIALIZED",
+            "workspace",
+            f"Invalid workspace identity: {identity_path}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        return cls(paths, profile, repository, identity)
+
+    def assert_initialized(self) -> None:
+        self.repository.assert_initialized()
+        ensure(
+            (self.paths.canonical / "workspace.json").is_file(),
             "WORKSPACE_NOT_INITIALIZED",
             "workspace",
             f"Not a PCO workspace: {self.root}",
             canonical_changed=False,
             retry_safe=False,
         )
-        self.repository.assert_initialized()
-
-    def state_path(self, name: str) -> Path:
-        ensure(
-            ".." not in Path(name).parts and not Path(name).is_absolute(),
-            "STATE_PATH_UNSAFE",
-            "workspace",
-            "Unsafe state path",
-            value=name,
-            canonical_changed=False,
-            retry_safe=False,
-        )
-        return self.config.state_root / name
-
-    def load_json(self, name: str) -> dict[str, Any]:
-        path = self.state_path(name)
-        ensure(
-            path.is_file(),
-            "STATE_NOT_FOUND",
-            "workspace",
-            f"Missing runtime state: {name}",
-            canonical_changed=False,
-            retry_safe=False,
-        )
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    def save_json(self, name: str, value: dict[str, Any]) -> None:
-        path = self.state_path(name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
-        os.replace(temporary, path)
-
-    def thread(self) -> ThreadState:
-        data = self.load_json("thread.json")
-        if "compaction_cursor" not in data:
-            # A legacy thread may be upgraded only from a fully observable,
-            # successful compact record. Never use consolidation progress as
-            # a substitute when that proof is absent.
-            data["compaction_cursor"] = self._proven_compaction_cursor()
-            self.save_json("thread.json", data)
-        return ThreadState.model_validate(data)
-
-    def _proven_compaction_cursor(self) -> str | None:
-        try:
-            records = list(self.repository.iter_records("checkpoints"))
-        except Exception:
-            return None
-        for record in reversed(records):
-            payload = record.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("status") not in {
-                "committed",
-                "committed_with_pending_derivations",
-            }:
-                continue
-            checkpoint_id = record.get("id")
-            if not isinstance(checkpoint_id, str):
-                continue
-            receipt_path = self.state_path(f"checkpoints/{checkpoint_id}/receipt.json")
-            if not receipt_path.is_file():
-                continue
-            try:
-                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            compaction = (
-                receipt.get("compaction") if isinstance(receipt, dict) else None
-            )
-            publication = (
-                receipt.get("context_publication")
-                if isinstance(receipt, dict)
-                else None
-            )
-            if (
-                isinstance(compaction, dict)
-                and compaction.get("status") == "completed"
-                and isinstance(compaction.get("cursor_after"), str)
-                and compaction.get("cursor_after")
-                and isinstance(publication, dict)
-                and publication.get("status") == "completed"
-            ):
-                return compaction["cursor_after"]
-        return None
-
-    def save_thread(self, state: ThreadState) -> None:
-        self.save_json("thread.json", state.model_dump(mode="json"))
-
-    def binding(self) -> HarnessBinding:
-        return HarnessBinding.model_validate(self.load_json("harness-binding.json"))
-
-    def save_binding(self, binding: HarnessBinding) -> None:
-        self.save_json("harness-binding.json", binding.model_dump(mode="json"))
-
-    def canonical_profile(self) -> Profile:
-        path = self.config.memory_root / "profiles" / self.profile.name
-        return Profile.load(path, default_registry())
-
-    def refresh_repository_profile(self) -> MemoryRepository:
-        canonical = self.canonical_profile()
-        marker_path = self.config.memory_root / ".mem-profile.json"
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        if canonical.name != marker.get("name") or canonical.version != marker.get(
-            "version"
-        ):
-            raise MemError(
-                "PROFILE_MARKER_MISMATCH",
-                "profile_load",
-                f"Canonical Profile {canonical.name}@{canonical.version} does not match .mem-profile.json",
-                path=str(marker_path),
-                recovery=[
-                    "Recreate the workspace",
-                    "Restore a matching Profile version",
-                ],
-                canonical_changed=False,
-                retry_safe=False,
-            )
-        self.profile = canonical
-        self.profile_path = self.config.memory_root / "profiles" / self.profile.name
-        self.repository = MemoryRepository(self.config.memory_root, self.profile)
-        return self.repository
-
-    def doctor(self) -> dict[str, Any]:
-        self.assert_initialized()
-        verification = self.refresh_repository_profile().verify()
-        binding = self.binding()
-        thread = self.thread()
-        issues: list[str] = []
-        if (
-            binding.thread_id != thread.thread_id
-            or binding.epoch_id != thread.active_epoch_id
-        ):
-            issues.append("active harness binding does not match thread/epoch")
-        if not verification["pre_commit_hook"]["installed"]:
-            issues.append("mem-core pre-commit validation hook is not installed")
-        lock = self.config.state_root / "checkpoint-lock.json"
-        return {
-            "ok": verification["ok"] and not issues,
-            "workspace": str(self.root),
-            "memory": verification,
-            "thread": thread.model_dump(mode="json"),
-            "binding": binding.model_dump(mode="json"),
-            "checkpoint_locked": lock.exists(),
-            "issues": issues,
-        }

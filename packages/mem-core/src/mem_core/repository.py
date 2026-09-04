@@ -8,7 +8,7 @@ import subprocess
 import sys
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 from .errors import MemError, ensure
 from .locking import canonical_lock
@@ -16,10 +16,15 @@ from .models import RecordEnvelope, latest_by_id
 from .profile import Profile
 from .profile_identity import profile_tree_digest
 
+if TYPE_CHECKING:
+    from pco.init_safety import DirectoryAnchor
+
 
 class MemoryRepository:
-    def __init__(self, root: Path, profile: Profile) -> None:
-        self.root = root.resolve()
+    def __init__(
+        self, root: Path, profile: Profile, *, _resolve_root: bool = True
+    ) -> None:
+        self.root = root.resolve() if _resolve_root else root.absolute()
         self.profile = profile
 
     def _git(self, *args: str, cwd: Path | None = None, check: bool = True) -> str:
@@ -108,6 +113,77 @@ class MemoryRepository:
         self._git("commit", "-m", f"Initialize {self.profile.name} canonical memory")
         self.install_pre_commit_hook()
         return self.head()
+
+    def init_anchored(
+        self,
+        root: "DirectoryAnchor",
+        *,
+        copy_profile: bool = True,
+        initial_files: Mapping[str, bytes] | None = None,
+    ) -> str:
+        """Initialize through a caller-supplied descriptor-backed directory.
+
+        The path-based ``init`` remains the generic trusted-repository API.
+        PCO imports are intentionally local so mem-core does not acquire a
+        package import dependency merely by being imported.
+        """
+
+        from pco.init_safety import (
+            AnchoredGit,
+            canonical_json_bytes,
+            copy_profile_tree_anchored,
+            install_pre_commit_hook_anchored,
+        )
+
+        with AnchoredGit(root.git_cwd(".")) as git:
+            git.run("init", "-b", "main")
+            git.run("config", "user.name", "PCO Memory")
+            git.run("config", "user.email", "pco-memory@local")
+
+            for stream in self.profile.config.streams.values():
+                root.touch(
+                    self.profile._safe_relative(stream.path, phase="init"),
+                    parents=True,
+                )
+            for artifact_root in self.profile.config.artifact_roots:
+                relative = self.profile._safe_relative(artifact_root, phase="init")
+                if relative.suffix:
+                    root.touch(relative, parents=True)
+                else:
+                    root.mkdir(relative, parents=True)
+                    root.touch(relative / ".gitkeep")
+            root.touch("transactions/transactions.jsonl", parents=True)
+            root.write_bytes(".gitignore", b"*.lock\n")
+            root.write_bytes(
+                ".mem-profile.json",
+                canonical_json_bytes(
+                    {
+                        "name": self.profile.name,
+                        "version": self.profile.version,
+                        "path": (
+                            f"profiles/{self.profile.name}"
+                            if copy_profile
+                            else str(self.profile.root)
+                        ),
+                    }
+                ),
+            )
+            if copy_profile:
+                profile_relative = f"profiles/{self.profile.name}"
+                root.mkdir(profile_relative, parents=True)
+                with root.open_directory(profile_relative) as profile_root:
+                    copy_profile_tree_anchored(profile_root, self.profile)
+            for relative, content in sorted((initial_files or {}).items()):
+                root.write_bytes(
+                    self.profile._safe_relative(relative, phase="init"), content
+                )
+
+            git.run("add", ".")
+            git.run(
+                "commit", "-m", f"Initialize {self.profile.name} canonical memory"
+            )
+            install_pre_commit_hook_anchored(root, git)
+            return git.run("rev-parse", "HEAD")
 
     def _common_git_dir(self) -> Path:
         raw = self._git("rev-parse", "--git-common-dir")

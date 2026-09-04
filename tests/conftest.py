@@ -9,6 +9,7 @@ from mem_core.profile import Profile
 from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
 from pco.paths import bundled_profile
+from pco.workspace import Workspace
 
 
 NOW = "2026-08-30T10:00:00+00:00"
@@ -208,3 +209,10 @@ def v05_repository(tmp_path: Path) -> MemoryRepository:
     result = MemoryRepository(tmp_path / "canonical", profile)
     result.init()
     return result
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> Workspace:
+    root = tmp_path / "pco"
+    Workspace.init(root)
+    return Workspace.open(root)
