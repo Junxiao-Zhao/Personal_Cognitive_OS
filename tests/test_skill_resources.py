@@ -120,6 +120,33 @@ def test_pco_memory_skill_forbids_projection_edits_and_permanent_grants() -> Non
     assert "permanent workspace write permission is unsupported" in text
 
 
+def test_pco_consolidate_skill_uses_plain_pco_commands() -> None:
+    """Proposal submission must use the one canonical public command shape."""
+    text = bundled_skill("pco-consolidate").joinpath("SKILL.md").read_text()
+
+    assert "pco proposal scaffold" in text
+    assert "pco proposal commit <review_id>" in text
+    assert "pco skill" not in text
+
+
+def test_pco_consolidate_skill_documents_both_logical_permission_boundaries() -> None:
+    """Authoring and submission need distinct, Host-governed boundaries."""
+    skill = bundled_skill("pco-consolidate")
+    text = skill.joinpath("SKILL.md").read_text() + skill.joinpath("PERMISSIONS.md").read_text()
+
+    assert "explain the complete intended proposal before Edit" in text
+    assert "one-time write permission" in text
+    assert "denial leaves canonical memory unchanged" in text
+    assert "permanent workspace write permission is unsupported" in text
+
+
+def test_skill_manifests_contain_no_host_eval_assets() -> None:
+    """Bundled skills remain documentation-only; Host evaluation stays manual."""
+    for name in ("pco-memory", "pco-consolidate"):
+        manifest = json.loads(bundled_skill(name).joinpath("manifest.json").read_text())
+        assert not any(path == "evals" or path.startswith("evals/") for path in manifest["files"])
+
+
 def test_verify_skill_tree_accepts_a_matching_manifest(tmp_path: Path) -> None:
     """A manifest matching every ordinary file is accepted read-only."""
     skill = make_skill_tree(tmp_path, files={"SKILL.md": b"body\n"})

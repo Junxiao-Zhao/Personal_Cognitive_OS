@@ -1,0 +1,10 @@
+{
+  "files": {
+    "PERMISSIONS.md": "c3c464bb93afe2c4c642120d7e1e6b44275babec4e0e5602a6e1a19fd70e4156",
+    "SKILL.md": "698ebb6788379e0f41289f5d93c2c65a99cb94df89a8e8c5a993cdc7a93b20f0",
+    "references/proposal-format.md": "46036e70c2861077ea815f28d8fa614ab1e118557d5f37b751726cdb13f5c9be"
+  },
+  "name": "pco-consolidate",
+  "requires_pco": ">=0.5.0,<0.6.0",
+  "skill_set_version": "0.5.0"
+}
