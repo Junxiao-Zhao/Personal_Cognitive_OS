@@ -8,6 +8,8 @@ the workspace state that exists independently of that future format.
 from __future__ import annotations
 
 import json
+import stat
+import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,8 +18,8 @@ from mem_core.repository import MemoryRepository
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import __version__
-from .config import PROFILE_VERSION, PROPOSAL_MANIFEST_VERSION, WORKSPACE_FORMAT_VERSION
-from .skill_resources import verify_skill_tree
+from .config import PROPOSAL_MANIFEST_VERSION
+from .skill_resources import inspect_skill_manifest, verify_skill_tree
 from .versioning import check_compatibility
 
 if TYPE_CHECKING:
@@ -40,32 +42,28 @@ _PERMISSION_CONTRACT = {
 class WorkspaceIdentity(BaseModel):
     """The exact, immutable identity carried in canonical ``workspace.json``."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
     workspace_id: str = Field(pattern=r"^workspace_[0-9a-f]{32}$")
-    workspace_format_version: str = Field(pattern=r"^0\.5\.0$")
-    profile_version: str = Field(pattern=r"^0\.5\.0$")
+    workspace_format_version: str = Field(min_length=1)
+    profile_version: str = Field(min_length=1)
 
 
 def load_workspace_identity(repository: MemoryRepository) -> WorkspaceIdentity:
     """Read and anchor workspace identity to its exact initial Git blob."""
 
+    root_commit = _sole_root_commit(repository)
     current_path = repository.root / "workspace.json"
     try:
         current_bytes = current_path.read_bytes()
         current = WorkspaceIdentity.model_validate_json(current_bytes)
-        root_commit = repository._git("rev-list", "--max-parents=0", "HEAD")
-        root_bytes = repository._git("show", f"{root_commit}:workspace.json")
+        root_bytes = _root_blob_bytes(repository, root_commit, "workspace.json")
         original = WorkspaceIdentity.model_validate_json(root_bytes)
-        current_blob = repository._git("hash-object", "workspace.json")
-        original_blob = repository._git("rev-parse", f"{root_commit}:workspace.json")
-    except (OSError, UnicodeDecodeError, ValidationError, MemError) as exc:
-        if isinstance(exc, MemError) and exc.detail.code != "GIT_FAILED":
-            raise
+    except (OSError, UnicodeDecodeError, ValidationError, RuntimeError) as exc:
         _integrity_error("Unable to read a valid root-anchored workspace identity", exc)
 
     ensure(
-        current == original and current_blob == original_blob,
+        current == original and current_bytes == root_bytes,
         _INTEGRITY_CODE,
         "doctor",
         "workspace.json differs from the canonical root commit",
@@ -76,7 +74,6 @@ def load_workspace_identity(repository: MemoryRepository) -> WorkspaceIdentity:
             "Restore the complete canonical repository containing its original initial commit"
         ],
     )
-    _ensure_identity_versions(current)
     _ensure_transaction_receipts(repository, current)
     return current
 
@@ -91,11 +88,23 @@ def verify_workspace(
     structured deferral rather than treating an empty or legacy tree as valid.
     """
 
-    identity = load_workspace_identity(workspace.repository)
-    skills = _verify_local_skills(workspace)
-    compatibility = _verify_compatibility(identity, skills)
+    result = _verify_workspace(workspace, hash_skill_payloads=True)
     if path is not None:
         _verify_requested_path(workspace, path)
+    return result
+
+
+def doctor_workspace(workspace: "Workspace") -> dict[str, Any]:
+    """Check workspace metadata and SKILL compatibility without payload hashing."""
+    return _verify_workspace(workspace, hash_skill_payloads=False)
+
+
+def _verify_workspace(
+    workspace: "Workspace", *, hash_skill_payloads: bool
+) -> dict[str, Any]:
+    identity = load_workspace_identity(workspace.repository)
+    skills = _verify_local_skills(workspace, hash_payloads=hash_skill_payloads)
+    compatibility = _verify_compatibility(identity, skills)
     return {
         "ok": True,
         "identity": identity.model_dump(mode="json"),
@@ -103,19 +112,6 @@ def verify_workspace(
         "skills": skills,
         "permission_contract": dict(_PERMISSION_CONTRACT),
     }
-
-
-def _ensure_identity_versions(identity: WorkspaceIdentity) -> None:
-    ensure(
-        identity.workspace_format_version == WORKSPACE_FORMAT_VERSION
-        and identity.profile_version == PROFILE_VERSION,
-        _INTEGRITY_CODE,
-        "doctor",
-        "workspace.json has unsupported workspace or Profile versions",
-        canonical_changed=False,
-        retry_safe=False,
-        path="workspace.json",
-    )
 
 
 def _ensure_transaction_receipts(
@@ -163,14 +159,37 @@ def _ensure_transaction_receipts(
                             retry_safe=False,
                             path=f"transactions/transactions.jsonl:{line_number}",
                         )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        _integrity_error("Unable to read canonical transaction receipts", exc)
+    except json.JSONDecodeError as exc:
+        raise MemError(
+            _INTEGRITY_CODE,
+            "doctor",
+            f"Unable to read canonical transaction receipts: {exc}",
+            canonical_changed=False,
+            retry_safe=False,
+            path=f"transactions/transactions.jsonl:{line_number}",
+        ) from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MemError(
+            _INTEGRITY_CODE,
+            "doctor",
+            f"Unable to read canonical transaction receipts: {exc}",
+            canonical_changed=False,
+            retry_safe=False,
+            path="transactions/transactions.jsonl",
+        ) from exc
 
 
-def _verify_local_skills(workspace: "Workspace") -> dict[str, dict[str, Any]]:
+def _verify_local_skills(
+    workspace: "Workspace", *, hash_payloads: bool
+) -> dict[str, dict[str, Any]]:
     verified: dict[str, dict[str, Any]] = {}
     for name in _SKILL_NAMES:
-        result = verify_skill_tree(workspace.paths.skills / name, __version__)
+        skill_path = _workspace_skill_path(workspace, name)
+        result = (
+            verify_skill_tree(skill_path, __version__)
+            if hash_payloads
+            else inspect_skill_manifest(skill_path, __version__)
+        )
         ensure(
             result["name"] == name,
             "WORKSPACE_SKILL_INVALID",
@@ -182,6 +201,33 @@ def _verify_local_skills(workspace: "Workspace") -> dict[str, dict[str, Any]]:
         )
         verified[name] = result
     return verified
+
+
+def _workspace_skill_path(workspace: "Workspace", name: str) -> Path:
+    for relative in (".agents", ".agents/skills"):
+        candidate = workspace.paths.root / relative
+        try:
+            observed = candidate.lstat()
+        except OSError as exc:
+            raise MemError(
+                "WORKSPACE_SKILL_INVALID",
+                "verify",
+                "workspace SKILL ancestor must be a real directory",
+                canonical_changed=False,
+                retry_safe=False,
+                path=relative,
+                value=str(exc),
+            ) from exc
+        ensure(
+            not stat.S_ISLNK(observed.st_mode) and stat.S_ISDIR(observed.st_mode),
+            "WORKSPACE_SKILL_INVALID",
+            "verify",
+            "workspace SKILL ancestor must be a real directory",
+            canonical_changed=False,
+            retry_safe=False,
+            path=relative,
+        )
+    return workspace.paths.skills / name
 
 
 def _verify_compatibility(
@@ -225,6 +271,44 @@ def _verify_requested_path(workspace: "Workspace", path: Path) -> None:
         retry_safe=False,
         path=str(path),
     )
+
+
+def _sole_root_commit(repository: MemoryRepository) -> str:
+    try:
+        shallow = repository._git("rev-parse", "--is-shallow-repository")
+        roots = repository._git("rev-list", "--max-parents=0", "HEAD").splitlines()
+    except MemError as exc:
+        _integrity_error("Unable to inspect canonical repository history", exc)
+    ensure(
+        shallow == "false",
+        _INTEGRITY_CODE,
+        "doctor",
+        "Cannot anchor identity in a shallow canonical repository",
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    ensure(
+        len(roots) == 1,
+        _INTEGRITY_CODE,
+        "doctor",
+        "Canonical repository must have exactly one reachable root commit",
+        canonical_changed=False,
+        retry_safe=False,
+    )
+    return roots[0]
+
+
+def _root_blob_bytes(repository: MemoryRepository, commit: str, path: str) -> bytes:
+    result = subprocess.run(
+        ["git", "cat-file", "blob", f"{commit}:{path}"],
+        cwd=repository.root,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(detail or "git cat-file failed")
+    return result.stdout
 
 
 def _integrity_error(message: str, exc: BaseException) -> None:

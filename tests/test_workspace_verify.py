@@ -18,6 +18,8 @@ from pco.workspace import Workspace
 def _snapshot_tree(root: Path) -> dict[str, tuple[Any, ...]]:
     """Capture every workspace entry without following symlinks."""
     root_info = root.lstat()
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError(f"snapshot root must be a real directory: {root}")
     snapshot: dict[str, tuple[Any, ...]] = {
         ".": (
             stat.S_IFMT(root_info.st_mode),
@@ -63,6 +65,17 @@ def _commit_unverified_transaction(
         handle.write(json.dumps(transaction, sort_keys=True) + "\n")
     workspace.repository._git("add", "transactions/transactions.jsonl")
     workspace.repository._git("commit", "--no-verify", "-m", "test receipt")
+
+
+def _amend_root_identity(workspace: Workspace, identity: dict[str, Any]) -> None:
+    metadata = workspace.paths.canonical / "workspace.json"
+    metadata.write_text(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    workspace.repository._git("add", "workspace.json")
+    workspace.repository._git("commit", "--amend", "--no-verify", "--no-edit")
 
 
 def test_doctor_reports_identity_compatibility_skills_and_permission_contract(
@@ -167,6 +180,18 @@ def test_doctor_rejects_transaction_receipt_for_another_workspace(
     assert _snapshot_tree(workspace.paths.root) == before
 
 
+def test_doctor_keeps_transaction_parse_line_diagnostics(workspace: Workspace) -> None:
+    """A malformed receipt log must identify its own canonical line, not metadata."""
+    transaction_log = workspace.paths.canonical / "transactions/transactions.jsonl"
+    transaction_log.write_text("not-json\n", encoding="utf-8")
+
+    with pytest.raises(MemError) as exc:
+        workspace.doctor()
+
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+    assert exc.value.detail.path == "transactions/transactions.jsonl:1"
+
+
 def test_doctor_accepts_transaction_receipt_for_this_workspace(workspace: Workspace) -> None:
     """Valid workspace-scoped receipts remain verifiable canonical history."""
     _commit_unverified_transaction(
@@ -183,14 +208,19 @@ def test_doctor_accepts_transaction_receipt_for_this_workspace(workspace: Worksp
     assert workspace.doctor()["identity"] == workspace.identity
 
 
-def test_doctor_rejects_skill_hash_tampering_read_only(workspace: Workspace) -> None:
-    """Skipping local manifests would execute altered workspace instructions."""
+def test_doctor_checks_skill_compatibility_but_verify_rejects_payload_tampering_read_only(
+    workspace: Workspace,
+) -> None:
+    """Doctor must not hash payloads, while verify must reject altered instructions."""
     skill = workspace.paths.skills / "pco-memory" / "SKILL.md"
     skill.write_text("tampered\n", encoding="utf-8")
     before = _snapshot_tree(workspace.paths.root)
 
+    assert workspace.doctor()["skills"]["pco-memory"]["name"] == "pco-memory"
+    assert _snapshot_tree(workspace.paths.root) == before
+
     with pytest.raises(MemError) as exc:
-        workspace.doctor()
+        verify_workspace(workspace)
 
     assert exc.value.detail.code == "WORKSPACE_SKILL_INVALID"
     assert _snapshot_tree(workspace.paths.root) == before
@@ -231,3 +261,156 @@ def test_copying_complete_canonical_repo_preserves_workspace_id(
     restored = Workspace.open(restored_root)
 
     assert restored.identity["workspace_id"] == workspace.identity["workspace_id"]
+
+
+def test_snapshot_tree_rejects_symlink_or_non_directory_root(tmp_path: Path) -> None:
+    """A snapshot that traverses a link could miss verification side effects."""
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(directory, target_is_directory=True)
+    file = tmp_path / "file"
+    file.write_text("not a directory\n", encoding="utf-8")
+
+    for root in (link, file):
+        with pytest.raises(ValueError, match="real directory"):
+            _snapshot_tree(root)
+
+
+def test_doctor_uses_working_identity_bytes_without_git_clean_filter(
+    workspace: Workspace, tmp_path: Path
+) -> None:
+    """A Git clean filter must neither run nor redefine exact identity bytes."""
+    marker = tmp_path / "filter-ran"
+    cleaner = tmp_path / "cleaner"
+    cleaner.write_text(f"#!/bin/sh\nprintf invoked > {marker}\ncat\n", encoding="utf-8")
+    cleaner.chmod(0o755)
+    workspace.repository._git("config", "filter.workspace-identity.clean", str(cleaner))
+    (workspace.paths.canonical / ".gitattributes").write_text(
+        "workspace.json filter=workspace-identity\n", encoding="utf-8"
+    )
+    before = _snapshot_tree(workspace.paths.root)
+
+    assert workspace.doctor()["ok"] is True
+
+    assert not marker.exists()
+    assert _snapshot_tree(workspace.paths.root) == before
+
+
+def test_doctor_rejects_eol_normalized_workspace_bytes_read_only(
+    workspace: Workspace,
+) -> None:
+    """EOL filtering cannot make different working identity bytes appear anchored."""
+    metadata = workspace.paths.canonical / "workspace.json"
+    (workspace.paths.canonical / ".gitattributes").write_text(
+        "workspace.json text\n", encoding="utf-8"
+    )
+    metadata.write_bytes(metadata.read_bytes().replace(b"\n", b"\r\n"))
+    before = _snapshot_tree(workspace.paths.root)
+
+    with pytest.raises(MemError) as exc:
+        workspace.doctor()
+
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+    assert _snapshot_tree(workspace.paths.root) == before
+
+
+def test_doctor_rejects_shallow_canonical_repository_read_only(workspace: Workspace) -> None:
+    """A shallow boundary cannot substitute for the immutable initial commit."""
+    root_commit = workspace.repository._git("rev-list", "--max-parents=0", "HEAD")
+    (workspace.paths.canonical / ".git/shallow").write_text(
+        root_commit + "\n", encoding="utf-8"
+    )
+    before = _snapshot_tree(workspace.paths.root)
+
+    with pytest.raises(MemError) as exc:
+        workspace.doctor()
+
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+    assert "shallow canonical repository" in exc.value.detail.message
+    assert _snapshot_tree(workspace.paths.root) == before
+
+
+def test_doctor_rejects_multiple_reachable_root_commits_read_only(
+    workspace: Workspace,
+) -> None:
+    """Choosing one of two roots would allow identity-anchor ambiguity."""
+    head = workspace.repository.head()
+    tree = workspace.repository._git("rev-parse", f"{head}^{{tree}}")
+    unrelated = workspace.repository._git("commit-tree", tree, "-m", "unrelated root")
+    merged = workspace.repository._git(
+        "commit-tree", tree, "-p", head, "-p", unrelated, "-m", "merge roots"
+    )
+    workspace.repository._git("update-ref", "HEAD", merged)
+    before = _snapshot_tree(workspace.paths.root)
+
+    with pytest.raises(MemError) as exc:
+        workspace.doctor()
+
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+    assert "exactly one reachable root" in exc.value.detail.message
+    assert _snapshot_tree(workspace.paths.root) == before
+
+
+def test_doctor_accepts_root_anchored_extra_fields_and_compatible_versions(
+    workspace: Workspace,
+) -> None:
+    """Schema extensions and v0.5 patches remain valid when rooted identically."""
+    identity = {
+        **workspace.identity,
+        "workspace_format_version": "0.5.1",
+        "profile_version": "0.5.1",
+        "root_anchored_extension": {"preserve": True},
+    }
+    _amend_root_identity(workspace, identity)
+
+    result = workspace.doctor()
+
+    assert result["identity"] == identity
+    assert result["compatibility"]["workspace"] == "0.5.1"
+    assert result["compatibility"]["profile"] == "0.5.1"
+
+
+@pytest.mark.parametrize("field", ["workspace_format_version", "profile_version"])
+def test_doctor_reports_out_of_range_root_anchored_versions_as_format_mismatch(
+    workspace: Workspace, field: str
+) -> None:
+    """Compatibility failures must not be disguised as identity tampering."""
+    identity = {**workspace.identity, field: "0.6.0"}
+    _amend_root_identity(workspace, identity)
+    before = _snapshot_tree(workspace.paths.root)
+
+    with pytest.raises(MemError) as exc:
+        workspace.doctor()
+
+    assert exc.value.detail.code == "WORKSPACE_FORMAT_MISMATCH"
+    assert _snapshot_tree(workspace.paths.root) == before
+
+
+@pytest.mark.parametrize("ancestor", [".agents", ".agents/skills"])
+@pytest.mark.parametrize("kind", ["symlink", "file"])
+def test_doctor_rejects_symlinked_skill_ancestors_without_following_outside_workspace(
+    workspace: Workspace, tmp_path: Path, ancestor: str, kind: str
+) -> None:
+    """A trusted external SKILL tree must not satisfy a workspace-local check."""
+    target = workspace.paths.root / ancestor
+    parked = workspace.paths.root / f"{target.name}-parked"
+    outside = tmp_path / f"outside-{target.name}"
+    target.rename(parked)
+    if kind == "symlink":
+        shutil.copytree(parked, outside)
+        target.symlink_to(outside, target_is_directory=True)
+    else:
+        target.write_text("not a directory\n", encoding="utf-8")
+    before = _snapshot_tree(workspace.paths.root)
+    outside_before = _snapshot_tree(outside) if kind == "symlink" else None
+
+    with pytest.raises(MemError) as exc:
+        workspace.doctor()
+
+    assert exc.value.detail.code == "WORKSPACE_SKILL_INVALID"
+    assert "workspace SKILL ancestor must be a real directory" in exc.value.detail.message
+    assert _snapshot_tree(workspace.paths.root) == before
+    if kind == "symlink":
+        assert outside_before is not None
+        assert _snapshot_tree(outside) == outside_before

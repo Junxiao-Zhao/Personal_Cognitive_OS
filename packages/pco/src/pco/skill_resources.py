@@ -68,6 +68,12 @@ def verify_skill_tree(path: Path, package_version: str) -> dict[str, Any]:
     return _validate_skill_manifest(manifest, observed, package_version)
 
 
+def inspect_skill_manifest(path: Path, package_version: str) -> dict[str, Any]:
+    """Validate a local SKILL manifest without reading or hashing its payloads."""
+    _ensure_directory(path)
+    return _skill_manifest_metadata(_load_manifest(path), package_version)
+
+
 def verified_skill_tree_bytes(
     path: Path, package_version: str
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
@@ -111,6 +117,18 @@ def _validate_skill_manifest(
         retry_safe=False,
         value=_diff_hashes(expected, observed),
     )
+    return _skill_manifest_fields(manifest)
+
+
+def _skill_manifest_metadata(
+    manifest: Mapping[str, Any], package_version: str
+) -> dict[str, Any]:
+    _manifest_files(manifest)
+    _ensure_supported_requirement(manifest.get("requires_pco"), package_version)
+    return _skill_manifest_fields(manifest)
+
+
+def _skill_manifest_fields(manifest: Mapping[str, Any]) -> dict[str, Any]:
     name = manifest.get("name")
     skill_set_version = manifest.get("skill_set_version")
     ensure(

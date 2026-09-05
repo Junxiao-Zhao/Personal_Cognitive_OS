@@ -185,6 +185,6 @@ class Workspace:
     def doctor(self) -> dict[str, Any]:
         """Verify this workspace without repairing or otherwise mutating it."""
 
-        from .verify import verify_workspace
+        from .verify import doctor_workspace
 
-        return verify_workspace(self)
+        return doctor_workspace(self)
