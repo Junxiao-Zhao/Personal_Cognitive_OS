@@ -19,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pco")
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init")
-    init.add_argument("path", type=Path, nargs="?", default=Path.cwd())
+    init.add_argument("path", type=Path, nargs="?", default=None)
     commands.add_parser("doctor")
     verify = commands.add_parser("verify")
     verify.add_argument("--path", type=Path)
@@ -74,13 +74,16 @@ def _discover_workspace(start: Path | None = None) -> Path:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     """Dispatch parsed workspace commands through the public workspace APIs."""
     if args.command == "init":
-        return Workspace.init(args.path)
+        return Workspace.init(args.path if args.path is not None else Path.cwd())
 
     workspace = Workspace.open(_discover_workspace())
     if args.command == "doctor":
         return workspace.doctor()
     if args.command == "verify":
-        return verify_workspace(workspace, path=args.path)
+        path = args.path
+        if path is not None and not path.is_absolute():
+            path = workspace.root / path
+        return verify_workspace(workspace, path=path)
     raise MemError(
         "COMMAND_INVALID",
         "cli",

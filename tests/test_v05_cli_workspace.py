@@ -53,6 +53,22 @@ def test_pco_init_defaults_to_current_directory(
     assert run(build_parser().parse_args(["init"]))["workspace"] == str(tmp_path)
 
 
+def test_pco_init_resolves_omitted_path_at_dispatch_time(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Capturing CWD while building the parser would initialize a stale path."""
+    old_cwd = tmp_path / "old"
+    old_cwd.mkdir()
+    new_cwd = tmp_path / "new"
+    new_cwd.mkdir()
+    monkeypatch.chdir(old_cwd)
+    args = build_parser().parse_args(["init"])
+
+    monkeypatch.chdir(new_cwd)
+
+    assert run(args)["workspace"] == str(new_cwd)
+
+
 def test_successful_workspace_command_returns_zero_and_json(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -126,6 +142,34 @@ def test_verify_pco_memory_reports_the_read_only_deferred_error(
     }
     assert result["diagnostic"] == {"path": "PCO_MEMORY"}
     assert _snapshot_tree(tmp_path) == before
+
+
+def test_nested_verify_resolves_relative_path_from_workspace_root(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Resolving from nested CWD would miss the workspace projection path."""
+    root = tmp_path / "workspace"
+    Workspace.init(root)
+    nested = root / "project" / "nested"
+    nested.mkdir(parents=True)
+    before = _snapshot_tree(root)
+    monkeypatch.chdir(nested)
+
+    assert main(["verify", "--path", "PCO_MEMORY"]) == 1
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["error"] == {
+        "code": "WORKSPACE_VERIFICATION_DEFERRED",
+        "phase": "verify",
+        "message": "PCO_MEMORY verification is deferred until the derivation projection verifier exists",
+        "canonical_changed": False,
+        "retry_safe": False,
+        "recovery": [
+            "Use canonical pco search or pco history until derivations are available"
+        ],
+    }
+    assert result["diagnostic"] == {"path": "PCO_MEMORY"}
+    assert _snapshot_tree(root) == before
 
 
 def test_missing_workspace_preserves_the_structured_error_contract(
