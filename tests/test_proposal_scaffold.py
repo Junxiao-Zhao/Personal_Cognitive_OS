@@ -108,6 +108,24 @@ def _extension_uniqueness_is_valid(
     return True
 
 
+def _extension_disjointness_is_valid(
+    schema: dict[str, Any], data: dict[str, Any]
+) -> bool:
+    def selected_values(selector: dict[str, Any]) -> set[str]:
+        matches = selector.get("where", {})
+        return {
+            item[selector["property"]]
+            for item in data.get(selector["collection"], [])
+            if selector["property"] in item
+            and all(item.get(key) == value for key, value in matches.items())
+        }
+
+    return all(
+        selected_values(rule["left"]).isdisjoint(selected_values(rule["right"]))
+        for rule in schema["x-pco-disjoint-by"]
+    )
+
+
 def test_scaffold_is_read_only_and_uses_current_controls(
     workspace: Workspace,
 ) -> None:
@@ -696,4 +714,35 @@ def test_schema_documents_property_uniqueness_as_an_explicit_extension(
     assert Draft202012Validator(schema).is_valid(data) is True
     assert schema["properties"][collection]["x-pco-unique-by"] == unique_keys
     assert _extension_uniqueness_is_valid(schema, data) is False
+    assert _runtime_accepts(data) is False
+
+
+def test_schema_documents_cross_collection_path_disjointness() -> None:
+    schema = _manifest_schema()
+    data = _manifest_data(
+        input_material=[
+            {
+                "material_id": "artifact",
+                "kind": "proposal_artifact",
+                "path": "inputs/same.txt",
+                "fidelity": "selected_excerpt",
+            }
+        ],
+        files=[{"path": "inputs/same.txt", "operation": "create"}],
+    )
+
+    # Draft 2020-12 cannot express a join across arrays. Generic validators
+    # accept this shape, while PCO interprets the declared extension.
+    assert Draft202012Validator(schema).is_valid(data) is True
+    assert schema["x-pco-disjoint-by"] == [
+        {
+            "left": {"collection": "files", "property": "path"},
+            "right": {
+                "collection": "input_material",
+                "property": "path",
+                "where": {"kind": "proposal_artifact"},
+            },
+        }
+    ]
+    assert _extension_disjointness_is_valid(schema, data) is False
     assert _runtime_accepts(data) is False

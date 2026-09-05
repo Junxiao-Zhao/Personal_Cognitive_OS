@@ -4,6 +4,17 @@
   "title": "PCO Proposal Manifest",
   "type": "object",
   "additionalProperties": false,
+  "$comment": "x-pco-disjoint-by declares cross-collection property sets that PCO requires to be disjoint; generic JSON Schema validators do not enforce this extension.",
+  "x-pco-disjoint-by": [
+    {
+      "left": {"collection": "files", "property": "path"},
+      "right": {
+        "collection": "input_material",
+        "property": "path",
+        "where": {"kind": "proposal_artifact"}
+      }
+    }
+  ],
   "required": [
     "review_id",
     "base_commit",
