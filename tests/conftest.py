@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -216,3 +217,54 @@ def workspace(tmp_path: Path) -> Workspace:
     root = tmp_path / "pco"
     Workspace.init(root)
     return Workspace.open(root)
+
+
+@pytest.fixture
+def proposal_factory(workspace: Workspace):
+    """Create only the active review root needed by proposal-path tests."""
+
+    def create(review_id: str) -> Path:
+        root = workspace.paths.proposals / review_id
+        root.mkdir()
+        return root
+
+    return create
+
+
+@pytest.fixture
+def business_markdown_factory():
+    """Build strict-frontmatter Markdown bytes without legacy checkpoint state."""
+
+    def create(
+        *,
+        object_type: str,
+        record_id: str,
+        operation: str = "create",
+        base_revision: int | None = None,
+        body: str = "A reviewed canonical statement.",
+        fields: dict[str, Any] | None = None,
+    ) -> bytes:
+        frontmatter: dict[str, Any] = {
+            "type": object_type,
+            "id": record_id,
+            "operation": operation,
+        }
+        if base_revision is not None:
+            frontmatter["base_revision"] = base_revision
+        frontmatter.update(fields or {})
+        lines = ["---"]
+        lines.extend(
+            f"{key}: {json.dumps(value, ensure_ascii=False)}"
+            for key, value in frontmatter.items()
+        )
+        lines.extend(["---", "", body])
+        return ("\n".join(lines).rstrip("\n") + "\n").encode("utf-8")
+
+    return create
+
+
+@pytest.fixture
+def active_proposal_tree(workspace: Workspace, proposal_factory):
+    """Return a public v0.5 workspace and its single empty active review root."""
+
+    return workspace, proposal_factory("review_active")

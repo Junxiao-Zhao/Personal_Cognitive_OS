@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pco.dev/schemas/proposal-manifest.schema.json",
+  "title": "PCO Proposal Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "review_id",
+    "base_commit",
+    "workspace_version",
+    "profile_version",
+    "input_material",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "pattern": "^0\\.5\\.(0|[1-9][0-9]*)$",
+      "x-pco-supported-range": ">=0.5.0,<0.6.0"
+    },
+    "review_id": {
+      "type": "string",
+      "pattern": "^review_[A-Za-z0-9._-]+$"
+    },
+    "base_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "workspace_version": {"type": "string", "minLength": 1},
+    "profile_version": {"type": "string", "minLength": 1},
+    "input_material": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/local_file"},
+          {"$ref": "#/$defs/proposal_artifact"}
+        ]
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/business_file"}
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "material_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "fidelity": {
+      "enum": ["full_source", "selected_excerpt"]
+    },
+    "business_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "operation"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relative_path"},
+        "operation": {"enum": ["create", "revise", "retire"]}
+      }
+    },
+    "local_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["material_id", "kind", "locator", "fidelity"],
+      "properties": {
+        "material_id": {"$ref": "#/$defs/material_id"},
+        "kind": {"const": "local_file"},
+        "locator": {"type": "string", "pattern": "^[Ff][Ii][Ll][Ee]:"},
+        "expected_content_hash": {"$ref": "#/$defs/hash"},
+        "fidelity": {"$ref": "#/$defs/fidelity"}
+      }
+    },
+    "proposal_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["material_id", "kind", "path", "fidelity"],
+      "properties": {
+        "material_id": {"$ref": "#/$defs/material_id"},
+        "kind": {"const": "proposal_artifact"},
+        "path": {
+          "allOf": [
+            {"$ref": "#/$defs/relative_path"},
+            {"pattern": "^inputs/.+"}
+          ]
+        },
+        "expected_content_hash": {"$ref": "#/$defs/hash"},
+        "fidelity": {"$ref": "#/$defs/fidelity"}
+      }
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\).+$"
+    }
+  }
+}
