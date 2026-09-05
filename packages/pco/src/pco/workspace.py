@@ -181,3 +181,10 @@ class Workspace:
             canonical_changed=False,
             retry_safe=False,
         )
+
+    def doctor(self) -> dict[str, Any]:
+        """Verify this workspace without repairing or otherwise mutating it."""
+
+        from .verify import verify_workspace
+
+        return verify_workspace(self)
