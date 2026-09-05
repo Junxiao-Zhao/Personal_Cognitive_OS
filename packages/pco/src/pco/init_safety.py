@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import ctypes
-import errno
 import json
 import os
 import shlex
 import stat
 import subprocess
 import sys
-import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -19,36 +16,13 @@ from typing import Any, Iterator, Mapping
 from mem_core.errors import MemError, ensure
 from mem_core.profile import Profile
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - capability-gated non-POSIX import
+    fcntl = None  # type: ignore[assignment]
+
 
 Identity = tuple[int, int]
-_RENAME_NOREPLACE = 1
-
-
-def _load_renameat2() -> Any | None:
-    try:
-        renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2")
-    except (AttributeError, OSError):
-        return None
-    renameat2.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint,
-    ]
-    renameat2.restype = ctypes.c_int
-    return renameat2
-
-
-_RENAMEAT2 = _load_renameat2()
-
-
-def _supports_rename_noreplace() -> bool:
-    if _RENAMEAT2 is None:
-        return False
-    ctypes.set_errno(0)
-    result = _RENAMEAT2(-1, b".", -1, b".", _RENAME_NOREPLACE)
-    return result == -1 and ctypes.get_errno() == errno.EBADF
 
 
 def _unsafe(message: str, *, value: Any = None) -> MemError:
@@ -130,7 +104,10 @@ def require_anchor_capabilities_before_mutation() -> None:
         hasattr(os, "O_NOFOLLOW"),
         hasattr(os, "O_PATH"),
         hasattr(os, "fchmod"),
-        _supports_rename_noreplace(),
+        fcntl is not None,
+        hasattr(fcntl, "flock"),
+        hasattr(fcntl, "LOCK_EX"),
+        hasattr(fcntl, "LOCK_NB"),
         os.open in supported_dir_fd,
         os.mkdir in supported_dir_fd,
         os.stat in supported_dir_fd,
@@ -171,61 +148,38 @@ def _directory_flags() -> int:
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
-def _publish_directory_no_replace(
-    source_fd: int,
-    source_name: str,
-    destination_fd: int,
-    destination_name: str,
+def _acquire_initializer_lock(
+    directory_fd: int,
+    *,
+    capability_probe: bool,
 ) -> None:
-    if _RENAMEAT2 is None:
-        raise _unsafe("Atomic no-replace directory publication is unavailable")
-    result = _RENAMEAT2(
-        source_fd,
-        os.fsencode(source_name),
-        destination_fd,
-        os.fsencode(destination_name),
-        _RENAME_NOREPLACE,
-    )
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number == errno.EEXIST:
-        raise FileExistsError(error_number, os.strerror(error_number), destination_name)
-    raise OSError(error_number, os.strerror(error_number), destination_name)
-
-
-def _entry_identity(directory_fd: int, name: str) -> Identity:
+    if fcntl is None:
+        raise _unsafe("Exclusive workspace initialization locks are unavailable")
     try:
-        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise _race("Another initializer holds the workspace lock") from exc
     except OSError as exc:
-        raise _race("Claim staging directory identity changed") from exc
-    if not stat.S_ISDIR(observed.st_mode):
-        raise _race("Claim staging entry is no longer a real directory")
-    return _stat_identity(observed)
+        if capability_probe:
+            raise _unsafe(
+                "Workspace filesystem does not support initialization locks",
+                value=str(exc),
+            ) from exc
+        raise _race("Workspace initialization lock failed") from exc
 
 
-def _open_unique_staging_directory(parent_fd: int) -> tuple[str, int, Identity]:
-    for _attempt in range(16):
-        name = f".pco-init-{uuid.uuid4().hex}"
-        try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            continue
-        except OSError as exc:
-            raise _race("Unable to create unique workspace claim staging") from exc
-        try:
-            descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
-        except OSError as exc:
-            raise _race("Workspace claim staging changed before it was opened") from exc
-        try:
-            identity = fstat_identity(descriptor)
-            if _entry_identity(parent_fd, name) != identity:
-                raise _race("Workspace claim staging changed before publication")
-        except BaseException:
-            os.close(descriptor)
-            raise
-        return name, descriptor, identity
-    raise _race("Unable to allocate a unique workspace claim staging directory")
+def _probe_parent_lock_support(target: Path) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent_fd = os.open(target.parent, flags)
+    except OSError as exc:
+        raise _unsafe(
+            "Workspace target parent cannot be opened safely", value=str(exc)
+        ) from exc
+    try:
+        _acquire_initializer_lock(parent_fd, capability_probe=True)
+    finally:
+        os.close(parent_fd)
 
 
 def open_directory_no_follow(
@@ -438,26 +392,6 @@ class DirectoryAnchor:
         except BaseException:
             os.close(descriptor)
             raise
-        self._retained[parts] = (descriptor, expected_identity, display_path)
-
-    def retain_open_directory(
-        self,
-        relative: str | Path | PurePosixPath,
-        descriptor: int,
-        *,
-        expected_identity: Identity,
-    ) -> None:
-        """Take ownership of an already-open, already-published child."""
-
-        parts = _relative_parts(relative, allow_dot=False)
-        if parts in self._retained:
-            raise _race("Directory anchor already retains this child")
-        display_path = self.display_path / str(relative)
-        ensure_directory_identity(
-            descriptor,
-            display_path,
-            expected_identity=expected_identity,
-        )
         self._retained[parts] = (descriptor, expected_identity, display_path)
 
     def _open_parent(
@@ -716,10 +650,12 @@ def copy_profile_tree_anchored(root: DirectoryAnchor, profile: Profile) -> None:
 
 @contextmanager
 def claim_workspace(target: Path) -> Iterator[DirectoryAnchor]:
-    """Atomically publish and retain this initializer's open ``.pco`` claim."""
+    """Serialize initializers, then create and retain the ``.pco`` claim."""
 
     require_anchor_capabilities_before_mutation()
     stat_before = lstat_absent_or_real_directory(target)
+    if stat_before is None:
+        _probe_parent_lock_support(target)
     directory_fd = open_directory_no_follow(
         target,
         create_if_absent=stat_before is None,
@@ -730,39 +666,20 @@ def claim_workspace(target: Path) -> Iterator[DirectoryAnchor]:
         expected_identity=fstat_identity(directory_fd),
         display_path=target,
     )
-    parent_fd: int | None = None
-    staging_fd: int | None = None
     try:
+        _acquire_initializer_lock(
+            directory_fd,
+            capability_probe=stat_before is not None,
+        )
         anchor.assert_target_identity()
         ensure_directory_empty(directory_fd)
         try:
-            parent_fd = os.open("..", _directory_flags(), dir_fd=directory_fd)
-        except OSError as exc:
-            raise _race("Unable to anchor workspace target parent") from exc
-        staging_name, staging_fd, staging_identity = _open_unique_staging_directory(
-            parent_fd
-        )
-        anchor.assert_target_identity()
-        try:
-            _publish_directory_no_replace(
-                parent_fd,
-                staging_name,
-                directory_fd,
-                ".pco",
-            )
+            os.mkdir(".pco", mode=0o700, dir_fd=directory_fd)
         except FileExistsError as exc:
-            # There is no descriptor-conditional rmdir primitive. Preserve the
-            # uniquely named unpublished directory rather than risk deleting a
-            # replacement inserted after any name/identity check.
             raise _race("Another initializer claimed .pco") from exc
         except OSError as exc:
             raise _race("Unable to claim .pco") from exc
-        anchor.retain_open_directory(
-            ".pco",
-            staging_fd,
-            expected_identity=staging_identity,
-        )
-        staging_fd = None
+        anchor.retain_directory(".pco")
         try:
             entries = os.listdir(directory_fd)
         except OSError as exc:
@@ -774,8 +691,4 @@ def claim_workspace(target: Path) -> Iterator[DirectoryAnchor]:
             claimed.assert_target_identity()
         yield anchor
     finally:
-        if staging_fd is not None:
-            os.close(staging_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
         anchor.close()

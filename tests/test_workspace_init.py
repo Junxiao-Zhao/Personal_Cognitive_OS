@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import multiprocessing
@@ -297,22 +299,122 @@ def test_missing_fd_enumeration_capability_is_rejected_before_target_creation(
     assert not target.exists()
 
 
-@pytest.mark.parametrize("capability", ["rename-no-replace", "o-path"])
-def test_missing_publication_or_safe_open_capability_fails_before_mutation(
+@pytest.mark.parametrize("capability", ["o-path", "flock"])
+def test_missing_anchor_capability_fails_before_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capability: str
 ) -> None:
     init_safety, workspace_module = _workspace_api()
     target = tmp_path / "target"
-    if capability == "rename-no-replace":
-        monkeypatch.setattr(init_safety, "_RENAMEAT2", None, raising=False)
-    else:
+    if capability == "o-path":
         monkeypatch.delattr(init_safety.os, "O_PATH", raising=False)
+    else:
+        monkeypatch.setattr(init_safety, "fcntl", None, raising=False)
 
     with pytest.raises(MemError) as exc:
         workspace_module.Workspace.init(target)
 
     assert exc.value.detail.code == "WORKSPACE_PATH_UNSAFE"
     assert not target.exists()
+
+
+def test_preexisting_writable_target_needs_no_parent_write_permission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    init_safety, workspace_module = _workspace_api()
+    target = tmp_path / "workspace"
+    target.mkdir()
+    parent_identity = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    real_mkdir = init_safety.os.mkdir
+
+    def deny_parent_write(path, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None:
+            observed = os.fstat(dir_fd)
+            if (observed.st_dev, observed.st_ino) == parent_identity:
+                raise PermissionError(errno.EACCES, "parent is not writable")
+        return real_mkdir(path, mode=mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(init_safety.os, "mkdir", deny_parent_write)
+    monkeypatch.setattr(
+        init_safety, "require_anchor_capabilities_before_mutation", lambda: None
+    )
+    previous_mode = stat.S_IMODE(tmp_path.stat().st_mode)
+    tmp_path.chmod(0o500)
+    try:
+        result = workspace_module.Workspace.init(target)
+    finally:
+        tmp_path.chmod(previous_mode)
+
+    assert result["workspace"] == str(target.absolute())
+    assert (target / ".pco/canonical/.git").is_dir()
+
+
+def test_lock_loser_leaves_no_sibling_staging_or_target_entry(tmp_path: Path) -> None:
+    _, workspace_module = _workspace_api()
+    target = tmp_path / "workspace"
+    target.mkdir()
+    descriptor = os.open(
+        target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with pytest.raises(MemError) as exc:
+            workspace_module.Workspace.init(target)
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+    assert exc.value.detail.code == "WORKSPACE_INIT_RACE"
+    assert list(target.iterdir()) == []
+    assert {path.name for path in tmp_path.iterdir()} == {"workspace"}
+
+
+def test_claim_mkdir_error_leaves_no_sibling_staging_or_target_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    init_safety, workspace_module = _workspace_api()
+    target = tmp_path / "workspace"
+    target.mkdir()
+    real_mkdir = init_safety.os.mkdir
+
+    def fail_claim(path, mode=0o777, *, dir_fd=None):
+        if path == ".pco" and dir_fd is not None:
+            raise OSError(errno.EIO, "simulated claim publication error")
+        return real_mkdir(path, mode=mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(init_safety.os, "mkdir", fail_claim)
+    monkeypatch.setattr(
+        init_safety, "require_anchor_capabilities_before_mutation", lambda: None
+    )
+
+    with pytest.raises(MemError) as exc:
+        workspace_module.Workspace.init(target)
+
+    assert exc.value.detail.code == "WORKSPACE_INIT_RACE"
+    assert list(target.iterdir()) == []
+    assert {path.name for path in tmp_path.iterdir()} == {"workspace"}
+
+
+def test_init_has_no_cross_filesystem_directory_publication_dependency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    init_safety, workspace_module = _workspace_api()
+
+    def cross_device_publication(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "simulated cross-filesystem publication")
+
+    monkeypatch.setattr(
+        init_safety,
+        "_publish_directory_no_replace",
+        cross_device_publication,
+        raising=False,
+    )
+    target = tmp_path / "workspace"
+
+    result = workspace_module.Workspace.init(target)
+
+    assert result["workspace"] == str(target.absolute())
+    assert (target / ".pco/canonical/.git").is_dir()
+    assert {path.name for path in tmp_path.iterdir()} == {"workspace"}
 
 
 def test_losing_initializer_never_cleans_winner(
@@ -323,15 +425,14 @@ def test_losing_initializer_never_cleans_winner(
     target.mkdir()
     real_mkdir = init_safety.os.mkdir
 
-    def let_other_initializer_win(
-        source_fd, source_name, destination_fd, destination_name
-    ):
-        assert destination_name == ".pco"
-        real_mkdir(destination_name, mode=0o700, dir_fd=destination_fd)
+    def let_other_initializer_win(path, mode=0o777, *, dir_fd=None):
+        if path != ".pco" or dir_fd is None:
+            return real_mkdir(path, mode=mode, dir_fd=dir_fd)
+        real_mkdir(path, mode=mode, dir_fd=dir_fd)
         claim_fd = os.open(
-            destination_name,
+            path,
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=destination_fd,
+            dir_fd=dir_fd,
         )
         try:
             winner_fd = os.open(
@@ -348,11 +449,9 @@ def test_losing_initializer_never_cleans_winner(
             os.close(claim_fd)
         raise FileExistsError("simulated competing initializer")
 
+    monkeypatch.setattr(init_safety.os, "mkdir", let_other_initializer_win)
     monkeypatch.setattr(
-        init_safety,
-        "_publish_directory_no_replace",
-        let_other_initializer_win,
-        raising=False,
+        init_safety, "require_anchor_capabilities_before_mutation", lambda: None
     )
 
     with pytest.raises(MemError) as exc:
@@ -360,11 +459,7 @@ def test_losing_initializer_never_cleans_winner(
 
     assert exc.value.detail.code == "WORKSPACE_INIT_RACE"
     assert (target / ".pco/winner").read_text(encoding="utf-8") == "winner"
-    staging = [
-        path for path in tmp_path.iterdir() if path.name.startswith(".pco-init-")
-    ]
-    assert len(staging) == 1
-    assert list(staging[0].iterdir()) == []
+    assert {path.name for path in tmp_path.iterdir()} == {"workspace"}
 
 
 def test_failed_initializer_preserves_its_partial_claim(

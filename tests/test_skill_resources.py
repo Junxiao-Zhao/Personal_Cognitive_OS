@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from mem_core.errors import MemError
+from pco import skill_resources
 from pco.skill_resources import (
     bundled_skill,
     hash_regular_tree,
@@ -171,6 +172,36 @@ def test_verify_skill_tree_accepts_a_manifest_declared_compatible_range(
     )
 
     assert verify_skill_tree(skill, package_version="0.5.1")["ok"] is True
+
+
+@pytest.mark.parametrize("missing", ["o-path", "proc-fd"])
+def test_generic_hash_and_verify_remain_portable_without_snapshot_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str,
+) -> None:
+    body = b"portable body\n"
+    skill = make_skill_tree(tmp_path, files={"SKILL.md": body})
+    if missing == "o-path":
+        monkeypatch.delattr(skill_resources.os, "O_PATH", raising=False)
+    else:
+        real_is_dir = Path.is_dir
+
+        def hide_proc_fd(path: Path) -> bool:
+            if path == Path("/proc/self/fd"):
+                return False
+            return real_is_dir(path)
+
+        monkeypatch.setattr(Path, "is_dir", hide_proc_fd)
+
+    assert hash_regular_tree(skill, exclude={"manifest.json"}) == {
+        "SKILL.md": _sha256(body),
+    }
+    assert verify_skill_tree(skill, package_version="0.5.1") == {
+        "ok": True,
+        "name": "example-skill",
+        "version": "0.5.0",
+    }
 
 
 def test_verify_skill_tree_rejects_unlisted_file(tmp_path: Path) -> None:
