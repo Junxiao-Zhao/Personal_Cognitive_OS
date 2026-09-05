@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
 import shlex
 import stat
 import subprocess
 import sys
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -18,6 +21,34 @@ from mem_core.profile import Profile
 
 
 Identity = tuple[int, int]
+_RENAME_NOREPLACE = 1
+
+
+def _load_renameat2() -> Any | None:
+    try:
+        renameat2 = getattr(ctypes.CDLL(None, use_errno=True), "renameat2")
+    except (AttributeError, OSError):
+        return None
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    return renameat2
+
+
+_RENAMEAT2 = _load_renameat2()
+
+
+def _supports_rename_noreplace() -> bool:
+    if _RENAMEAT2 is None:
+        return False
+    ctypes.set_errno(0)
+    result = _RENAMEAT2(-1, b".", -1, b".", _RENAME_NOREPLACE)
+    return result == -1 and ctypes.get_errno() == errno.EBADF
 
 
 def _unsafe(message: str, *, value: Any = None) -> MemError:
@@ -57,6 +88,10 @@ def lstat_final(path: Path) -> os.stat_result | None:
         return os.lstat(path)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise _unsafe(
+            "Workspace target cannot be inspected safely", value=str(exc)
+        ) from exc
 
 
 def lstat_absent_or_real_directory(path: Path) -> os.stat_result | None:
@@ -93,9 +128,13 @@ def require_anchor_capabilities_before_mutation() -> None:
         os.name == "posix",
         hasattr(os, "O_DIRECTORY"),
         hasattr(os, "O_NOFOLLOW"),
+        hasattr(os, "O_PATH"),
         hasattr(os, "fchmod"),
+        _supports_rename_noreplace(),
         os.open in supported_dir_fd,
         os.mkdir in supported_dir_fd,
+        os.stat in supported_dir_fd,
+        os.stat in getattr(os, "supports_follow_symlinks", set()),
         os.listdir in supported_fd,
         Path("/proc/self/fd").is_dir(),
     )
@@ -118,7 +157,7 @@ def ensure_directory_identity(
         raise _race("Workspace directory descriptor identity changed")
     try:
         observed = lstat_final(target)
-    except OSError as exc:
+    except (MemError, OSError) as exc:
         raise _race("Workspace target could not be re-inspected") from exc
     if (
         observed is None
@@ -130,6 +169,63 @@ def ensure_directory_identity(
 
 def _directory_flags() -> int:
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _publish_directory_no_replace(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+) -> None:
+    if _RENAMEAT2 is None:
+        raise _unsafe("Atomic no-replace directory publication is unavailable")
+    result = _RENAMEAT2(
+        source_fd,
+        os.fsencode(source_name),
+        destination_fd,
+        os.fsencode(destination_name),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(error_number, os.strerror(error_number), destination_name)
+    raise OSError(error_number, os.strerror(error_number), destination_name)
+
+
+def _entry_identity(directory_fd: int, name: str) -> Identity:
+    try:
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise _race("Claim staging directory identity changed") from exc
+    if not stat.S_ISDIR(observed.st_mode):
+        raise _race("Claim staging entry is no longer a real directory")
+    return _stat_identity(observed)
+
+
+def _open_unique_staging_directory(parent_fd: int) -> tuple[str, int, Identity]:
+    for _attempt in range(16):
+        name = f".pco-init-{uuid.uuid4().hex}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise _race("Unable to create unique workspace claim staging") from exc
+        try:
+            descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise _race("Workspace claim staging changed before it was opened") from exc
+        try:
+            identity = fstat_identity(descriptor)
+            if _entry_identity(parent_fd, name) != identity:
+                raise _race("Workspace claim staging changed before publication")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return name, descriptor, identity
+    raise _race("Unable to allocate a unique workspace claim staging directory")
 
 
 def open_directory_no_follow(
@@ -344,6 +440,26 @@ class DirectoryAnchor:
             raise
         self._retained[parts] = (descriptor, expected_identity, display_path)
 
+    def retain_open_directory(
+        self,
+        relative: str | Path | PurePosixPath,
+        descriptor: int,
+        *,
+        expected_identity: Identity,
+    ) -> None:
+        """Take ownership of an already-open, already-published child."""
+
+        parts = _relative_parts(relative, allow_dot=False)
+        if parts in self._retained:
+            raise _race("Directory anchor already retains this child")
+        display_path = self.display_path / str(relative)
+        ensure_directory_identity(
+            descriptor,
+            display_path,
+            expected_identity=expected_identity,
+        )
+        self._retained[parts] = (descriptor, expected_identity, display_path)
+
     def _open_parent(
         self,
         relative: str | Path | PurePosixPath,
@@ -373,6 +489,8 @@ class DirectoryAnchor:
         parents: bool = False,
         mode: int = 0o600,
     ) -> None:
+        if not hasattr(os, "fchmod"):
+            raise _unsafe("Safe anchored file mode setting is unavailable")
         parent, name = self._open_parent(relative, parents=parents)
         descriptor: int | None = None
         try:
@@ -395,6 +513,7 @@ class DirectoryAnchor:
                 if written <= 0:
                     raise OSError("short write")
                 view = view[written:]
+            os.fchmod(descriptor, mode)
         except OSError as exc:
             raise _unsafe("Unable to write anchored regular file", value=str(relative)) from exc
         finally:
@@ -403,22 +522,46 @@ class DirectoryAnchor:
             os.close(parent)
 
     def chmod(self, relative: str | Path | PurePosixPath, mode: int) -> None:
+        safe_stat = (
+            os.stat in getattr(os, "supports_dir_fd", set())
+            and os.stat in getattr(os, "supports_follow_symlinks", set())
+        )
+        if (
+            not hasattr(os, "O_PATH")
+            or not hasattr(os, "fchmod")
+            or not safe_stat
+            or not Path("/proc/self/fd").is_dir()
+        ):
+            raise _unsafe("Safe anchored chmod is unavailable")
         parent, name = self._open_parent(relative, parents=False)
+        path_descriptor: int | None = None
         descriptor: int | None = None
         try:
-            descriptor = os.open(
+            path_descriptor = os.open(
                 name,
-                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=parent,
             )
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            path_stat = os.fstat(path_descriptor)
+            if not stat.S_ISREG(path_stat.st_mode):
                 raise _unsafe("Anchored chmod target must be a regular file")
+            observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if _stat_identity(observed) != _stat_identity(path_stat):
+                raise _unsafe("Anchored chmod target identity changed")
+            descriptor = os.open(
+                f"/proc/self/fd/{path_descriptor}",
+                os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+            )
+            if fstat_identity(descriptor) != _stat_identity(path_stat):
+                raise _unsafe("Anchored chmod target identity changed")
             os.fchmod(descriptor, mode)
         except OSError as exc:
             raise _unsafe("Unable to chmod anchored regular file", value=str(relative)) from exc
         finally:
             if descriptor is not None:
                 os.close(descriptor)
+            if path_descriptor is not None:
+                os.close(path_descriptor)
             os.close(parent)
 
     def git_cwd(self, relative: str | Path | PurePosixPath) -> "GitWorkingDirectory":
@@ -499,9 +642,8 @@ def install_pre_commit_hook_anchored(
     with root.open_directory(common_git_dir) as git_root:
         git_root.mkdir("hooks", parents=True)
         git_root.write_bytes(
-            "hooks/pre-commit", _managed_pre_commit_hook_bytes(), mode=0o700
+            "hooks/pre-commit", _managed_pre_commit_hook_bytes(), mode=0o755
         )
-        git_root.chmod("hooks/pre-commit", 0o755)
 
 
 def _read_regular_file_no_follow(path: Path) -> bytes:
@@ -559,13 +701,22 @@ def copy_regular_tree_anchored(root: DirectoryAnchor, source: Path) -> None:
                 raise _unsafe("Bundled resource tree contains an unsafe entry", value=entry.path)
 
 
+def copy_tree_bytes_anchored(
+    root: DirectoryAnchor, files_by_path: Mapping[str, bytes]
+) -> None:
+    """Install an already-verified regular-file snapshot through ``root``."""
+
+    for relative, content in sorted(files_by_path.items()):
+        root.write_bytes(relative, content, parents=True)
+
+
 def copy_profile_tree_anchored(root: DirectoryAnchor, profile: Profile) -> None:
     copy_regular_tree_anchored(root, profile.root)
 
 
 @contextmanager
 def claim_workspace(target: Path) -> Iterator[DirectoryAnchor]:
-    """Claim an empty workspace with an atomic, never-cleaned ``.pco`` mkdir."""
+    """Atomically publish and retain this initializer's open ``.pco`` claim."""
 
     require_anchor_capabilities_before_mutation()
     stat_before = lstat_absent_or_real_directory(target)
@@ -579,15 +730,39 @@ def claim_workspace(target: Path) -> Iterator[DirectoryAnchor]:
         expected_identity=fstat_identity(directory_fd),
         display_path=target,
     )
+    parent_fd: int | None = None
+    staging_fd: int | None = None
     try:
         anchor.assert_target_identity()
         ensure_directory_empty(directory_fd)
         try:
-            os.mkdir(".pco", mode=0o700, dir_fd=directory_fd)
+            parent_fd = os.open("..", _directory_flags(), dir_fd=directory_fd)
+        except OSError as exc:
+            raise _race("Unable to anchor workspace target parent") from exc
+        staging_name, staging_fd, staging_identity = _open_unique_staging_directory(
+            parent_fd
+        )
+        anchor.assert_target_identity()
+        try:
+            _publish_directory_no_replace(
+                parent_fd,
+                staging_name,
+                directory_fd,
+                ".pco",
+            )
         except FileExistsError as exc:
+            # There is no descriptor-conditional rmdir primitive. Preserve the
+            # uniquely named unpublished directory rather than risk deleting a
+            # replacement inserted after any name/identity check.
             raise _race("Another initializer claimed .pco") from exc
         except OSError as exc:
             raise _race("Unable to claim .pco") from exc
+        anchor.retain_open_directory(
+            ".pco",
+            staging_fd,
+            expected_identity=staging_identity,
+        )
+        staging_fd = None
         try:
             entries = os.listdir(directory_fd)
         except OSError as exc:
@@ -595,8 +770,12 @@ def claim_workspace(target: Path) -> Iterator[DirectoryAnchor]:
         if entries != [".pco"]:
             raise _race("Workspace changed while .pco was being claimed")
         anchor.assert_target_identity()
-        anchor.retain_directory(".pco")
-        anchor.assert_target_identity()
+        with anchor.open_directory(".pco") as claimed:
+            claimed.assert_target_identity()
         yield anchor
     finally:
+        if staging_fd is not None:
+            os.close(staging_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
         anchor.close()

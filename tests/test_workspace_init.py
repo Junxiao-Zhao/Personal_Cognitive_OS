@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import multiprocessing
 import os
 import re
 import socket
@@ -8,6 +10,7 @@ import stat
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
+from queue import Empty
 from typing import Iterator
 
 import pytest
@@ -84,6 +87,54 @@ def _assert_trees_equal(source: Path, target: Path) -> None:
     assert target_files == source_files
 
 
+def _make_test_skill(root: Path, name: str) -> tuple[Path, bytes]:
+    skill = root / name
+    skill.mkdir(parents=True)
+    trusted = f"# {name}\ntrusted instructions\n".encode()
+    permissions = b"read-only\n"
+    (skill / "SKILL.md").write_bytes(trusted)
+    (skill / "PERMISSIONS.md").write_bytes(permissions)
+    manifest = {
+        "files": {
+            "PERMISSIONS.md": hashlib.sha256(permissions).hexdigest(),
+            "SKILL.md": hashlib.sha256(trusted).hexdigest(),
+        },
+        "name": name,
+        "requires_pco": ">=0.5.0,<0.6.0",
+        "skill_set_version": "0.5.0",
+    }
+    (skill / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return skill, trusted
+
+
+def _chmod_fifo_worker(root: str, result_queue) -> None:
+    from pco import init_safety
+
+    root_path = Path(root)
+    descriptor = os.open(
+        root_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    try:
+        with init_safety.DirectoryAnchor(
+            descriptor,
+            expected_identity=init_safety.fstat_identity(descriptor),
+            display_path=root_path,
+        ) as anchor:
+            try:
+                anchor.chmod("fifo", 0o600)
+            except MemError as exc:
+                result_queue.put(("mem-error", exc.detail.code))
+            except BaseException as exc:  # pragma: no cover - diagnostic boundary
+                result_queue.put(("unexpected", type(exc).__name__))
+            else:
+                result_queue.put(("ok", None))
+    except BaseException as exc:  # pragma: no cover - diagnostic boundary
+        result_queue.put(("unexpected", type(exc).__name__))
+
+
 def test_canonical_json_bytes_is_compact_utf8_sorted_and_lf_terminated() -> None:
     init_safety, _ = _workspace_api()
 
@@ -111,6 +162,28 @@ def test_init_rejects_unsafe_final_component_without_mutation(
 ) -> None:
     _, workspace_module = _workspace_api()
     target = _make_entry(tmp_path / "target", kind)
+    before = _snapshot_parent(tmp_path)
+
+    with pytest.raises(MemError) as exc:
+        workspace_module.Workspace.init(target)
+
+    assert exc.value.detail.code == "WORKSPACE_PATH_UNSAFE"
+    assert _snapshot_parent(tmp_path) == before
+
+
+@pytest.mark.parametrize("kind", ["non-directory", "symlink-to-nondirectory"])
+def test_init_rejects_nondirectory_intermediate_without_mutation(
+    tmp_path: Path, kind: str
+) -> None:
+    _, workspace_module = _workspace_api()
+    intermediate = tmp_path / "intermediate"
+    if kind == "non-directory":
+        intermediate.write_bytes(b"not a directory")
+    else:
+        destination = tmp_path / "not-a-directory"
+        destination.write_bytes(b"not a directory")
+        intermediate.symlink_to(destination)
+    target = intermediate / "workspace"
     before = _snapshot_parent(tmp_path)
 
     with pytest.raises(MemError) as exc:
@@ -224,6 +297,24 @@ def test_missing_fd_enumeration_capability_is_rejected_before_target_creation(
     assert not target.exists()
 
 
+@pytest.mark.parametrize("capability", ["rename-no-replace", "o-path"])
+def test_missing_publication_or_safe_open_capability_fails_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capability: str
+) -> None:
+    init_safety, workspace_module = _workspace_api()
+    target = tmp_path / "target"
+    if capability == "rename-no-replace":
+        monkeypatch.setattr(init_safety, "_RENAMEAT2", None, raising=False)
+    else:
+        monkeypatch.delattr(init_safety.os, "O_PATH", raising=False)
+
+    with pytest.raises(MemError) as exc:
+        workspace_module.Workspace.init(target)
+
+    assert exc.value.detail.code == "WORKSPACE_PATH_UNSAFE"
+    assert not target.exists()
+
+
 def test_losing_initializer_never_cleans_winner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -232,40 +323,48 @@ def test_losing_initializer_never_cleans_winner(
     target.mkdir()
     real_mkdir = init_safety.os.mkdir
 
-    def let_other_initializer_win(path, mode=0o777, *, dir_fd=None):
-        if path == ".pco" and dir_fd is not None:
-            real_mkdir(path, mode=mode, dir_fd=dir_fd)
-            claim_fd = os.open(
-                ".pco",
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=dir_fd,
+    def let_other_initializer_win(
+        source_fd, source_name, destination_fd, destination_name
+    ):
+        assert destination_name == ".pco"
+        real_mkdir(destination_name, mode=0o700, dir_fd=destination_fd)
+        claim_fd = os.open(
+            destination_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=destination_fd,
+        )
+        try:
+            winner_fd = os.open(
+                "winner",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=claim_fd,
             )
             try:
-                winner_fd = os.open(
-                    "winner",
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                    dir_fd=claim_fd,
-                )
-                try:
-                    os.write(winner_fd, b"winner")
-                finally:
-                    os.close(winner_fd)
+                os.write(winner_fd, b"winner")
             finally:
-                os.close(claim_fd)
-            raise FileExistsError("simulated competing initializer")
-        return real_mkdir(path, mode=mode, dir_fd=dir_fd)
+                os.close(winner_fd)
+        finally:
+            os.close(claim_fd)
+        raise FileExistsError("simulated competing initializer")
 
     monkeypatch.setattr(
-        init_safety, "require_anchor_capabilities_before_mutation", lambda: None
+        init_safety,
+        "_publish_directory_no_replace",
+        let_other_initializer_win,
+        raising=False,
     )
-    monkeypatch.setattr(init_safety.os, "mkdir", let_other_initializer_win)
 
     with pytest.raises(MemError) as exc:
         workspace_module.Workspace.init(target)
 
     assert exc.value.detail.code == "WORKSPACE_INIT_RACE"
     assert (target / ".pco/winner").read_text(encoding="utf-8") == "winner"
+    staging = [
+        path for path in tmp_path.iterdir() if path.name.startswith(".pco-init-")
+    ]
+    assert len(staging) == 1
+    assert list(staging[0].iterdir()) == []
 
 
 def test_failed_initializer_preserves_its_partial_claim(
@@ -356,6 +455,40 @@ def test_claimed_pco_swap_is_detected_and_never_writes_replacement(
     assert claimed.is_dir()
 
 
+def test_claim_publication_swap_cannot_adopt_or_mutate_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    init_safety, workspace_module = _workspace_api()
+    target = tmp_path / "workspace"
+    target.mkdir()
+    created_claim = tmp_path / "created-claim"
+    replacement = target / ".pco"
+    real_listdir = init_safety.os.listdir
+    swapped = False
+
+    def swap_before_retention(descriptor):
+        nonlocal swapped
+        entries = real_listdir(descriptor)
+        if entries == [".pco"] and not swapped:
+            replacement.rename(created_claim)
+            replacement.mkdir()
+            swapped = True
+            return real_listdir(descriptor)
+        return entries
+
+    monkeypatch.setattr(
+        init_safety, "require_anchor_capabilities_before_mutation", lambda: None
+    )
+    monkeypatch.setattr(init_safety.os, "listdir", swap_before_retention)
+
+    with pytest.raises(MemError) as exc:
+        workspace_module.Workspace.init(target)
+
+    assert exc.value.detail.code == "WORKSPACE_INIT_RACE"
+    assert list(created_claim.iterdir()) == []
+    assert list(replacement.iterdir()) == []
+
+
 def test_target_swap_during_repository_init_keeps_git_writes_on_anchor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -380,6 +513,49 @@ def test_target_swap_during_repository_init_keeps_git_writes_on_anchor(
     assert exc.value.detail.code == "WORKSPACE_INIT_RACE"
     assert list(outside.iterdir()) == []
     assert (moved / ".pco/canonical/.git").is_dir()
+
+
+@pytest.mark.parametrize("mutation", ["changed", "swapped", "fifo"])
+def test_skill_copy_uses_only_the_exact_preflight_verified_regular_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    _, workspace_module = _workspace_api()
+    source_root = tmp_path / "skill-sources"
+    memory_skill, trusted = _make_test_skill(source_root, "pco-memory")
+    consolidate_skill, _ = _make_test_skill(source_root, "pco-consolidate")
+    skill_sources = {
+        "pco-memory": memory_skill,
+        "pco-consolidate": consolidate_skill,
+    }
+    monkeypatch.setattr(
+        workspace_module, "bundled_skill", lambda name: skill_sources[name]
+    )
+    real_init = MemoryRepository.init_anchored
+
+    def mutate_after_preflight(repository, root, **kwargs):
+        commit = real_init(repository, root, **kwargs)
+        skill_file = memory_skill / "SKILL.md"
+        if mutation == "changed":
+            skill_file.write_bytes(b"unverified in-place replacement\n")
+        elif mutation == "swapped":
+            replacement = memory_skill / "replacement"
+            replacement.write_bytes(b"unverified inode replacement\n")
+            os.replace(replacement, skill_file)
+        else:
+            skill_file.unlink()
+            os.mkfifo(skill_file)
+        return commit
+
+    monkeypatch.setattr(MemoryRepository, "init_anchored", mutate_after_preflight)
+    target = tmp_path / "workspace"
+
+    workspace_module.Workspace.init(target)
+
+    installed = target / ".agents/skills/pco-memory/SKILL.md"
+    assert installed.is_file()
+    assert installed.read_bytes() == trusted
 
 
 @pytest.mark.parametrize("precreate", [False, True], ids=["absent", "empty"])
@@ -573,3 +749,48 @@ def test_directory_anchor_never_follows_symlink(
         assert exc.value.detail.code == "WORKSPACE_PATH_UNSAFE"
 
     assert list(outside.iterdir()) == []
+
+
+def test_directory_anchor_chmod_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    os.mkfifo(root / "fifo")
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_chmod_fifo_worker,
+        args=(str(root), result_queue),
+    )
+    process.start()
+    process.join(timeout=2)
+    blocked = process.is_alive()
+    if blocked:
+        process.terminate()
+        process.join(timeout=2)
+
+    assert not blocked, "chmod blocked while opening a FIFO before type validation"
+    try:
+        result = result_queue.get(timeout=1)
+    except Empty:  # pragma: no cover - diagnostic boundary
+        pytest.fail("chmod worker exited without a result")
+    assert result == ("mem-error", "WORKSPACE_PATH_UNSAFE")
+
+
+def test_hook_mode_is_set_on_exclusive_fd_without_standalone_chmod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    init_safety, workspace_module = _workspace_api()
+
+    def forbidden_chmod(*_args, **_kwargs):
+        raise AssertionError("new anchored files must be chmodded before closing")
+
+    monkeypatch.setattr(init_safety.DirectoryAnchor, "chmod", forbidden_chmod)
+    previous_umask = os.umask(0o777)
+    target = tmp_path / "workspace"
+    try:
+        workspace_module.Workspace.init(target)
+    finally:
+        os.umask(previous_umask)
+
+    hook = target / ".pco/canonical/.git/hooks/pre-commit"
+    assert stat.S_IMODE(hook.stat().st_mode) == 0o755

@@ -40,10 +40,10 @@ def hash_regular_tree(path: Path, *, exclude: set[str]) -> dict[str, str]:
     ``lstat`` semantics, so a symlink is rejected rather than traversed.
     """
     excluded = {_normalize_relative(item) for item in exclude}
-    entries = _regular_files_no_follow(path)
+    snapshot = _read_regular_tree_bytes(path)
     return {
-        relative: _sha256_file(entry)
-        for relative, entry in entries
+        relative: hashlib.sha256(content).hexdigest()
+        for relative, content in snapshot.items()
         if relative not in excluded
     }
 
@@ -62,11 +62,35 @@ def verify_skill_tree(path: Path, package_version: str) -> dict[str, Any]:
     This function only reads the supplied tree; it never repairs, copies, or
     writes resources while checking them.
     """
-    _ensure_directory(path)
-    manifest = _load_manifest(path)
+    metadata, _files = verified_skill_tree_bytes(path, package_version)
+    return metadata
+
+
+def verified_skill_tree_bytes(
+    path: Path, package_version: str
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Read, hash, and validate the exact regular-file bytes to be installed.
+
+    Entry type is checked on ``O_PATH|O_NOFOLLOW`` descriptors. Only an inode
+    already proven regular is reopened through its descriptor for reading, so
+    a pathname race cannot make verification block on or activate a special
+    file. The returned bytes are the same bytes covered by the manifest check.
+    """
+
+    snapshot = _read_regular_tree_bytes(path)
+    manifest_path = path / "manifest.json"
+    try:
+        manifest_bytes = snapshot["manifest.json"]
+    except KeyError:
+        _invalid("Unable to read valid SKILL manifest", path=str(manifest_path))
+    manifest = _parse_manifest_bytes(manifest_bytes, manifest_path)
     expected = _manifest_files(manifest)
     _ensure_supported_requirement(manifest.get("requires_pco"), package_version)
-    observed = hash_regular_tree(path, exclude={"manifest.json"})
+    observed = {
+        relative: hashlib.sha256(content).hexdigest()
+        for relative, content in snapshot.items()
+        if relative != "manifest.json"
+    }
     ensure(
         observed == expected,
         _INVALID_CODE,
@@ -94,67 +118,136 @@ def verify_skill_tree(path: Path, package_version: str) -> dict[str, Any]:
         canonical_changed=False,
         retry_safe=False,
     )
-    return {"ok": True, "name": name, "version": skill_set_version}
+    return (
+        {"ok": True, "name": name, "version": skill_set_version},
+        snapshot,
+    )
 
 
-def _regular_files_no_follow(root: Path) -> list[tuple[str, Path]]:
-    _ensure_directory(root)
-    entries: list[tuple[str, Path]] = []
-    pending: list[tuple[Path, PurePosixPath]] = [(root, PurePosixPath("."))]
-    while pending:
-        directory, prefix = pending.pop()
-        try:
-            children = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        except OSError as exc:
-            _invalid("Unable to enumerate SKILL resource tree", path=str(directory), value=str(exc))
-        for child in children:
-            relative = _normalize_relative((prefix / child.name).as_posix())
-            try:
-                mode = child.stat(follow_symlinks=False).st_mode
-            except OSError as exc:
-                _invalid("Unable to inspect SKILL resource entry", path=relative, value=str(exc))
-            if stat.S_ISLNK(mode):
-                _invalid("SKILL resource tree contains a symlink", path=relative)
-            child_path = Path(child.path)
-            if stat.S_ISDIR(mode):
-                pending.append((child_path, PurePosixPath(relative)))
-            elif stat.S_ISREG(mode):
-                entries.append((relative, child_path))
-            else:
-                _invalid("SKILL resource tree contains a non-regular file", path=relative)
-    return sorted(entries, key=lambda item: item[0])
-
-
-def _sha256_file(path: Path) -> str:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+def _read_regular_tree_bytes(root: Path) -> dict[str, bytes]:
+    if not hasattr(os, "O_PATH") or not Path("/proc/self/fd").is_dir():
+        _invalid("Safe descriptor-backed SKILL reads are unavailable", path=str(root))
+    flags = os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        descriptor = os.open(path, flags)
+        path_descriptor = os.open(root, flags)
     except OSError as exc:
-        _invalid("Unable to read SKILL resource file", path=str(path), value=str(exc))
+        _invalid("Unable to open SKILL resource tree", path=str(root), value=str(exc))
     try:
-        mode = os.fstat(descriptor).st_mode
-        if not stat.S_ISREG(mode):
-            _invalid("SKILL resource tree contains a non-regular file", path=str(path))
-        digest = hashlib.sha256()
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-    except OSError as exc:
-        _invalid("Unable to hash SKILL resource file", path=str(path), value=str(exc))
+        root_stat = os.fstat(path_descriptor)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            _invalid("SKILL resource tree must be a real directory", path=str(root))
+        directory_fd = _open_descriptor_for_read(path_descriptor, root_stat, directory=True)
     finally:
-        os.close(descriptor)
-
-
-def _load_manifest(path: Path) -> dict[str, Any]:
-    manifest_path = path / "manifest.json"
+        os.close(path_descriptor)
     try:
-        raw = _read_regular_file(manifest_path)
+        snapshot: dict[str, bytes] = {}
+        _read_regular_directory(directory_fd, PurePosixPath("."), snapshot)
+        return dict(sorted(snapshot.items()))
+    finally:
+        os.close(directory_fd)
+
+
+def _read_regular_directory(
+    directory_fd: int,
+    prefix: PurePosixPath,
+    snapshot: dict[str, bytes],
+) -> None:
+    try:
+        names = sorted(os.listdir(directory_fd))
+    except OSError as exc:
+        _invalid(
+            "Unable to enumerate SKILL resource tree",
+            path=prefix.as_posix(),
+            value=str(exc),
+        )
+    for name in names:
+        relative = _normalize_relative((prefix / name).as_posix())
+        flags = os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            path_descriptor = os.open(name, flags, dir_fd=directory_fd)
+        except OSError as exc:
+            _invalid(
+                "Unable to open SKILL resource entry",
+                path=relative,
+                value=str(exc),
+            )
+        try:
+            observed = os.fstat(path_descriptor)
+            if stat.S_ISDIR(observed.st_mode):
+                child_fd = _open_descriptor_for_read(
+                    path_descriptor, observed, directory=True
+                )
+                try:
+                    _read_regular_directory(
+                        child_fd, PurePosixPath(relative), snapshot
+                    )
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(observed.st_mode):
+                content_fd = _open_descriptor_for_read(
+                    path_descriptor, observed, directory=False
+                )
+                try:
+                    snapshot[relative] = _read_all(content_fd)
+                finally:
+                    os.close(content_fd)
+            else:
+                _invalid(
+                    "SKILL resource tree contains a non-regular file",
+                    path=relative,
+                )
+        finally:
+            os.close(path_descriptor)
+
+
+def _open_descriptor_for_read(
+    path_descriptor: int,
+    expected: os.stat_result,
+    *,
+    directory: bool,
+) -> int:
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if directory:
+        flags |= os.O_DIRECTORY
+    try:
+        descriptor = os.open(f"/proc/self/fd/{path_descriptor}", flags)
+    except OSError as exc:
+        _invalid("Unable to read opened SKILL resource entry", value=str(exc))
+    try:
+        actual = os.fstat(descriptor)
+        expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+        if (
+            not expected_kind(actual.st_mode)
+            or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            _invalid("Opened SKILL resource entry identity changed")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_all(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = os.read(descriptor, 1024 * 1024)
+        except OSError as exc:
+            _invalid("Unable to read opened SKILL resource entry", value=str(exc))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _parse_manifest_bytes(raw: bytes, manifest_path: Path) -> dict[str, Any]:
+    try:
         parsed = json.loads(raw.decode("utf-8"), object_pairs_hook=_JsonObject)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        _invalid("Unable to read valid SKILL manifest", path=str(manifest_path), value=str(exc))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        _invalid(
+            "Unable to read valid SKILL manifest",
+            path=str(manifest_path),
+            value=str(exc),
+        )
     ensure(
         isinstance(parsed, _JsonObject),
         _INVALID_CODE,
@@ -165,29 +258,6 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     )
     _ensure_unique_json_keys(parsed, "SKILL manifest")
     return parsed
-
-
-def _read_regular_file(path: Path) -> bytes:
-    try:
-        mode = path.lstat().st_mode
-    except OSError as exc:
-        _invalid("Unable to inspect SKILL manifest", path=str(path), value=str(exc))
-    if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
-        _invalid("SKILL manifest must be a regular file", path=str(path))
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        _invalid("Unable to read SKILL manifest", path=str(path), value=str(exc))
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            _invalid("SKILL manifest must be a regular file", path=str(path))
-        with os.fdopen(descriptor, "rb", closefd=False) as stream:
-            return stream.read()
-    finally:
-        os.close(descriptor)
 
 
 def _manifest_files(manifest: Mapping[str, Any]) -> dict[str, str]:
@@ -251,15 +321,6 @@ def _ensure_unique_json_keys(value: _JsonObject, description: str) -> None:
         canonical_changed=False,
         retry_safe=False,
     )
-
-
-def _ensure_directory(path: Path) -> None:
-    try:
-        mode = path.lstat().st_mode
-    except OSError as exc:
-        _invalid("Unable to inspect SKILL resource tree", path=str(path), value=str(exc))
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        _invalid("SKILL resource tree must be a real directory", path=str(path))
 
 
 def _normalize_relative(raw_path: str) -> str:

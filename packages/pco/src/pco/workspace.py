@@ -13,14 +13,15 @@ from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
 
 from . import __version__
+from . import init_safety
 from .config import PROFILE_VERSION, WORKSPACE_FORMAT_VERSION
 from .init_safety import (
     canonical_json_bytes,
     claim_workspace,
-    copy_regular_tree_anchored,
+    copy_tree_bytes_anchored,
 )
 from .paths import WorkspacePaths, bundled_profile
-from .skill_resources import bundled_skill, verify_skill_tree
+from .skill_resources import bundled_skill, verified_skill_tree_bytes
 
 
 _BUNDLED_SKILLS = ("pco-memory", "pco-consolidate")
@@ -47,6 +48,7 @@ class Workspace:
     def init(cls, root: Path) -> dict[str, Any]:
         """Create a complete dedicated workspace through a stable root anchor."""
 
+        init_safety.require_anchor_capabilities_before_mutation()
         paths = WorkspacePaths.from_root(Path(root))
         profile = Profile.load(bundled_profile(), default_registry())
         ensure(
@@ -58,11 +60,20 @@ class Workspace:
             retry_safe=False,
         )
 
-        skill_sources: dict[str, Path] = {}
+        skill_snapshots: dict[str, dict[str, bytes]] = {}
         for skill_name in _BUNDLED_SKILLS:
             source = Path(str(bundled_skill(skill_name)))
-            verify_skill_tree(source, __version__)
-            skill_sources[skill_name] = source
+            metadata, snapshot = verified_skill_tree_bytes(source, __version__)
+            ensure(
+                metadata["name"] == skill_name,
+                "WORKSPACE_SKILL_INVALID",
+                "verify",
+                "Bundled SKILL manifest name does not match its install location",
+                path=skill_name,
+                canonical_changed=False,
+                retry_safe=False,
+            )
+            skill_snapshots[skill_name] = snapshot
 
         workspace_id = f"workspace_{uuid.uuid4().hex}"
         identity = {
@@ -106,8 +117,8 @@ class Workspace:
                         skills_root.assert_target_identity()
                         skills_root.mkdir(skill_name)
                         with skills_root.open_directory(skill_name) as skill_root:
-                            copy_regular_tree_anchored(
-                                skill_root, skill_sources[skill_name]
+                            copy_tree_bytes_anchored(
+                                skill_root, skill_snapshots[skill_name]
                             )
                     anchor.assert_target_identity()
                     pco_root.assert_target_identity()
