@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 from typing import Iterable
 from urllib.parse import unquote, urlsplit
@@ -18,6 +19,13 @@ from .models import InputMaterial, LocalFileMaterial, ProposalArtifactMaterial
 
 MAX_INPUT_MATERIAL_BYTES = 16_777_216
 _READ_CHUNK_BYTES = 1024 * 1024
+_UNSUPPORTED_LEADING_BOMS = (
+    b"\x00\x00\xfe\xff",  # UTF-32 big endian
+    b"\xff\xfe\x00\x00",  # UTF-32 little endian
+    b"\xfe\xff",  # UTF-16 big endian
+    b"\xff\xfe",  # UTF-16 little endian
+)
+_MALFORMED_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,13 +108,15 @@ def _normalize_utf8(
     normalized = bytearray()
     raw_size = 0
     pending_cr = False
+    prefix = bytearray()
+    decoder_started = False
 
     def extend_normalized(text: str) -> None:
         nonlocal pending_cr
-        if "\x00" in text or "\ufeff" in text:
+        if "\x00" in text:
             raise _material_error(
                 "INPUT_MATERIAL_INVALID",
-                "Input material contains a NUL or non-leading byte-order mark",
+                "Input material contains a NUL code point",
             )
 
         if pending_cr:
@@ -123,6 +133,18 @@ def _normalize_utf8(
             _raise_too_large(limit, form="normalized")
         normalized.extend(encoded)
 
+    def reject_unsupported_bom(data: bytes) -> None:
+        if any(data.startswith(bom) for bom in _UNSUPPORTED_LEADING_BOMS):
+            raise _material_error(
+                "INPUT_MATERIAL_INVALID",
+                "Input material begins with a UTF-16 or UTF-32 byte-order mark",
+            )
+
+    def decode(data: bytes) -> None:
+        decoded = decoder.decode(data, final=False)
+        if decoded:
+            extend_normalized(decoded)
+
     try:
         for chunk in chunks:
             if not isinstance(chunk, bytes):
@@ -132,9 +154,21 @@ def _normalize_utf8(
             raw_size += len(chunk)
             if raw is not None:
                 raw.extend(chunk)
-            decoded = decoder.decode(chunk, final=False)
-            if decoded:
-                extend_normalized(decoded)
+            if not decoder_started:
+                prefix_bytes = min(4 - len(prefix), len(chunk))
+                prefix.extend(chunk[:prefix_bytes])
+                if len(prefix) < 4:
+                    continue
+                reject_unsupported_bom(bytes(prefix))
+                decoder_started = True
+                decode(bytes(prefix))
+                prefix.clear()
+                decode(chunk[prefix_bytes:])
+            else:
+                decode(chunk)
+        if not decoder_started:
+            reject_unsupported_bom(bytes(prefix))
+            decode(bytes(prefix))
         final_text = decoder.decode(b"", final=True)
         if final_text:
             extend_normalized(final_text)
@@ -172,28 +206,77 @@ def _stat_identity(observed: os.stat_result) -> tuple[int, int, int, int]:
     )
 
 
-def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
-    """Read one final-component no-follow regular file exactly once."""
-
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
-        raise ValueError("limit must be a non-negative integer")
+def _require_read_capabilities(*, anchored: bool, path: Path) -> None:
     no_follow = getattr(os, "O_NOFOLLOW", None)
     non_blocking = getattr(os, "O_NONBLOCK", None)
-    if no_follow is None or non_blocking is None:
+    directory = getattr(os, "O_DIRECTORY", None)
+    safe_metadata = os.stat in getattr(os, "supports_follow_symlinks", set())
+    safe_anchoring = not anchored or (
+        os.name == "posix"
+        and directory is not None
+        and os.open in getattr(os, "supports_dir_fd", set())
+        and os.stat in getattr(os, "supports_dir_fd", set())
+    )
+    if (
+        no_follow is None
+        or non_blocking is None
+        or not safe_metadata
+        or not safe_anchoring
+    ):
         raise _material_error(
             "INPUT_MATERIAL_UNSAFE",
-            "This platform cannot safely open final-component input material",
+            "This platform cannot safely inspect and open input material",
             path=path,
         )
 
-    flags = os.O_RDONLY | no_follow | non_blocking | getattr(os, "O_CLOEXEC", 0)
+
+def _named_stat(
+    name: str | Path, *, parent_fd: int | None, display_path: Path
+) -> os.stat_result:
     try:
-        descriptor = os.open(path, flags)
+        if parent_fd is None:
+            return os.stat(name, follow_symlinks=False)
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise _material_error(
+            "INPUT_MATERIAL_UNSAFE",
+            "Input material named entry cannot be inspected safely",
+            path=display_path,
+            value=str(exc),
+        ) from exc
+
+
+def _read_regular_entry(
+    name: str | Path,
+    *,
+    parent_fd: int | None,
+    display_path: Path,
+    limit: int,
+) -> CapturedFile:
+    observed = _named_stat(name, parent_fd=parent_fd, display_path=display_path)
+    if not stat.S_ISREG(observed.st_mode):
+        raise _material_error(
+            "INPUT_MATERIAL_UNSAFE",
+            "Input material named entry must be a regular file",
+            path=display_path,
+        )
+
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        if parent_fd is None:
+            descriptor = os.open(name, flags)
+        else:
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
     except OSError as exc:
         raise _material_error(
             "INPUT_MATERIAL_UNSAFE",
             "Input material cannot be opened without following links",
-            path=path,
+            path=display_path,
             value=str(exc),
         ) from exc
 
@@ -204,20 +287,23 @@ def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
             raise _material_error(
                 "INPUT_MATERIAL_UNSAFE",
                 "Input material identity cannot be inspected",
-                path=path,
+                path=display_path,
                 value=str(exc),
             ) from exc
-        if not stat.S_ISREG(before.st_mode):
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != (observed.st_dev, observed.st_ino)
+        ):
             raise _material_error(
                 "INPUT_MATERIAL_UNSAFE",
-                "Input material must be a regular file",
-                path=path,
+                "Input material changed between inspection and open",
+                path=display_path,
             )
         if before.st_size < 0:
             raise _material_error(
                 "INPUT_MATERIAL_UNSAFE",
                 "Input material reported an invalid file size",
-                path=path,
+                path=display_path,
             )
         if before.st_size > limit:
             _raise_too_large(limit, form="raw")
@@ -232,7 +318,7 @@ def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
                     raise _material_error(
                         "INPUT_MATERIAL_UNSAFE",
                         "Input material could not be read safely",
-                        path=path,
+                        path=display_path,
                         value=str(exc),
                     ) from exc
                 if not chunk:
@@ -250,7 +336,7 @@ def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
             raise _material_error(
                 "INPUT_MATERIAL_UNSAFE",
                 "Input material identity cannot be rechecked",
-                path=path,
+                path=display_path,
                 value=str(exc),
             ) from exc
         before_identity = _stat_identity(before)
@@ -258,7 +344,7 @@ def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
             raise _material_error(
                 "INPUT_MATERIAL_UNSAFE",
                 "Input material changed while it was being read",
-                path=path,
+                path=display_path,
                 value={"before": before_identity, "after": _stat_identity(after)},
             )
         return CapturedFile(
@@ -272,13 +358,42 @@ def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
         os.close(descriptor)
 
 
+def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
+    """Read one named final-component no-follow regular file exactly once."""
+
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise ValueError("limit must be a non-negative integer")
+    _require_read_capabilities(anchored=False, path=path)
+    return _read_regular_entry(
+        path,
+        parent_fd=None,
+        display_path=path,
+        limit=limit,
+    )
+
+
 def _local_file_path(locator: str) -> Path:
     parsed = urlsplit(locator)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise _material_error(
+            "INPUT_MATERIAL_UNSAFE",
+            "Local input material URI has an invalid authority",
+            value=locator,
+        ) from exc
+    local_authority = (
+        parsed.hostname in {None, "localhost"}
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+    )
     if (
         parsed.scheme.lower() != "file"
-        or parsed.netloc not in {"", "localhost"}
+        or not local_authority
         or parsed.query
         or parsed.fragment
+        or _MALFORMED_PERCENT_ESCAPE.search(parsed.path) is not None
     ):
         raise _material_error(
             "INPUT_MATERIAL_UNSAFE",
@@ -309,7 +424,7 @@ def _local_file_path(locator: str) -> Path:
     return path
 
 
-def _artifact_path(root: Path, relative: PurePosixPath) -> Path:
+def _artifact_parts(root: Path, relative: PurePosixPath) -> tuple[str, ...]:
     parts = relative.parts
     if (
         relative.is_absolute()
@@ -323,7 +438,108 @@ def _artifact_path(root: Path, relative: PurePosixPath) -> Path:
             "Proposal input material must be contained beneath inputs/",
             path=root / Path(*parts),
         )
-    return root / Path(*parts)
+    return parts
+
+
+def _open_anchored_directory(
+    name: str | Path,
+    *,
+    parent_fd: int | None,
+    display_path: Path,
+    observed: os.stat_result | None = None,
+) -> int:
+    try:
+        if parent_fd is None:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        else:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+    except OSError as exc:
+        raise _material_error(
+            "INPUT_MATERIAL_UNSAFE",
+            "Proposal artifact traversal encountered an unsafe directory",
+            path=display_path,
+            value=str(exc),
+        ) from exc
+    try:
+        anchored = os.fstat(descriptor)
+        if not stat.S_ISDIR(anchored.st_mode) or (
+            observed is not None
+            and (anchored.st_dev, anchored.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise _material_error(
+                "INPUT_MATERIAL_UNSAFE",
+                "Proposal artifact directory identity changed while opening",
+                path=display_path,
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _capture_proposal_artifact(
+    material: ProposalArtifactMaterial,
+    *,
+    proposal_root: Path,
+    limit: int,
+) -> CapturedFile:
+    parts = _artifact_parts(proposal_root, material.path)
+    _require_read_capabilities(anchored=True, path=proposal_root)
+    root_observed = _named_stat(
+        proposal_root,
+        parent_fd=None,
+        display_path=proposal_root,
+    )
+    if not stat.S_ISDIR(root_observed.st_mode):
+        raise _material_error(
+            "INPUT_MATERIAL_UNSAFE",
+            "Proposal root must be a real directory",
+            path=proposal_root,
+        )
+
+    anchors: list[int] = []
+    try:
+        anchors.append(
+            _open_anchored_directory(
+                proposal_root,
+                parent_fd=None,
+                display_path=proposal_root,
+                observed=root_observed,
+            )
+        )
+        display = proposal_root
+        for part in parts[:-1]:
+            display /= part
+            anchors.append(
+                _open_anchored_directory(
+                    part,
+                    parent_fd=anchors[-1],
+                    display_path=display,
+                )
+            )
+        return _read_regular_entry(
+            parts[-1],
+            parent_fd=anchors[-1],
+            display_path=display / parts[-1],
+            limit=limit,
+        )
+    finally:
+        for descriptor in reversed(anchors):
+            os.close(descriptor)
 
 
 def capture_material(
@@ -334,13 +550,18 @@ def capture_material(
 ) -> CapturedMaterial:
     """Bind one input descriptor to an exact, bounded file capture."""
 
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        raise ValueError("limit must be a non-negative integer")
     if isinstance(material, LocalFileMaterial):
         path = _local_file_path(material.locator)
         captured = read_regular_file(path, limit=limit)
         file_hash = None
     elif isinstance(material, ProposalArtifactMaterial):
-        path = _artifact_path(proposal_root, material.path)
-        captured = read_regular_file(path, limit=limit)
+        captured = _capture_proposal_artifact(
+            material,
+            proposal_root=proposal_root,
+            limit=limit,
+        )
         file_hash = captured.file_hash
     else:  # pragma: no cover - InputMaterial is a closed discriminated union
         raise TypeError("unsupported input material descriptor")

@@ -66,16 +66,16 @@ def test_empty_chunk_does_not_split_crlf_pair() -> None:
 
 
 @pytest.mark.parametrize(
-    "chunks",
+    ("chunks", "normalized"),
     [
-        [b"a", b"\xef\xbb\xbf", b"b"],
-        [b"\xef\xbb\xbf", b"\xef\xbb\xbf"],
+        ([b"a", b"\xef\xbb\xbf", b"b"], "a\ufeffb\n".encode()),
+        ([b"\xef\xbb\xbf", b"\xef\xbb\xbf"], "\ufeff\n".encode()),
     ],
 )
-def test_utf8_bom_is_allowed_only_once_at_the_start(chunks: list[bytes]) -> None:
-    with pytest.raises(MemError) as exc:
-        normalize_utf8(chunks, limit=1024)
-    assert _code(exc) == "INPUT_MATERIAL_INVALID"
+def test_only_one_leading_utf8_bom_is_removed(
+    chunks: list[bytes], normalized: bytes
+) -> None:
+    assert normalize_utf8(chunks, limit=1024) == normalized
 
 
 def test_raw_limit_stops_before_requesting_more_input() -> None:
@@ -178,6 +178,52 @@ def test_reader_opens_final_component_once_and_closes_descriptor(
     assert closed == opened
 
 
+def test_reader_rejects_non_regular_named_entry_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "input"
+    os.mkfifo(path)
+
+    def forbidden_open(*args: object, **kwargs: object) -> int:
+        raise AssertionError("non-regular named entry reached open")
+
+    monkeypatch.setattr(os, "open", forbidden_open)
+
+    with pytest.raises(MemError) as exc:
+        read_regular_file(path, limit=1024)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+
+
+def test_reader_rejects_regular_file_swap_between_metadata_and_open_and_closes_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "input.txt"
+    replacement = tmp_path / "replacement.txt"
+    path.write_bytes(b"trusted\n")
+    replacement.write_bytes(b"changed\n")
+    real_open = os.open
+    opened: list[int] = []
+
+    def swap_then_open(*args: object, **kwargs: object) -> int:
+        path.unlink()
+        replacement.rename(path)
+        descriptor = real_open(*args, **kwargs)  # type: ignore[arg-type]
+        opened.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(os, "open", swap_then_open)
+
+    with pytest.raises(MemError) as exc:
+        read_regular_file(path, limit=1024)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+    assert len(opened) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(opened[0])
+    assert closed.value.errno == errno.EBADF
+
+
 def test_reader_closes_descriptor_when_streaming_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -205,7 +251,9 @@ def test_reader_rejects_changed_identity_after_read(
     path = tmp_path / "input.txt"
     path.write_bytes(b"content\n")
     real_fstat = os.fstat
+    real_close = os.close
     calls = 0
+    closed: list[int] = []
 
     def changed_fstat(descriptor: int) -> os.stat_result:
         nonlocal calls
@@ -217,12 +265,18 @@ def test_reader_rejects_changed_identity_after_read(
         values[stat.ST_SIZE] += 1
         return os.stat_result(values)
 
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
     monkeypatch.setattr(os, "fstat", changed_fstat)
+    monkeypatch.setattr(os, "close", recording_close)
 
     with pytest.raises(MemError) as exc:
         read_regular_file(path, limit=1024)
 
     assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+    assert len(closed) == 1
 
 
 def test_reader_stops_growing_stream_at_limit(
@@ -257,6 +311,23 @@ def test_reader_rejects_platform_without_no_follow_support(
     path = tmp_path / "input.txt"
     path.write_text("safe", encoding="utf-8")
     monkeypatch.delattr(os, "O_NOFOLLOW")
+
+    with pytest.raises(MemError) as exc:
+        read_regular_file(path, limit=1024)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+
+
+def test_reader_rejects_platform_without_no_follow_metadata_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "input.txt"
+    path.write_text("safe", encoding="utf-8")
+    monkeypatch.setattr(
+        os,
+        "supports_follow_symlinks",
+        set(os.supports_follow_symlinks) - {os.stat},
+    )
 
     with pytest.raises(MemError) as exc:
         read_regular_file(path, limit=1024)
@@ -322,6 +393,144 @@ def test_capture_proposal_artifact_uses_contained_path_and_exact_file_hash(
     assert captured.file_hash == "sha256:" + hashlib.sha256(b"excerpt\r\n").hexdigest()
 
 
+def test_capture_proposal_artifact_rejects_symlinked_parent_and_closes_anchors(
+    tmp_path: Path,
+) -> None:
+    proposal = tmp_path / "proposal"
+    proposal.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "excerpt.txt").write_bytes(b"secret")
+    (proposal / "inputs").symlink_to(outside, target_is_directory=True)
+    material = ProposalArtifactMaterial(
+        material_id="excerpt",
+        kind="proposal_artifact",
+        path="inputs/excerpt.txt",
+        fidelity="selected_excerpt",
+    )
+    descriptors_before = len(os.listdir("/proc/self/fd"))
+
+    with pytest.raises(MemError) as exc:
+        capture_material(material, proposal_root=proposal)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+    assert len(os.listdir("/proc/self/fd")) == descriptors_before
+
+
+def test_capture_proposal_artifact_rejects_symlinked_proposal_root(
+    tmp_path: Path,
+) -> None:
+    real_proposal = tmp_path / "real"
+    (real_proposal / "inputs").mkdir(parents=True)
+    (real_proposal / "inputs" / "excerpt.txt").write_bytes(b"secret")
+    proposal_link = tmp_path / "proposal"
+    proposal_link.symlink_to(real_proposal, target_is_directory=True)
+    material = ProposalArtifactMaterial(
+        material_id="excerpt",
+        kind="proposal_artifact",
+        path="inputs/excerpt.txt",
+        fidelity="selected_excerpt",
+    )
+
+    with pytest.raises(MemError) as exc:
+        capture_material(material, proposal_root=proposal_link)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+
+
+def test_capture_proposal_artifact_rejects_root_swap_before_anchor_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proposal = tmp_path / "proposal"
+    (proposal / "inputs").mkdir(parents=True)
+    (proposal / "inputs" / "excerpt.txt").write_bytes(b"trusted")
+    attacker = tmp_path / "attacker"
+    (attacker / "inputs").mkdir(parents=True)
+    (attacker / "inputs" / "excerpt.txt").write_bytes(b"secret")
+    displaced = tmp_path / "displaced"
+    material = ProposalArtifactMaterial(
+        material_id="excerpt",
+        kind="proposal_artifact",
+        path="inputs/excerpt.txt",
+        fidelity="selected_excerpt",
+    )
+    real_open = os.open
+    swapped = False
+
+    def swap_then_open(*args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            proposal.rename(displaced)
+            attacker.rename(proposal)
+        return real_open(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", swap_then_open)
+    monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) | {os.open})
+    descriptors_before = len(os.listdir("/proc/self/fd"))
+
+    with pytest.raises(MemError) as exc:
+        capture_material(material, proposal_root=proposal)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+    assert len(os.listdir("/proc/self/fd")) == descriptors_before
+
+
+def test_capture_proposal_artifact_closes_all_descriptors_after_success(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "inputs" / "nested" / "excerpt.txt"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"excerpt\n")
+    material = ProposalArtifactMaterial(
+        material_id="excerpt",
+        kind="proposal_artifact",
+        path="inputs/nested/excerpt.txt",
+        fidelity="selected_excerpt",
+    )
+    descriptors_before = len(os.listdir("/proc/self/fd"))
+
+    captured = capture_material(material, proposal_root=tmp_path)
+
+    assert captured.normalized_bytes == b"excerpt\n"
+    assert len(os.listdir("/proc/self/fd")) == descriptors_before
+
+
+def test_capture_proposal_artifact_requires_anchored_directory_capabilities(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "inputs" / "excerpt.txt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"excerpt\n")
+    material = ProposalArtifactMaterial(
+        material_id="excerpt",
+        kind="proposal_artifact",
+        path="inputs/excerpt.txt",
+        fidelity="selected_excerpt",
+    )
+    monkeypatch.setattr(os, "supports_dir_fd", set(os.supports_dir_fd) - {os.open})
+
+    with pytest.raises(MemError) as exc:
+        capture_material(material, proposal_root=tmp_path)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+
+
+def test_capture_proposal_artifact_rejects_invalid_limit(tmp_path: Path) -> None:
+    artifact = tmp_path / "inputs" / "excerpt.txt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"excerpt\n")
+    material = ProposalArtifactMaterial(
+        material_id="excerpt",
+        kind="proposal_artifact",
+        path="inputs/excerpt.txt",
+        fidelity="selected_excerpt",
+    )
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        capture_material(material, proposal_root=tmp_path, limit=-1)
+
+
 def test_capture_proposal_artifact_cannot_escape_root_even_if_model_is_tampered(
     tmp_path: Path,
 ) -> None:
@@ -344,6 +553,57 @@ def test_capture_rejects_non_local_file_authority(tmp_path: Path) -> None:
         material_id="journal",
         kind="local_file",
         locator="file://remote.example/journal.md",
+        fidelity="full_source",
+    )
+
+    with pytest.raises(MemError) as exc:
+        capture_material(material, proposal_root=tmp_path)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+
+
+@pytest.mark.parametrize("suffix", ["bad%ZZ.txt", "bad%.txt", "bad%0.txt"])
+def test_capture_rejects_malformed_file_uri_percent_triplets(
+    tmp_path: Path, suffix: str
+) -> None:
+    path = tmp_path / suffix
+    path.write_bytes(b"must not be read")
+    material = LocalFileMaterial(
+        material_id="journal",
+        kind="local_file",
+        locator="file://" + path.as_posix(),
+        fidelity="full_source",
+    )
+
+    with pytest.raises(MemError) as exc:
+        capture_material(material, proposal_root=tmp_path)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+
+
+def test_capture_accepts_case_insensitive_localhost_authority(tmp_path: Path) -> None:
+    path = tmp_path / "journal.txt"
+    path.write_bytes(b"journal")
+    material = LocalFileMaterial(
+        material_id="journal",
+        kind="local_file",
+        locator="file://LOCALHOST" + path.as_posix(),
+        fidelity="full_source",
+    )
+
+    assert capture_material(material, proposal_root=tmp_path).normalized_bytes == b"journal\n"
+
+
+@pytest.mark.parametrize(
+    "authority", ["user@localhost", "localhost:80", "remote.example"]
+)
+def test_capture_rejects_credentials_ports_and_remote_file_authorities(
+    tmp_path: Path, authority: str
+) -> None:
+    material = LocalFileMaterial(
+        material_id="journal",
+        kind="local_file",
+        locator=f"file://{authority}/journal.txt",
         fidelity="full_source",
     )
 
