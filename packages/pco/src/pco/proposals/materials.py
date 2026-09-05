@@ -474,7 +474,15 @@ def _open_anchored_directory(
             value=str(exc),
         ) from exc
     try:
-        anchored = os.fstat(descriptor)
+        try:
+            anchored = os.fstat(descriptor)
+        except OSError as exc:
+            raise _material_error(
+                "INPUT_MATERIAL_UNSAFE",
+                "Proposal artifact directory identity cannot be inspected",
+                path=display_path,
+                value=str(exc),
+            ) from exc
         if not stat.S_ISDIR(anchored.st_mode) or (
             observed is not None
             and (anchored.st_dev, anchored.st_ino)

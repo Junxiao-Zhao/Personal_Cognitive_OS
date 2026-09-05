@@ -496,6 +496,41 @@ def test_capture_proposal_artifact_closes_all_descriptors_after_success(
     assert len(os.listdir("/proc/self/fd")) == descriptors_before
 
 
+def test_capture_maps_ancestor_fstat_failure_and_closes_all_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "inputs" / "excerpt.txt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"excerpt\n")
+    material = ProposalArtifactMaterial(
+        material_id="excerpt",
+        kind="proposal_artifact",
+        path="inputs/excerpt.txt",
+        fidelity="selected_excerpt",
+    )
+    real_fstat = os.fstat
+    calls = 0
+
+    def fail_ancestor_fstat(descriptor: int) -> os.stat_result:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError(errno.EIO, "injected directory fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(os, "fstat", fail_ancestor_fstat)
+    descriptors_before = len(os.listdir("/proc/self/fd"))
+
+    with pytest.raises(MemError) as exc:
+        capture_material(material, proposal_root=tmp_path)
+
+    assert _code(exc) == "INPUT_MATERIAL_UNSAFE"
+    assert exc.value.detail.path == str(tmp_path / "inputs")
+    assert "injected directory fstat failure" in exc.value.detail.value
+    assert isinstance(exc.value.__cause__, OSError)
+    assert len(os.listdir("/proc/self/fd")) == descriptors_before
+
+
 def test_capture_proposal_artifact_requires_anchored_directory_capabilities(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
