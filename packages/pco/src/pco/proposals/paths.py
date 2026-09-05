@@ -43,18 +43,20 @@ def active_proposals(
 
     root = _proposal_root(paths)
     try:
-        root_info = root.lstat()
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
     except OSError as exc:
-        _unsafe(root, "Unable to inspect the proposal root", exc)
-    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-        _unsafe(root, "Proposal root must be a real directory")
+        _unsafe(root, "Unable to open the proposal root safely", exc)
 
     found: list[Path] = []
     try:
-        with os.scandir(root) as entries:
+        root_info = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_info.st_mode):
+            _unsafe(root, "Proposal root must be a real directory")
+        with os.scandir(root_fd) as entries:
             for entry in entries:
-                if entry.name == ".committed":
-                    continue
                 entry_path = root / entry.name
                 try:
                     info = entry.stat(follow_symlinks=False)
@@ -65,6 +67,8 @@ def active_proposals(
                         entry_path,
                         "Active proposal entries must be real directories",
                     )
+                if entry.name == ".committed":
+                    continue
                 if _REVIEW_ID.fullmatch(entry.name) is None:
                     _unsafe(
                         entry_path,
@@ -75,6 +79,8 @@ def active_proposals(
         raise
     except OSError as exc:
         _unsafe(root, "Unable to enumerate the proposal root", exc)
+    finally:
+        os.close(root_fd)
 
     found.sort(key=lambda path: path.name.encode("utf-8"))
     if len(found) > 1:

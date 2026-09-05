@@ -5,18 +5,17 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version",
     "review_id",
     "base_commit",
     "workspace_version",
-    "profile_version",
-    "input_material",
-    "files"
+    "profile_version"
   ],
   "properties": {
     "schema_version": {
       "type": "string",
-      "pattern": "^0\\.5\\.(0|[1-9][0-9]*)$",
+      "default": "0.5.0",
+      "pattern": "^[vV]?(?:0+!)?0+\\.0*5(?:\\.0*[0-9]+)*(?:[-_.]?(?:[Pp][Oo][Ss][Tt]|[Rr][Ee][Vv]|[Rr])(?:[-_.]?0*[0-9]+)?|-0*[0-9]+)?(?:\\+[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*)?(?![\\s\\S])",
+      "$comment": "The pattern covers compatible final/post PEP 440 v0.5 spellings without surrounding whitespace; runtime consumers enforce the authoritative range extension with packaging.SpecifierSet.",
       "x-pco-supported-range": ">=0.5.0,<0.6.0"
     },
     "review_id": {
@@ -31,6 +30,10 @@
     "profile_version": {"type": "string", "minLength": 1},
     "input_material": {
       "type": "array",
+      "default": [],
+      "uniqueItems": true,
+      "$comment": "uniqueItems handles exact duplicates. x-pco-unique-by additionally requires unique material_id values and unique path values among proposal artifacts; generic JSON Schema validators do not enforce this extension.",
+      "x-pco-unique-by": ["material_id", "path"],
       "items": {
         "oneOf": [
           {"$ref": "#/$defs/local_file"},
@@ -40,6 +43,10 @@
     },
     "files": {
       "type": "array",
+      "default": [],
+      "uniqueItems": true,
+      "$comment": "uniqueItems handles exact duplicates. x-pco-unique-by additionally requires unique path values; generic JSON Schema validators do not enforce this extension.",
+      "x-pco-unique-by": ["path"],
       "items": {"$ref": "#/$defs/business_file"}
     }
   },

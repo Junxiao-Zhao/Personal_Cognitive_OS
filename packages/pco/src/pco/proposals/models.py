@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
+from mem_core.errors import MemError
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -102,17 +103,26 @@ class ProposalManifest(_StrictModel):
     input_material: list[InputMaterial] = Field(default_factory=list)
     files: list[BusinessFile] = Field(default_factory=list)
 
-    @field_validator("schema_version")
+    @field_validator("schema_version", mode="before")
     @classmethod
-    def require_supported_schema_version(cls, value: str) -> str:
+    def require_supported_schema_version(cls, value: Any) -> str:
         supported = CompatibilityContract.for_package().proposal_manifest
-        try:
-            compatible = Version(value) in supported
-        except InvalidVersion:
-            compatible = False
+        compatible = False
+        if isinstance(value, str) and value == value.strip():
+            try:
+                compatible = Version(value) in supported
+            except InvalidVersion:
+                pass
         if not compatible:
-            raise ValueError(
-                f"proposal manifest version {value!r} is outside the supported range {supported}"
+            raise MemError(
+                "WORKSPACE_FORMAT_MISMATCH",
+                "compatibility",
+                f"proposal manifest version {value!r} is outside the supported range {supported}",
+                path="proposal manifest",
+                value={"observed": value, "supported": str(supported)},
+                recovery=["Use a proposal manifest with a compatible v0.5 contract"],
+                canonical_changed=False,
+                retry_safe=False,
             )
         return value
 
