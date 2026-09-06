@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 import uuid
 
-from mem_core.errors import ensure
+from mem_core.errors import MemError, ensure
 
 from .models import ProposalManifest
 from .paths import ProposalPaths
+from .snapshot import capture_snapshot_from_root
+from .validation import validate_snapshot
 
 if TYPE_CHECKING:
     from ..workspace import Workspace
@@ -52,3 +54,29 @@ class ProposalService:
             profile_version=self.workspace.profile.version,
         )
         return {"ok": True, "manifest": manifest.model_dump(mode="json")}
+
+    def validate(self, review_id: str) -> dict[str, Any]:
+        """Read and validate one active proposal without mutating the workspace."""
+
+        try:
+            active = self.paths.active_proposals()
+            ensure(
+                len(active) == 1 and active[0].name == review_id,
+                "PROPOSAL_MANIFEST_MISMATCH",
+                "proposal_validation",
+                "The requested review is not the single active proposal",
+                path=str(self.paths.root / review_id),
+                canonical_changed=False,
+                retry_safe=False,
+            )
+            snapshot = capture_snapshot_from_root(active[0], include_local=True)
+            return validate_snapshot(
+                snapshot, self.workspace, require_hashes=False
+            ).as_dict()
+        except MemError as exc:
+            result = exc.as_dict()
+            diagnostic = result.get("diagnostic", {})
+            # Preserve the canonical diagnostic object while supporting the
+            # proposal command's directly actionable error payload.
+            result["error"].update(diagnostic)
+            return result
