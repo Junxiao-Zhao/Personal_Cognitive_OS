@@ -315,6 +315,10 @@ def validate_snapshot(
 ) -> ValidationResult:
     """Validate only snapshot bytes against the exact canonical base and Profile."""
 
+    # Imported lazily because transaction construction consumes ValidationResult;
+    # replay detection itself reads only the immutable snapshot and exact Git base.
+    from .operations import replay_warnings
+
     _validate_controls(snapshot, workspace)
     base_commit = snapshot.manifest.base_commit
     base_records = _load_base_records(workspace, base_commit)
@@ -358,7 +362,11 @@ def validate_snapshot(
             "Canonical HEAD changed during proposal validation",
             value={"expected": base_commit, "observed": final_head},
         )
-    return ValidationResult(parsed=parsed, revisions=revisions)
+    return ValidationResult(
+        parsed=parsed,
+        revisions=revisions,
+        warnings=replay_warnings(workspace, snapshot),
+    )
 
 
 def capture_and_validate_for_commit(

@@ -5,6 +5,7 @@ from .models import (
     InputMaterial,
     LocalFileMaterial,
     ProposalArtifactMaterial,
+    ProposalCommitReceipt,
     ProposalManifest,
 )
 from .paths import ProposalPaths, active_proposals
@@ -15,6 +16,7 @@ __all__ = [
     "InputMaterial",
     "LocalFileMaterial",
     "ProposalArtifactMaterial",
+    "ProposalCommitReceipt",
     "ProposalManifest",
     "ProposalPaths",
     "ProposalService",
