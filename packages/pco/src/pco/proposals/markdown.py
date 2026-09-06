@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping
 from functools import lru_cache
 import math
 from pathlib import PurePosixPath
@@ -11,11 +12,23 @@ from typing import Any, Literal, TypeAlias
 from mem_core.errors import MemError
 from mem_core.profile import Profile
 from mem_core.registry import default_registry
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 import yaml
 from yaml.constructor import ConstructorError
 from yaml.nodes import MappingNode
-from yaml.tokens import AliasToken, AnchorToken, DocumentEndToken, TagToken
+from yaml.tokens import (
+    AliasToken,
+    AnchorToken,
+    BlockEndToken,
+    BlockMappingStartToken,
+    BlockSequenceStartToken,
+    DocumentEndToken,
+    FlowMappingEndToken,
+    FlowMappingStartToken,
+    FlowSequenceEndToken,
+    FlowSequenceStartToken,
+    TagToken,
+)
 
 from ..paths import bundled_profile
 from .materials import MAX_INPUT_MATERIAL_BYTES, normalize_utf8
@@ -60,7 +73,65 @@ _GENERATED_PAYLOAD_FIELDS = {
     "snapshot_ref",
 }
 _CONTROLS = {"type", "id", "operation", "base_revision"}
-_REFERENCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_MATERIAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_MAX_SEMANTIC_DEPTH = 64
+_YAML_CONTAINER_START = (
+    BlockMappingStartToken,
+    BlockSequenceStartToken,
+    FlowMappingStartToken,
+    FlowSequenceStartToken,
+)
+_YAML_CONTAINER_END = (BlockEndToken, FlowMappingEndToken, FlowSequenceEndToken)
+
+
+class _FrozenMapping(Mapping[str, Any]):
+    """An immutable mapping backed only by an immutable tuple of pairs."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, values: dict[str, Any]) -> None:
+        object.__setattr__(self, "_items", tuple(values.items()))
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise TypeError("parsed proposal semantics are immutable")
+
+    def __getitem__(self, key: str) -> Any:
+        for candidate, value in self._items:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _value in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Mapping):
+            return False
+        return _deep_thaw(self) == _deep_thaw(other)
+
+    def __repr__(self) -> str:
+        return repr(dict(self.items()))
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _FrozenMapping(
+            {key: _deep_freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _deep_thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _deep_thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_thaw(item) for item in value]
+    return value
 
 
 def _schema_error(
@@ -85,26 +156,64 @@ def _schema_error(
     )
 
 
+def _ensure_bounded_depth(
+    value: Any, *, path: PurePosixPath | str
+) -> None:
+    stack: list[tuple[Any, int, frozenset[int]]] = [(value, 0, frozenset())]
+    while stack:
+        current, depth, ancestors = stack.pop()
+        if not isinstance(current, (dict, list)):
+            continue
+        if depth > _MAX_SEMANTIC_DEPTH:
+            raise _schema_error(
+                "Business semantics exceed the maximum nesting depth",
+                path=path,
+                value={"max_depth": _MAX_SEMANTIC_DEPTH},
+            )
+        identity = id(current)
+        if identity in ancestors:
+            raise _schema_error(
+                "Business semantics must not contain reference cycles", path=path
+            )
+        child_ancestors = ancestors | {identity}
+        children = current.values() if isinstance(current, dict) else current
+        stack.extend((child, depth + 1, child_ancestors) for child in children)
+
+
 class ParsedBusinessObject(BaseModel):
     """Proposal controls plus authorable, schema-checked business semantics."""
 
-    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True, extra="forbid", strict=True, frozen=True
+    )
 
     stream: BusinessStream
     operation: ReviewOperation
     record_id: str = Field(min_length=1)
     base_revision: int | None
-    structured: dict[str, Any]
+    structured: _FrozenMapping
     body_markdown: str
     relative_path: PurePosixPath
     material_id: str | None = None
+
+    @field_validator("structured", mode="before")
+    @classmethod
+    def _freeze_structured(cls, value: Any) -> _FrozenMapping:
+        if not isinstance(value, dict):
+            raise TypeError("structured proposal semantics must be a mapping")
+        _ensure_bounded_depth(value, path="<parsed>")
+        return _deep_freeze(value)
+
+    @field_serializer("structured")
+    def _serialize_structured(self, value: _FrozenMapping) -> dict[str, Any]:
+        return _deep_thaw(value)
 
     def to_record_preview(self) -> dict[str, Any]:
         """Return a generated-field preview accepted by the deterministic renderer."""
 
         profile = _profile()
         revision = 1 if self.operation == "create" else self.base_revision + 1  # type: ignore[operator]
-        payload = dict(self.structured)
+        payload = _deep_thaw(self.structured)
         payload["previous_revision"] = (
             None if self.operation == "create" else self.base_revision
         )
@@ -203,19 +312,35 @@ def _frontmatter_and_body(data: bytes, path: PurePosixPath) -> tuple[dict[str, A
     frontmatter_bytes = b"".join(lines[1:terminator])
     body_bytes = b"".join(lines[terminator + 1 :])
     try:
+        nesting_depth = 0
         for token in yaml.scan(frontmatter_bytes.decode("utf-8")):
             if isinstance(token, (AliasToken, AnchorToken, TagToken, DocumentEndToken)):
                 raise _schema_error(
                     "YAML aliases, anchors, tags, merge keys, and multiple documents are forbidden",
                     path=path,
                 )
+            if isinstance(token, _YAML_CONTAINER_START):
+                nesting_depth += 1
+                if nesting_depth > _MAX_SEMANTIC_DEPTH:
+                    raise _schema_error(
+                        "Business semantics exceed the maximum nesting depth",
+                        path=path,
+                        value={"max_depth": _MAX_SEMANTIC_DEPTH},
+                    )
+            elif isinstance(token, _YAML_CONTAINER_END):
+                nesting_depth -= 1
         loaded = yaml.load(frontmatter_bytes.decode("utf-8"), Loader=_StrictLoader)
     except MemError:
         raise
+    except RecursionError as exc:
+        raise _schema_error(
+            "Business Markdown nesting exceeds the parser limit", path=path
+        ) from exc
     except yaml.YAMLError as exc:
         raise _schema_error("Business Markdown frontmatter is invalid YAML", path=path) from exc
     if not isinstance(loaded, dict):
         raise _schema_error("Business Markdown frontmatter must be one mapping", path=path)
+    _ensure_bounded_depth(loaded, path=path)
     _require_json_values(loaded, path=path)
     body = body_bytes.decode("utf-8")
     if not body:
@@ -280,7 +405,7 @@ def _validate_controls(
         )
     if (
         not isinstance(record_id, str)
-        or not _REFERENCE_ID.fullmatch(record_id)
+        or not record_id
         or (expected_id is not None and record_id != expected_id)
     ):
         raise _schema_error("Frontmatter id does not match the business filename", path=path, value=record_id)
@@ -307,12 +432,12 @@ def _validate_reference_shapes(stream: BusinessStream, structured: dict[str, Any
         if not isinstance(refs, list):
             continue
         for reference in refs:
-            if not isinstance(reference, str) or not reference.startswith("evidence:") or not _REFERENCE_ID.fullmatch(reference[9:]):
+            if not isinstance(reference, str) or not reference.startswith("evidence:") or not reference[9:]:
                 raise _schema_error(f"{field} contains an invalid evidence reference", path=path, value=reference, stream=stream)
     refs = structured.get("promotion_refs", [])
     if isinstance(refs, list):
         for reference in refs:
-            if not isinstance(reference, str) or not reference.startswith("hypothesis:") or not _REFERENCE_ID.fullmatch(reference[11:]):
+            if not isinstance(reference, str) or not reference.startswith("hypothesis:") or not reference[11:]:
                 raise _schema_error("promotion_refs contains an invalid hypothesis reference", path=path, value=reference, stream=stream)
 
 
@@ -382,7 +507,7 @@ def parse_business_markdown(path: PurePosixPath, data: bytes) -> ParsedBusinessO
     }
     material_id = frontmatter.get("material_id") if stream == "sources" else None
     if material_id is not None:
-        if not isinstance(material_id, str) or not _REFERENCE_ID.fullmatch(material_id):
+        if not isinstance(material_id, str) or not _MATERIAL_ID.fullmatch(material_id):
             raise _schema_error("Source material_id must be a stable ASCII identifier", path=path, value=material_id)
     _validate_reference_shapes(stream, structured, path)
     _validate_schema(stream, operation, record_id, base_revision, structured, body, path)
@@ -419,6 +544,7 @@ def render_business_markdown(record: dict[str, Any]) -> bytes:
     payload = record.get("payload")
     if not isinstance(payload, dict):
         raise _schema_error("Business record payload must be a mapping", stream=stream)
+    _ensure_bounded_depth(record, path="<record>")
     _require_json_values(record, path=PurePosixPath("<record>"))
     try:
         _profile().validate_record_schema(stream, record)
@@ -426,6 +552,12 @@ def render_business_markdown(record: dict[str, Any]) -> bytes:
         raise _schema_error(
             "Business record does not satisfy the Profile schema",
             value=exc.as_dict()["error"],
+            stream=stream,
+            record_id=record.get("id"),
+        ) from exc
+    except RecursionError as exc:
+        raise _schema_error(
+            "Business record nesting exceeds the schema limit",
             stream=stream,
             record_id=record.get("id"),
         ) from exc
@@ -480,7 +612,15 @@ def render_business_markdown(record: dict[str, Any]) -> bytes:
         )
         rendered = header + body
         return normalize_utf8([rendered], limit=MAX_INPUT_MATERIAL_BYTES)
-    except (KeyError, AttributeError, UnicodeError, MemError, TypeError, ValueError) as exc:
+    except (
+        KeyError,
+        AttributeError,
+        UnicodeError,
+        MemError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ) as exc:
         if isinstance(exc, MemError) and exc.detail.code == "PROPOSAL_SCHEMA_INVALID":
             raise
         raise _schema_error("Business record cannot be rendered safely", stream=stream, record_id=record.get("id")) from exc

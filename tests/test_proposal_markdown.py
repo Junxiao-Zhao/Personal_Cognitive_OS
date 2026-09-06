@@ -73,6 +73,47 @@ def test_parser_returns_closed_typed_business_object() -> None:
     )
 
 
+def test_parsed_semantics_are_deeply_immutable(
+    minimal_records: dict[str, dict]
+) -> None:
+    hypothesis = parse_business_markdown(
+        PurePosixPath("hypotheses/hyp_eval.md"), HYPOTHESIS_MD
+    )
+    event = parse_business_markdown(
+        PurePosixPath("events/evt_1.md"),
+        render_business_markdown(minimal_records["events"]),
+    )
+
+    with pytest.raises(TypeError):
+        hypothesis.structured["confidence"] = 0.9
+    with pytest.raises((AttributeError, TypeError)):
+        hypothesis.structured["evidence_refs"].append("evidence:evil")
+    with pytest.raises(TypeError):
+        event.structured["occurred_at"]["precision"] = "unknown"
+    with pytest.raises(TypeError):
+        dict.__setitem__(hypothesis.structured, "confidence", 0.9)
+    assert hypothesis.structured == {
+        "change_summary": "Narrow the claim",
+        "confidence": 0.45,
+        "evidence_refs": ["evidence:ev_1"],
+        "counter_evidence_refs": [],
+        "status": "hypothesis",
+    }
+
+
+def test_preview_is_deeply_detached_from_parsed_semantics() -> None:
+    parsed = parse_business_markdown(
+        PurePosixPath("hypotheses/hyp_eval.md"), HYPOTHESIS_MD
+    )
+    preview = parsed.to_record_preview()
+
+    preview["payload"]["confidence"] = 0.9
+    preview["payload"]["evidence_refs"].append("evidence:evil")
+
+    assert parsed.structured["confidence"] == 0.45
+    assert parsed.structured["evidence_refs"] == ("evidence:ev_1",)
+
+
 @pytest.mark.parametrize(
     "document",
     [
@@ -128,6 +169,67 @@ def test_every_business_path_maps_to_exact_type_and_stream(
 
 
 @pytest.mark.parametrize(
+    ("stream", "directory"),
+    [
+        ("evidence", "evidence"),
+        ("sources", "sources"),
+        ("events", "events"),
+        ("psychologies", "psychologies"),
+        ("philosophies", "philosophies"),
+        ("archetypes", "archetypes"),
+        ("hypotheses", "hypotheses"),
+    ],
+)
+def test_profile_valid_unicode_and_colon_ids_round_trip_through_matching_paths(
+    minimal_records: dict[str, dict], stream: str, directory: str
+) -> None:
+    record = deepcopy(minimal_records[stream])
+    record["id"] = "对象:一"
+
+    rendered = render_business_markdown(record)
+    parsed = parse_business_markdown(
+        PurePosixPath(f"{directory}/对象:一.md"), rendered
+    )
+
+    assert parsed.record_id == "对象:一"
+    assert parsed.to_record_preview()["id"] == "对象:一"
+
+
+@pytest.mark.parametrize(
+    ("stream", "path", "field", "references"),
+    [
+        (
+            "hypotheses",
+            "hypotheses/hyp_1.md",
+            "evidence_refs",
+            ["evidence:证据", "evidence:ev:one"],
+        ),
+        (
+            "meta_revisions",
+            "META_MEMORY.md",
+            "promotion_refs",
+            ["hypothesis:假设", "hypothesis:hyp:one"],
+        ),
+    ],
+)
+def test_typed_references_preserve_unicode_and_colons_in_target_ids(
+    minimal_records: dict[str, dict],
+    stream: str,
+    path: str,
+    field: str,
+    references: list[str],
+) -> None:
+    record = deepcopy(minimal_records[stream])
+    record["payload"][field] = references
+
+    parsed = parse_business_markdown(
+        PurePosixPath(path), render_business_markdown(record)
+    )
+
+    assert parsed.to_record_preview()["payload"][field] == references
+
+
+@pytest.mark.parametrize(
     ("path", "replacement"),
     [
         ("events/evt_wrong.md", None),
@@ -175,6 +277,18 @@ def test_body_uses_strict_material_normalization() -> None:
         "hypotheses/hyp_eval.md",
         HYPOTHESIS_MD.replace(b"A claim", b"A\xff claim"),
     )
+
+
+def test_deeply_nested_flow_yaml_returns_stable_schema_error() -> None:
+    nested = b"[" * 1_200 + b"value" + b"]" * 1_200
+    document = HYPOTHESIS_MD.replace(
+        b"counter_evidence_refs: []",
+        b"counter_evidence_refs: " + nested,
+    )
+
+    error = _assert_invalid("hypotheses/hyp_eval.md", document)
+
+    assert error.detail.canonical_changed is False
 
 
 @pytest.mark.parametrize(
@@ -300,6 +414,18 @@ def test_render_rejects_unknown_or_unsafe_record_shapes(minimal_records: dict[st
     unsafe = deepcopy(minimal_records["hypotheses"])
     unsafe["payload"]["confidence"] = object()
     _assert_render_invalid(unsafe)
+
+
+def test_render_rejects_deeply_nested_record_with_stable_schema_error(
+    minimal_records: dict[str, dict]
+) -> None:
+    record = deepcopy(minimal_records["sources"])
+    nested: object = "value"
+    for _ in range(1_200):
+        nested = {"level": nested}
+    record["payload"]["query_context"] = nested
+
+    _assert_render_invalid(record)
 
 
 @pytest.mark.parametrize(
