@@ -4,6 +4,7 @@ from copy import deepcopy
 from pathlib import PurePosixPath
 
 import pytest
+from pydantic import ValidationError
 
 from mem_core.errors import MemError
 from pco.proposals.markdown import (
@@ -27,6 +28,11 @@ status: hypothesis
 ---
 
 A claim with **reviewable** detail.\r\n"""
+
+
+class _MutableValue:
+    def __init__(self) -> None:
+        self.value = "original"
 
 
 def _assert_invalid(path: str, document: bytes) -> MemError:
@@ -112,6 +118,68 @@ def test_preview_is_deeply_detached_from_parsed_semantics() -> None:
 
     assert parsed.structured["confidence"] == 0.45
     assert parsed.structured["evidence_refs"] == ("evidence:ev_1",)
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        {"unsafe": bytearray(b"a")},
+        {"unsafe": {"mutable"}},
+        {"unsafe": _MutableValue()},
+        {"unsafe": float("nan")},
+        {1: "non-string key"},
+        {"unsafe": ("tuple",)},
+    ],
+    ids=["bytearray", "set", "custom-object", "nonfinite", "key", "tuple"],
+)
+def test_direct_construction_rejects_non_json_structured_values(
+    structured: dict,
+) -> None:
+    with pytest.raises(ValidationError) as exc:
+        ParsedBusinessObject(
+            stream="sources",
+            operation="create",
+            record_id="src_direct",
+            base_revision=None,
+            structured=structured,
+            body_markdown="body\n",
+            relative_path=PurePosixPath("sources/src_direct.md"),
+        )
+
+    assert exc.value.errors()[0]["loc"] == ("structured",)
+
+
+def test_direct_construction_detaches_valid_nested_json_values() -> None:
+    structured = {
+        "change_summary": "Create event",
+        "occurred_at": {"precision": "day", "start": "2026-08-30"},
+        "evidence_refs": ["evidence:ev_1"],
+        "status": "active",
+    }
+    parsed = ParsedBusinessObject(
+        stream="events",
+        operation="create",
+        record_id="evt_direct",
+        base_revision=None,
+        structured=structured,
+        body_markdown="body\n",
+        relative_path=PurePosixPath("events/evt_direct.md"),
+    )
+
+    structured["occurred_at"]["precision"] = "unknown"
+    structured["evidence_refs"].append("evidence:evil")
+
+    expected = {
+        "change_summary": "Create event",
+        "occurred_at": {"precision": "day", "start": "2026-08-30"},
+        "evidence_refs": ["evidence:ev_1"],
+        "status": "active",
+    }
+    assert parsed.structured == expected
+    assert parsed.model_dump(mode="json")["structured"] == expected
+    preview = parsed.to_record_preview()
+    assert preview["payload"]["occurred_at"] == expected["occurred_at"]
+    assert preview["payload"]["evidence_refs"] == expected["evidence_refs"]
 
 
 @pytest.mark.parametrize(

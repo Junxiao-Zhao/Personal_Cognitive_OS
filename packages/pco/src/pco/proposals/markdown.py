@@ -200,8 +200,14 @@ class ParsedBusinessObject(BaseModel):
     @classmethod
     def _freeze_structured(cls, value: Any) -> _FrozenMapping:
         if not isinstance(value, dict):
-            raise TypeError("structured proposal semantics must be a mapping")
+            raise ValueError("structured proposal semantics must be a mapping")
         _ensure_bounded_depth(value, path="<parsed>")
+        try:
+            _require_json_values(value, path=PurePosixPath("<parsed>"))
+        except MemError as exc:
+            raise ValueError(
+                "structured proposal semantics must contain only finite JSON values"
+            ) from exc
         return _deep_freeze(value)
 
     @field_serializer("structured")
