@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import subprocess
 from typing import Any, TYPE_CHECKING
 
 from mem_core.delta import validate_structured_delta
 from mem_core.errors import MemError
+from mem_core.models import latest_by_id
 
 from ..config import WORKSPACE_FORMAT_VERSION
 from .markdown import ParsedBusinessObject, parse_business_markdown
@@ -46,11 +48,40 @@ class RevisionPreview:
         return json.loads(self._record_json)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ValidationResult:
     parsed: tuple[ParsedBusinessObject, ...]
     revisions: tuple[RevisionPreview, ...]
-    warnings: tuple[dict[str, Any], ...] = ()
+    _warnings_json: tuple[bytes, ...]
+
+    def __init__(
+        self,
+        parsed: tuple[ParsedBusinessObject, ...],
+        revisions: tuple[RevisionPreview, ...],
+        warnings: tuple[dict[str, Any], ...] = (),
+    ) -> None:
+        object.__setattr__(self, "parsed", tuple(parsed))
+        object.__setattr__(self, "revisions", tuple(revisions))
+        object.__setattr__(
+            self,
+            "_warnings_json",
+            tuple(
+                json.dumps(
+                    warning,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                for warning in warnings
+            ),
+        )
+
+    @property
+    def warnings(self) -> tuple[dict[str, Any], ...]:
+        """Return detached warnings so result state cannot be mutated."""
+
+        return tuple(json.loads(item) for item in self._warnings_json)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -90,19 +121,91 @@ def _error(
 def _validate_controls(snapshot: ProposalSnapshot, workspace: "Workspace") -> None:
     manifest = snapshot.manifest
     identity = workspace.identity() if callable(workspace.identity) else workspace.identity
-    if manifest.base_commit != workspace.repository.head():
-        raise _error("PROPOSAL_STALE", "Proposal base commit is not current", value={"expected": workspace.repository.head(), "observed": manifest.base_commit})
+    current_head = workspace.repository.head()
+    if manifest.base_commit != current_head:
+        raise _error("PROPOSAL_STALE", "Proposal base commit is not current", value={"expected": current_head, "observed": manifest.base_commit})
     if manifest.workspace_version != identity.get("workspace_format_version") or manifest.workspace_version != WORKSPACE_FORMAT_VERSION:
         raise _error("WORKSPACE_FORMAT_MISMATCH", "Proposal workspace version does not match the opened workspace", value={"proposal": manifest.workspace_version, "workspace": identity.get("workspace_format_version")})
     if manifest.profile_version != workspace.profile.version or manifest.profile_version != identity.get("profile_version"):
         raise _error("WORKSPACE_FORMAT_MISMATCH", "Proposal Profile version does not match the opened workspace", value={"proposal": manifest.profile_version, "profile": workspace.profile.version})
 
 
-def _preview(parsed: tuple[ParsedBusinessObject, ...], workspace: "Workspace") -> tuple[RevisionPreview, ...]:
-    current_by_stream = {
-        stream: workspace.repository.current_records(stream)
-        for stream in workspace.profile.config.streams
-    }
+def _load_base_records(
+    workspace: "Workspace", base_commit: str
+) -> dict[str, list[dict[str, Any]]]:
+    """Load every Profile stream once from one immutable Git tree."""
+
+    records: dict[str, list[dict[str, Any]]] = {}
+    for stream, stream_config in workspace.profile.config.streams.items():
+        relative = Path(stream_config.path).as_posix()
+        try:
+            result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(workspace.repository.root),
+                    "show",
+                    f"{base_commit}:{relative}",
+                ],
+                capture_output=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise _error(
+                "WORKSPACE_INTEGRITY_ERROR",
+                "Canonical base records cannot be read",
+                path=relative,
+                stream=stream,
+                value=str(exc),
+            ) from exc
+        if result.returncode:
+            raise _error(
+                "WORKSPACE_INTEGRITY_ERROR",
+                "Canonical base stream is missing from the proposal base commit",
+                path=relative,
+                stream=stream,
+                value=result.stderr.decode("utf-8", errors="replace").strip(),
+            )
+        try:
+            text = result.stdout.decode("utf-8", errors="strict")
+            stream_records = [
+                json.loads(line) for line in text.splitlines() if line.strip()
+            ]
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _error(
+                "WORKSPACE_INTEGRITY_ERROR",
+                "Canonical base stream is not valid UTF-8 JSONL",
+                path=relative,
+                stream=stream,
+                value=str(exc),
+            ) from exc
+        if not all(isinstance(record, dict) for record in stream_records):
+            raise _error(
+                "WORKSPACE_INTEGRITY_ERROR",
+                "Canonical base stream contains a non-object record",
+                path=relative,
+                stream=stream,
+            )
+        records[stream] = stream_records
+    return records
+
+
+def _preview(
+    parsed: tuple[ParsedBusinessObject, ...],
+    workspace: "Workspace",
+    base_records: dict[str, list[dict[str, Any]]],
+) -> tuple[RevisionPreview, ...]:
+    try:
+        current_by_stream = {
+            stream: latest_by_id(base_records.get(stream, ()))
+            for stream in workspace.profile.config.streams
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _error(
+            "WORKSPACE_INTEGRITY_ERROR",
+            "Canonical base records cannot be indexed by revision",
+            value=str(exc),
+        ) from exc
     seen: set[tuple[str, str]] = set()
     previews: list[RevisionPreview] = []
     for item in parsed:
@@ -213,6 +316,8 @@ def validate_snapshot(
     """Validate only snapshot bytes against the exact canonical base and Profile."""
 
     _validate_controls(snapshot, workspace)
+    base_commit = snapshot.manifest.base_commit
+    base_records = _load_base_records(workspace, base_commit)
     manifest_operations = {item.path: item.operation for item in snapshot.manifest.files}
     parsed = tuple(
         parse_business_markdown(item.path, item.data) for item in snapshot.business_files
@@ -234,7 +339,7 @@ def validate_snapshot(
         tuple(snapshot.manifest.input_material),
         require_hashes=require_hashes,
     )
-    revisions = _preview(parsed, workspace)
+    revisions = _preview(parsed, workspace, base_records)
     delta: dict[str, list[dict[str, Any]]] = {
         stream: [] for stream in workspace.profile.config.streams
     }
@@ -242,10 +347,17 @@ def validate_snapshot(
         delta[preview.stream].append(preview.record)
     validate_structured_delta(
         profile=workspace.profile,
-        base_records=workspace.repository.records_by_stream(),
+        base_records=base_records,
         delta=delta,
         root=workspace.repository.root,
     )
+    final_head = workspace.repository.head()
+    if final_head != base_commit:
+        raise _error(
+            "PROPOSAL_STALE",
+            "Canonical HEAD changed during proposal validation",
+            value={"expected": base_commit, "observed": final_head},
+        )
     return ValidationResult(parsed=parsed, revisions=revisions)
 
 

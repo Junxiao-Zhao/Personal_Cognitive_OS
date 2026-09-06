@@ -11,6 +11,7 @@ from typing import Iterator
 from mem_core.errors import MemError
 import pytest
 
+from pco.proposals import materials as materials_module
 from pco.proposals.materials import (
     MAX_INPUT_MATERIAL_BYTES,
     CapturedMaterial,
@@ -104,6 +105,36 @@ def test_limit_accepts_exact_raw_and_normalized_size() -> None:
 
 def test_default_material_limit_is_exactly_sixteen_mib() -> None:
     assert MAX_INPUT_MATERIAL_BYTES == 16_777_216
+
+
+def test_public_stream_normalizer_checks_incremental_budget_before_next_chunk() -> None:
+    consumed: list[int] = []
+    guarded: list[tuple[int, int]] = []
+
+    def chunks() -> Iterator[bytes]:
+        for index, chunk in enumerate((b"aaaa", b"b", b"must-not-be-read")):
+            consumed.append(index)
+            yield chunk
+
+    def guard(current: int, addition: int) -> None:
+        guarded.append((current, addition))
+        if current + addition > 4:
+            raise MemError(
+                "PROPOSAL_SNAPSHOT_TOO_LARGE",
+                "test",
+                "incremental budget exceeded",
+                canonical_changed=False,
+                retry_safe=False,
+            )
+
+    with pytest.raises(MemError) as exc:
+        materials_module.normalize_utf8_stream(
+            chunks(), limit=1024, capture_raw=True, normalized_byte_guard=guard
+        )
+
+    assert _code(exc) == "PROPOSAL_SNAPSHOT_TOO_LARGE"
+    assert consumed == [0, 1]
+    assert guarded[-1] == (4, 1)
 
 
 def _make_entry(path: Path, kind: str) -> socket.socket | None:

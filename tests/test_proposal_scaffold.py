@@ -408,6 +408,26 @@ def test_manifest_models_are_strict_and_preserve_the_two_material_shapes() -> No
 
     with pytest.raises(ValidationError):
         ProposalManifest.model_validate(_manifest_data(unexpected=True))
+
+
+def test_local_file_capture_scope_is_full_source_in_runtime_and_schema() -> None:
+    selected = {
+        "material_id": "journal",
+        "kind": "local_file",
+        "locator": "file:///journal.md",
+        "fidelity": "selected_excerpt",
+    }
+    full = {**selected, "fidelity": "full_source"}
+
+    with pytest.raises(ValidationError):
+        ProposalManifest.model_validate(_manifest_data(input_material=[selected]))
+    assert ProposalManifest.model_validate(
+        _manifest_data(input_material=[full])
+    ).input_material[0].fidelity == "full_source"
+
+    validator = Draft202012Validator(_manifest_schema())
+    assert not validator.is_valid(_manifest_data(input_material=[selected]))
+    assert validator.is_valid(_manifest_data(input_material=[full]))
     with pytest.raises(ValidationError):
         BusinessFile.model_validate(
             {"path": "hypotheses/hyp_1.md", "operation": "create", "extra": 1}

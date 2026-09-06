@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import PurePosixPath
+from types import SimpleNamespace
 
 from mem_core.errors import MemError
 import pytest
@@ -14,12 +15,18 @@ from pco.proposals.models import (
     ProposalArtifactMaterial,
     ProposalManifest,
 )
+from pco.proposals.materials import CapturedMaterial
 from pco.proposals.markdown import ParsedBusinessObject
 from pco.proposals.service import ProposalService
+from pco.proposals import materials as materials_module
 from pco.proposals import snapshot as snapshot_module
+from pco.proposals import validation as validation_module
 from pco.proposals.snapshot import capture_snapshot
 from pco.proposals.validation import (
     _preview,
+    _load_base_records,
+    _validate_materials,
+    ValidationResult,
     capture_and_validate_for_commit,
     validate_snapshot,
 )
@@ -39,7 +46,7 @@ def _make_source_proposal(
     local,
     *,
     expected=None,
-    material_fidelity="selected_excerpt",
+    material_fidelity="full_source",
     source_fidelity="registered_source_excerpt",
     user_authored=None,
 ):
@@ -181,17 +188,46 @@ def test_validation_requires_source_material_binding_and_descriptor_match(
     local = tmp_path / "journal.md"
     local.write_text("entry\n", encoding="utf-8")
     expected = "sha256:" + hashlib.sha256(b"entry\n").hexdigest()
-    root, manifest = _make_source_proposal(
-        workspace,
-        proposal_factory,
-        business_markdown_factory,
-        local,
-        expected=expected,
-        source_fidelity="full_user_provided_transcript",
-        user_authored=True,
+    root = proposal_factory("review_excerpt_overclaim")
+    (root / "sources").mkdir()
+    (root / "inputs").mkdir()
+    (root / "inputs/excerpt.txt").write_text("entry\n", encoding="utf-8")
+    (root / "sources/src_excerpt.md").write_bytes(
+        business_markdown_factory(
+            object_type="source",
+            record_id="src_excerpt",
+            fields={
+                "change_summary": "create",
+                "material_id": "excerpt",
+                "locator": "https://example.invalid/transcript",
+                "title": "Transcript excerpt",
+                "retrieved_at": "2026-08-30T10:00:00+00:00",
+                "provider_label": "browser",
+                "fidelity": "full_user_provided_transcript",
+                "user_authored": True,
+                "used_excerpts": ["entry"],
+                "status": "active",
+            },
+        )
     )
-    # The source says selected material fidelity only through its proposal descriptor.
-    # Its business fidelity must agree with that descriptor.
+    manifest = ProposalManifest(
+        review_id=root.name,
+        base_commit=workspace.repository.head(),
+        workspace_version=workspace.identity["workspace_format_version"],
+        profile_version=workspace.profile.version,
+        files=[BusinessFile(path="sources/src_excerpt.md", operation="create")],
+        input_material=[
+            ProposalArtifactMaterial(
+                material_id="excerpt",
+                kind="proposal_artifact",
+                path="inputs/excerpt.txt",
+                expected_content_hash=expected,
+                fidelity="selected_excerpt",
+            )
+        ],
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest.model_dump(mode="json")) + "\n")
+
     with pytest.raises(MemError) as exc:
         validate_snapshot(
             capture_snapshot(root, manifest, include_local=True),
@@ -199,6 +235,58 @@ def test_validation_requires_source_material_binding_and_descriptor_match(
             require_hashes=False,
         )
     assert exc.value.detail.code == "PROPOSAL_MATERIAL_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("capture_fidelity", "source_fidelity", "allowed"),
+    [
+        ("selected_excerpt", "selected_excerpt", True),
+        ("selected_excerpt", "registered_source_excerpt", True),
+        ("selected_excerpt", "full_user_provided_transcript", False),
+        ("full_source", "selected_excerpt", True),
+        ("full_source", "registered_source_excerpt", True),
+        ("full_source", "full_user_provided_transcript", True),
+    ],
+)
+def test_capture_scope_to_source_evidence_fidelity_matrix_is_non_overclaiming(
+    capture_fidelity, source_fidelity, allowed
+) -> None:
+    descriptor = ProposalArtifactMaterial(
+        material_id="material",
+        kind="proposal_artifact",
+        path="inputs/material.txt",
+        expected_content_hash="sha256:" + hashlib.sha256(b"material\n").hexdigest(),
+        fidelity=capture_fidelity,
+    )
+    captured = CapturedMaterial(
+        material=descriptor,
+        raw_bytes=b"material\n",
+        normalized_bytes=b"material\n",
+        content_hash=descriptor.expected_content_hash,
+        file_hash="sha256:" + hashlib.sha256(b"material\n").hexdigest(),
+        identity=(1, 2, 9, 3),
+    )
+    parsed = ParsedBusinessObject(
+        stream="sources",
+        operation="create",
+        record_id="src_material",
+        base_revision=None,
+        structured={"fidelity": source_fidelity},
+        body_markdown="source\n",
+        relative_path=PurePosixPath("sources/src_material.md"),
+        material_id="material",
+    )
+
+    if allowed:
+        _validate_materials(
+            (parsed,), (captured,), (descriptor,), require_hashes=False
+        )
+    else:
+        with pytest.raises(MemError) as exc:
+            _validate_materials(
+                (parsed,), (captured,), (descriptor,), require_hashes=False
+            )
+        assert exc.value.detail.code == "PROPOSAL_MATERIAL_MISMATCH"
 
 
 def test_manifest_operation_must_match_markdown(
@@ -319,7 +407,7 @@ def test_snapshot_local_capture_uses_task2_capability_contract(
         )
 
     monkeypatch.setattr(
-        snapshot_module, "_require_read_capabilities", reject_unsafe_platform
+        materials_module, "_require_read_capabilities", reject_unsafe_platform
     )
 
     with pytest.raises(MemError) as exc:
@@ -364,6 +452,39 @@ def test_snapshot_opens_external_local_material_once_and_closes_it(
 
     assert len(local_descriptors) == 1
     assert local_descriptors[0] in closed
+
+
+def test_snapshot_local_capture_calls_public_task2_reader(
+    workspace, proposal_factory, business_markdown_factory, tmp_path, monkeypatch
+) -> None:
+    local = tmp_path / "journal.md"
+    local.write_text("entry\n", encoding="utf-8")
+    expected = "sha256:" + hashlib.sha256(b"entry\n").hexdigest()
+    root, manifest = _make_source_proposal(
+        workspace, proposal_factory, business_markdown_factory, local, expected=expected
+    )
+    original = __import__(
+        "pco.proposals.materials", fromlist=["read_regular_file"]
+    ).read_regular_file
+    calls: list[tuple[object, object]] = []
+
+    def recording_reader(path, *, limit, normalized_byte_guard=None):
+        calls.append((path, normalized_byte_guard))
+        return original(
+            path,
+            limit=limit,
+            normalized_byte_guard=normalized_byte_guard,
+        )
+
+    monkeypatch.setattr(
+        "pco.proposals.materials.read_regular_file", recording_reader
+    )
+
+    capture_snapshot(root, manifest, include_local=True)
+
+    assert len(calls) == 1
+    assert calls[0][0] == local
+    assert callable(calls[0][1])
 
 
 def test_local_material_snapshot_budget_counts_normalized_bytes_exactly(
@@ -644,19 +765,17 @@ def test_revision_preview_covers_create_revise_retire_conflicts(
             "status": "active",
         },
     }
-    def current_records(stream):
-        if stream == "evidence" and has_current:
-            return {"ev_existing": current}
-        return {}
-
     def records_by_stream():
         records = {stream: [] for stream in workspace.profile.config.streams}
         if has_current:
             records["evidence"] = [current]
         return records
 
-    monkeypatch.setattr(workspace.repository, "current_records", current_records)
-    monkeypatch.setattr(workspace.repository, "records_by_stream", records_by_stream)
+    monkeypatch.setattr(
+        validation_module,
+        "_load_base_records",
+        lambda _workspace, _base_commit: records_by_stream(),
+    )
     snapshot = capture_snapshot(root, manifest, include_local=True)
 
     if not expected_ok:
@@ -691,6 +810,166 @@ def test_revision_preview_rejects_two_targets_for_one_stream_record(workspace) -
     )
 
     with pytest.raises(MemError) as exc:
-        _preview(parsed, workspace)
+        _preview(
+            parsed,
+            workspace,
+            {stream: [] for stream in workspace.profile.config.streams},
+        )
 
     assert exc.value.detail.code == "PROPOSAL_REVISION_CONFLICT"
+
+
+def test_validation_reads_one_exact_commit_not_live_stream_apis(
+    workspace, proposal_factory, business_markdown_factory, monkeypatch
+) -> None:
+    root = proposal_factory("review_exact_base")
+    (root / "evidence").mkdir()
+    (root / "evidence/ev_exact.md").write_bytes(
+        business_markdown_factory(
+            object_type="evidence",
+            record_id="ev_exact",
+            fields={
+                "change_summary": "create",
+                "speaker": "user",
+                "source_kind": "conversation",
+                "user_authored": True,
+                "fidelity": "selected_excerpt",
+                "status": "active",
+            },
+        )
+    )
+    manifest = ProposalManifest(
+        review_id=root.name,
+        base_commit=workspace.repository.head(),
+        workspace_version=workspace.identity["workspace_format_version"],
+        profile_version=workspace.profile.version,
+        files=[BusinessFile(path="evidence/ev_exact.md", operation="create")],
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest.model_dump(mode="json")) + "\n")
+    monkeypatch.setattr(
+        workspace.repository,
+        "current_records",
+        lambda *_args, **_kwargs: pytest.fail("read live current records"),
+    )
+    monkeypatch.setattr(
+        workspace.repository,
+        "records_by_stream",
+        lambda *_args, **_kwargs: pytest.fail("reread live stream records"),
+    )
+
+    result = validate_snapshot(
+        capture_snapshot(root, manifest, include_local=True),
+        workspace,
+        require_hashes=False,
+    )
+
+    assert result.as_dict()["ok"] is True
+
+
+def test_validation_ignores_uncommitted_live_stream_bytes_and_uses_base_tree(
+    workspace, proposal_factory
+) -> None:
+    root = proposal_factory("review_ignore_live_stream")
+    manifest = ProposalManifest(
+        review_id=root.name,
+        base_commit=workspace.repository.head(),
+        workspace_version=workspace.identity["workspace_format_version"],
+        profile_version=workspace.profile.version,
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest.model_dump(mode="json")) + "\n")
+    live_evidence = workspace.profile.stream_path(
+        workspace.repository.root, "evidence"
+    )
+    live_evidence.write_bytes(b"not valid live JSONL\n")
+
+    result = validate_snapshot(
+        capture_snapshot(root, manifest, include_local=True),
+        workspace,
+        require_hashes=False,
+    )
+
+    assert result.as_dict()["ok"] is True
+
+
+@pytest.mark.parametrize(
+    ("stdout", "stderr", "returncode"),
+    [
+        (b"", b"missing stream", 1),
+        (b"\xff\n", b"", 0),
+        (b"not-json\n", b"", 0),
+        (b"[]\n", b"", 0),
+    ],
+)
+def test_exact_base_loader_normalizes_git_and_jsonl_failures(
+    workspace, monkeypatch, stdout, stderr, returncode
+) -> None:
+    base = workspace.repository.head()
+    monkeypatch.setattr(
+        validation_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            stdout=stdout, stderr=stderr, returncode=returncode
+        ),
+    )
+
+    with pytest.raises(MemError) as exc:
+        _load_base_records(workspace, base)
+
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+
+
+def test_exact_base_loader_normalizes_process_start_failure(
+    workspace, monkeypatch
+) -> None:
+    base = workspace.repository.head()
+
+    def fail_run(*_args, **_kwargs):
+        raise OSError("injected git start failure")
+
+    monkeypatch.setattr(validation_module.subprocess, "run", fail_run)
+
+    with pytest.raises(MemError) as exc:
+        _load_base_records(workspace, base)
+
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+    assert "injected git start failure" in exc.value.detail.value
+
+
+def test_validation_final_head_check_rejects_concurrent_canonical_movement(
+    workspace, proposal_factory, monkeypatch
+) -> None:
+    root = proposal_factory("review_head_moved")
+    base = workspace.repository.head()
+    manifest = ProposalManifest(
+        review_id=root.name,
+        base_commit=base,
+        workspace_version=workspace.identity["workspace_format_version"],
+        profile_version=workspace.profile.version,
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest.model_dump(mode="json")) + "\n")
+    heads = iter((base, "f" * 40))
+    monkeypatch.setattr(workspace.repository, "head", lambda: next(heads))
+
+    with pytest.raises(MemError) as exc:
+        validate_snapshot(
+            capture_snapshot(root, manifest, include_local=True),
+            workspace,
+            require_hashes=False,
+        )
+
+    assert exc.value.detail.code == "PROPOSAL_STALE"
+
+
+def test_validation_result_warnings_detach_input_and_output_aliases() -> None:
+    warning = {"code": "REPLAY", "detail": {"items": ["original"]}}
+    result = ValidationResult(parsed=(), revisions=(), warnings=(warning,))
+    warning["detail"]["items"].append("input mutation")
+
+    first = result.warnings
+    first[0]["detail"]["items"].append("property mutation")
+    rendered = result.as_dict()
+    rendered["warnings"][0]["detail"]["items"].append("output mutation")
+
+    assert result.warnings == (
+        {"code": "REPLAY", "detail": {"items": ["original"]}},
+    )

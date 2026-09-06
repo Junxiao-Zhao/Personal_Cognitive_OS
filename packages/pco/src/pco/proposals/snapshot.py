@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import codecs
 from dataclasses import dataclass
 import json
 import os
@@ -13,13 +12,8 @@ from typing import Any
 from mem_core.errors import MemError
 from pydantic import TypeAdapter, ValidationError
 
-from .materials import (
-    MAX_INPUT_MATERIAL_BYTES,
-    CapturedMaterial,
-    _local_file_path,
-    _require_read_capabilities,
-    digest,
-)
+from . import materials as material_reader
+from .materials import MAX_INPUT_MATERIAL_BYTES, CapturedMaterial, digest
 from .models import InputMaterial, LocalFileMaterial, ProposalArtifactMaterial, ProposalManifest
 
 
@@ -134,6 +128,7 @@ def _open_root(root: Path) -> tuple[int, tuple[int, int, int, int, int, int]]:
         and os.open in getattr(os, "supports_dir_fd", set())
         and os.stat in getattr(os, "supports_dir_fd", set())
         and os.stat in getattr(os, "supports_follow_symlinks", set())
+        and os.scandir in getattr(os, "supports_fd", set())
     )
     if not required:
         raise _error("PROPOSAL_PATH_UNSAFE", "Safe proposal traversal is unavailable", path=root)
@@ -278,6 +273,13 @@ def _enumerate_tree(root_fd: int, root: Path) -> tuple[TreeEntry, ...]:
                 observed = sorted(
                     children, key=lambda item: item.name.encode("utf-8")
                 )
+        except TypeError as exc:
+            raise _error(
+                "PROPOSAL_PATH_UNSAFE",
+                "Proposal directory cannot be enumerated through its descriptor",
+                path=root / Path(*prefix.parts),
+                value=str(exc),
+            ) from exc
         except UnicodeError as exc:
             raise _error(
                 "PROPOSAL_PATH_UNSAFE",
@@ -376,157 +378,19 @@ def _budget(total: int, addition: int) -> int:
     return total + addition
 
 
-def _normalize_snapshot_chunks(
-    chunks: Any,
-    *,
-    aggregate_remaining: int,
-    path: Path,
-) -> tuple[bytes, bytes]:
-    """Normalize while bounding raw, normalized, and aggregate retained bytes."""
-
-    decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
-    raw = bytearray()
-    normalized = bytearray()
-    prefix = bytearray()
-    started = False
-    pending_cr = False
-    unsupported = (b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00", b"\xfe\xff", b"\xff\xfe")
-
-    def too_large(form: str) -> None:
-        raise _error(
-            "INPUT_MATERIAL_TOO_LARGE",
-            f"Input material {form} bytes exceed the individual limit",
-            path=path,
-            value={"form": form, "limit": MAX_INPUT_MATERIAL_BYTES},
-        )
-
-    def extend(text: str) -> None:
-        nonlocal pending_cr
-        if "\x00" in text:
-            raise _error("INPUT_MATERIAL_INVALID", "Input material contains a NUL code point", path=path)
-        if pending_cr:
-            if text.startswith("\n"):
-                text = text[1:]
-            text = "\n" + text
-            pending_cr = False
-        if text.endswith("\r"):
-            text = text[:-1]
-            pending_cr = True
-        encoded = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
-        new_size = len(normalized) + len(encoded)
-        if new_size > MAX_INPUT_MATERIAL_BYTES:
-            too_large("normalized")
-        if new_size > aggregate_remaining:
+def _aggregate_guard(remaining: int, *, value: Any) -> material_reader.NormalizedByteGuard:
+    def guard(current: int, addition: int) -> None:
+        if addition < 0 or current > remaining - addition:
             raise _error(
                 "PROPOSAL_SNAPSHOT_TOO_LARGE",
                 "Immutable proposal snapshot exceeds the aggregate byte limit while normalizing material",
-                path=path,
-                value={"limit": MAX_IMMUTABLE_SNAPSHOT_BYTES},
+                value={
+                    "limit": MAX_IMMUTABLE_SNAPSHOT_BYTES,
+                    "material": value,
+                },
             )
-        normalized.extend(encoded)
 
-    def reject_bom(data: bytes) -> None:
-        if any(data.startswith(mark) for mark in unsupported):
-            raise _error("INPUT_MATERIAL_INVALID", "Input material begins with a UTF-16 or UTF-32 byte-order mark", path=path)
-
-    def decode(data: bytes) -> None:
-        text = decoder.decode(data, final=False)
-        if text:
-            extend(text)
-
-    try:
-        for chunk in chunks:
-            if len(raw) + len(chunk) > MAX_INPUT_MATERIAL_BYTES:
-                too_large("raw")
-            raw.extend(chunk)
-            if not started:
-                prefix_size = min(4 - len(prefix), len(chunk))
-                prefix.extend(chunk[:prefix_size])
-                if len(prefix) < 4:
-                    continue
-                reject_bom(bytes(prefix))
-                started = True
-                decode(bytes(prefix))
-                prefix.clear()
-                decode(chunk[prefix_size:])
-            else:
-                decode(chunk)
-        if not started:
-            reject_bom(bytes(prefix))
-            decode(bytes(prefix))
-        final = decoder.decode(b"", final=True)
-        if final:
-            extend(final)
-    except UnicodeDecodeError as exc:
-        raise _error("INPUT_MATERIAL_INVALID", "Input material is not strict UTF-8 text", path=path, value=str(exc)) from exc
-    if pending_cr:
-        pending_cr = False
-        if len(normalized) + 1 > MAX_INPUT_MATERIAL_BYTES:
-            too_large("normalized")
-        if len(normalized) + 1 > aggregate_remaining:
-            raise _error(
-                "PROPOSAL_SNAPSHOT_TOO_LARGE",
-                "Immutable proposal snapshot exceeds the aggregate byte limit while normalizing material",
-                path=path,
-                value={"limit": MAX_IMMUTABLE_SNAPSHOT_BYTES},
-            )
-        normalized.extend(b"\n")
-    if normalized and not normalized.endswith(b"\n"):
-        extend("\n")
-    return bytes(raw), bytes(normalized)
-
-
-def _capture_local_material(
-    material: LocalFileMaterial, *, aggregate_remaining: int
-) -> CapturedMaterial:
-    path = _local_file_path(material.locator)
-    _require_read_capabilities(anchored=False, path=path)
-    try:
-        observed = os.stat(path, follow_symlinks=False)
-    except OSError as exc:
-        raise _error("INPUT_MATERIAL_UNSAFE", "Local material cannot be inspected safely", path=path, value=str(exc)) from exc
-    if not stat.S_ISREG(observed.st_mode):
-        raise _error("INPUT_MATERIAL_UNSAFE", "Local material must be a no-follow regular file", path=path)
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
-    except OSError as exc:
-        raise _error("INPUT_MATERIAL_UNSAFE", "Local material cannot be opened safely", path=path, value=str(exc)) from exc
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or _identity(observed)[:3] != _identity(before)[:3]:
-            raise _error("INPUT_MATERIAL_UNSAFE", "Local material changed while opening", path=path)
-        if before.st_size < 0:
-            raise _error("INPUT_MATERIAL_UNSAFE", "Local material reported an invalid file size", path=path)
-        if before.st_size > MAX_INPUT_MATERIAL_BYTES:
-            raise _error("INPUT_MATERIAL_TOO_LARGE", "Local material exceeds the individual raw limit", path=path)
-
-        def chunks():
-            consumed = 0
-            while True:
-                chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, max(1, MAX_INPUT_MATERIAL_BYTES - consumed + 1)))
-                if not chunk:
-                    return
-                consumed += len(chunk)
-                yield chunk
-
-        raw, normalized = _normalize_snapshot_chunks(
-            chunks(), aggregate_remaining=aggregate_remaining, path=path
-        )
-        after = os.fstat(descriptor)
-        if _identity(after) != _identity(before):
-            raise _error("INPUT_MATERIAL_UNSAFE", "Local material changed while being read", path=path)
-        return CapturedMaterial(
-            material=material.model_copy(deep=True),
-            raw_bytes=raw,
-            normalized_bytes=normalized,
-            content_hash=digest(normalized),
-            file_hash=None,
-            identity=(before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns),
-        )
-    except OSError as exc:
-        raise _error("INPUT_MATERIAL_UNSAFE", "Local material could not be read safely", path=path, value=str(exc)) from exc
-    finally:
-        os.close(descriptor)
+    return guard
 
 
 def _capture(
@@ -598,23 +462,32 @@ def _capture(
             if isinstance(descriptor, LocalFileMaterial):
                 if not include_local:
                     continue
-                captured = _capture_local_material(
+                captured = material_reader.capture_material(
                     descriptor,
-                    aggregate_remaining=MAX_IMMUTABLE_SNAPSHOT_BYTES - total,
+                    proposal_root=root,
+                    limit=MAX_INPUT_MATERIAL_BYTES,
+                    normalized_byte_guard=_aggregate_guard(
+                        MAX_IMMUTABLE_SNAPSHOT_BYTES - total,
+                        value=descriptor.material_id,
+                    ),
                 )
             else:
                 raw, identity6 = _read_exact(root_fd, root, descriptor.path, limit=MAX_INPUT_MATERIAL_BYTES)
-                raw_copy, normalized = _normalize_snapshot_chunks(
+                _ignored_raw, normalized = material_reader.normalize_utf8_stream(
                     (raw[index : index + _READ_CHUNK_BYTES] for index in range(0, len(raw), _READ_CHUNK_BYTES)),
-                    aggregate_remaining=MAX_IMMUTABLE_SNAPSHOT_BYTES - total,
-                    path=root / Path(*descriptor.path.parts),
+                    limit=MAX_INPUT_MATERIAL_BYTES,
+                    capture_raw=False,
+                    normalized_byte_guard=_aggregate_guard(
+                        MAX_IMMUTABLE_SNAPSHOT_BYTES - total,
+                        value=descriptor.path.as_posix(),
+                    ),
                 )
                 captured = CapturedMaterial(
                     material=descriptor.model_copy(deep=True),
-                    raw_bytes=raw_copy,
+                    raw_bytes=raw,
                     normalized_bytes=normalized,
                     content_hash=digest(normalized),
-                    file_hash=digest(raw_copy),
+                    file_hash=digest(raw),
                     identity=(identity6[1], identity6[2], identity6[3], identity6[4]),
                 )
             total = _budget(total, len(captured.normalized_bytes))

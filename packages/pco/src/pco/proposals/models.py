@@ -55,7 +55,7 @@ class LocalFileMaterial(_StrictModel):
     kind: Literal["local_file"]
     locator: str = Field(min_length=1)
     expected_content_hash: HashValue | None = None
-    fidelity: MaterialFidelity
+    fidelity: Literal["full_source"]
 
     @field_validator("locator")
     @classmethod

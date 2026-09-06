@@ -91,7 +91,7 @@
         "kind": {"const": "local_file"},
         "locator": {"type": "string", "pattern": "^[Ff][Ii][Ll][Ee]:"},
         "expected_content_hash": {"$ref": "#/$defs/hash"},
-        "fidelity": {"$ref": "#/$defs/fidelity"}
+        "fidelity": {"const": "full_source"}
       }
     },
     "proposal_artifact": {

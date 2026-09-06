@@ -390,6 +390,11 @@ def test_snapshot_maps_scandir_failure_and_closes_the_root_descriptor(
     monkeypatch.setattr(snapshot_module.os, "scandir", fail_scandir)
     monkeypatch.setattr(
         snapshot_module.os,
+        "supports_fd",
+        set(os.supports_fd) | {fail_scandir},
+    )
+    monkeypatch.setattr(
+        snapshot_module.os,
         "supports_dir_fd",
         set(os.supports_dir_fd) | {recording_open},
     )
@@ -399,6 +404,67 @@ def test_snapshot_maps_scandir_failure_and_closes_the_root_descriptor(
 
     assert exc.value.detail.code == "PROPOSAL_PATH_UNSAFE"
     assert "injected scandir failure" in exc.value.detail.value
+    assert closed == list(reversed(opened))
+
+
+def test_snapshot_requires_fd_scandir_capability(
+    workspace, proposal_factory, monkeypatch
+) -> None:
+    root = proposal_factory("review_scandir_capability")
+    manifest = _manifest(root, workspace)
+    monkeypatch.setattr(
+        snapshot_module.os,
+        "supports_fd",
+        set(os.supports_fd) - {os.scandir},
+    )
+
+    with pytest.raises(MemError) as exc:
+        capture_snapshot(root, manifest, include_local=False)
+
+    assert exc.value.detail.code == "PROPOSAL_PATH_UNSAFE"
+
+
+def test_snapshot_maps_fd_scandir_typeerror_and_closes_all_descriptors(
+    workspace, proposal_factory, monkeypatch
+) -> None:
+    root = proposal_factory("review_scandir_typeerror")
+    manifest = _manifest(root, workspace)
+    real_open = os.open
+    real_close = os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def recording_open(*args, **kwargs):
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    def reject_fd_scandir(_descriptor: int):
+        raise TypeError("fd scandir unavailable")
+
+    monkeypatch.setattr(snapshot_module.os, "open", recording_open)
+    monkeypatch.setattr(snapshot_module.os, "close", recording_close)
+    monkeypatch.setattr(snapshot_module.os, "scandir", reject_fd_scandir)
+    monkeypatch.setattr(
+        snapshot_module.os,
+        "supports_dir_fd",
+        set(os.supports_dir_fd) | {recording_open},
+    )
+    monkeypatch.setattr(
+        snapshot_module.os,
+        "supports_fd",
+        set(os.supports_fd) | {reject_fd_scandir},
+    )
+
+    with pytest.raises(MemError) as exc:
+        capture_snapshot(root, manifest, include_local=False)
+
+    assert exc.value.detail.code == "PROPOSAL_PATH_UNSAFE"
+    assert "fd scandir unavailable" in exc.value.detail.value
     assert closed == list(reversed(opened))
 
 

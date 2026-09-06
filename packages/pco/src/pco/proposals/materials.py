@@ -9,7 +9,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
-from typing import Iterable
+from typing import Callable, Iterable
 from urllib.parse import unquote, urlsplit
 
 from mem_core.errors import MemError
@@ -26,6 +26,7 @@ _UNSUPPORTED_LEADING_BOMS = (
     b"\xff\xfe",  # UTF-16 little endian
 )
 _MALFORMED_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+NormalizedByteGuard = Callable[[int, int], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,9 +98,20 @@ def _raise_too_large(limit: int, *, form: str) -> None:
     )
 
 
-def _normalize_utf8(
-    chunks: Iterable[bytes], *, limit: int, capture_raw: bool
+def normalize_utf8_stream(
+    chunks: Iterable[bytes],
+    *,
+    limit: int,
+    capture_raw: bool,
+    normalized_byte_guard: NormalizedByteGuard | None = None,
 ) -> tuple[bytes | None, bytes]:
+    """Capture and normalize a byte stream with incremental budget hooks.
+
+    ``normalized_byte_guard`` is called with the retained normalized size and
+    proposed addition before every normalized buffer extension. Callers may
+    raise their own structured aggregate-limit error from the guard.
+    """
+
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
         raise ValueError("limit must be a non-negative integer")
 
@@ -131,6 +143,8 @@ def _normalize_utf8(
         encoded = text.encode("utf-8")
         if len(normalized) + len(encoded) > limit:
             _raise_too_large(limit, form="normalized")
+        if normalized_byte_guard is not None:
+            normalized_byte_guard(len(normalized), len(encoded))
         normalized.extend(encoded)
 
     def reject_unsupported_bom(data: bytes) -> None:
@@ -182,10 +196,14 @@ def _normalize_utf8(
     if pending_cr:
         if len(normalized) + 1 > limit:
             _raise_too_large(limit, form="normalized")
+        if normalized_byte_guard is not None:
+            normalized_byte_guard(len(normalized), 1)
         normalized.extend(b"\n")
     if normalized and not normalized.endswith(b"\n"):
         if len(normalized) + 1 > limit:
             _raise_too_large(limit, form="normalized")
+        if normalized_byte_guard is not None:
+            normalized_byte_guard(len(normalized), 1)
         normalized.extend(b"\n")
     return (None if raw is None else bytes(raw)), bytes(normalized)
 
@@ -193,7 +211,9 @@ def _normalize_utf8(
 def normalize_utf8(chunks: Iterable[bytes], *, limit: int) -> bytes:
     """Normalize bounded byte chunks under the v0.5 material contract."""
 
-    _, normalized = _normalize_utf8(chunks, limit=limit, capture_raw=False)
+    _, normalized = normalize_utf8_stream(
+        chunks, limit=limit, capture_raw=False
+    )
     return normalized
 
 
@@ -252,6 +272,7 @@ def _read_regular_entry(
     parent_fd: int | None,
     display_path: Path,
     limit: int,
+    normalized_byte_guard: NormalizedByteGuard | None = None,
 ) -> CapturedFile:
     observed = _named_stat(name, parent_fd=parent_fd, display_path=display_path)
     if not stat.S_ISREG(observed.st_mode):
@@ -326,8 +347,11 @@ def _read_regular_entry(
                 consumed += len(chunk)
                 yield chunk
 
-        raw_bytes, normalized_bytes = _normalize_utf8(
-            chunks(), limit=limit, capture_raw=True
+        raw_bytes, normalized_bytes = normalize_utf8_stream(
+            chunks(),
+            limit=limit,
+            capture_raw=True,
+            normalized_byte_guard=normalized_byte_guard,
         )
         assert raw_bytes is not None
         try:
@@ -358,7 +382,12 @@ def _read_regular_entry(
         os.close(descriptor)
 
 
-def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
+def read_regular_file(
+    path: Path,
+    *,
+    limit: int,
+    normalized_byte_guard: NormalizedByteGuard | None = None,
+) -> CapturedFile:
     """Read one named final-component no-follow regular file exactly once."""
 
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
@@ -369,6 +398,7 @@ def read_regular_file(path: Path, *, limit: int) -> CapturedFile:
         parent_fd=None,
         display_path=path,
         limit=limit,
+        normalized_byte_guard=normalized_byte_guard,
     )
 
 
@@ -504,6 +534,7 @@ def _capture_proposal_artifact(
     *,
     proposal_root: Path,
     limit: int,
+    normalized_byte_guard: NormalizedByteGuard | None = None,
 ) -> CapturedFile:
     parts = _artifact_parts(proposal_root, material.path)
     _require_read_capabilities(anchored=True, path=proposal_root)
@@ -544,6 +575,7 @@ def _capture_proposal_artifact(
             parent_fd=anchors[-1],
             display_path=display / parts[-1],
             limit=limit,
+            normalized_byte_guard=normalized_byte_guard,
         )
     finally:
         for descriptor in reversed(anchors):
@@ -555,6 +587,7 @@ def capture_material(
     *,
     proposal_root: Path,
     limit: int = MAX_INPUT_MATERIAL_BYTES,
+    normalized_byte_guard: NormalizedByteGuard | None = None,
 ) -> CapturedMaterial:
     """Bind one input descriptor to an exact, bounded file capture."""
 
@@ -562,13 +595,18 @@ def capture_material(
         raise ValueError("limit must be a non-negative integer")
     if isinstance(material, LocalFileMaterial):
         path = _local_file_path(material.locator)
-        captured = read_regular_file(path, limit=limit)
+        captured = read_regular_file(
+            path,
+            limit=limit,
+            normalized_byte_guard=normalized_byte_guard,
+        )
         file_hash = None
     elif isinstance(material, ProposalArtifactMaterial):
         captured = _capture_proposal_artifact(
             material,
             proposal_root=proposal_root,
             limit=limit,
+            normalized_byte_guard=normalized_byte_guard,
         )
         file_hash = captured.file_hash
     else:  # pragma: no cover - InputMaterial is a closed discriminated union
