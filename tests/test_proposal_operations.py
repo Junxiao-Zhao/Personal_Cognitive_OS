@@ -11,7 +11,9 @@ from mem_core.models import ApplicationCommitRequest
 from mem_core.transaction import TransactionManager
 import pytest
 from pydantic import ValidationError
+import yaml
 
+from pco.proposals.digests import transaction_digest
 from pco.proposals.models import (
     BusinessFile,
     ProposalArtifactMaterial,
@@ -25,6 +27,7 @@ from pco.proposals.operations import (
 )
 from pco.proposals.snapshot import capture_snapshot_from_root
 from pco.proposals.validation import validate_snapshot
+from pco.workspace import Workspace
 
 
 def _source_proposal(
@@ -36,6 +39,7 @@ def _source_proposal(
     content=b"captured excerpt\n",
     title="Reviewed source",
     record_id="src_build",
+    manifest_schema_version="0.5.0",
 ):
     root = proposal_factory(review_id)
     (root / "inputs").mkdir()
@@ -62,6 +66,7 @@ def _source_proposal(
         )
     )
     manifest = ProposalManifest(
+        schema_version=manifest_schema_version,
         review_id=review_id,
         base_commit=workspace.repository.head(),
         workspace_version=workspace.identity["workspace_format_version"],
@@ -119,6 +124,62 @@ def _commit_corrupt_ledger(workspace, raw: str) -> None:
     workspace.repository._git(
         "commit", "--no-verify", "-m", "inject malformed proposal ledger"
     )
+
+
+def _migrate_profile_version(workspace, version: str, *, source_schema: str) -> Workspace:
+    profile_path = workspace.repository.root / "profiles/pco/profile.yaml"
+    profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    profile["version"] = version
+    profile["streams"]["sources"]["schema_version"] = source_schema
+    profile_path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+    schema_path = workspace.repository.root / "profiles/pco/schemas/source.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema["properties"]["schema_version"]["const"] = source_schema
+    schema_path.write_text(
+        json.dumps(schema, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    identity_path = workspace.repository.root / "workspace.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity["profile_version"] = version
+    identity_path.write_text(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    workspace.repository._git(
+        "add",
+        "profiles/pco/profile.yaml",
+        "profiles/pco/schemas/source.schema.json",
+        "workspace.json",
+    )
+    workspace.repository._git(
+        "commit", "--no-verify", "-m", "migrate exact canonical Profile controls"
+    )
+    return Workspace.open(workspace.root)
+
+
+def _rebind_transaction_to_controls(line: dict, controls: dict) -> dict:
+    receipt = {**line["receipt"], "digest_controls": controls}
+    fingerprint = transaction_digest(
+        workspace_id=receipt["workspace_id"],
+        base_commit=line["base_commit"],
+        input_digest_value=receipt["input_digest"],
+        proposal_digest_value=receipt["proposal_digest"],
+        manifest_hash=receipt["manifest_hash"],
+        receipt_id_value=receipt["receipt_id"],
+        profile_version=controls["profile_version"],
+        manifest_schema_version=controls["manifest_schema_version"],
+        stream_schema_versions=controls["stream_schema_versions"],
+        operations=line["operations"],
+    )
+    receipt["transaction_digest"] = fingerprint
+    return {
+        **line,
+        "id": application_transaction_id(fingerprint),
+        "transaction_fingerprint": fingerprint,
+        "receipt": receipt,
+    }
 
 
 def _unicode_evidence_proposal(
@@ -286,6 +347,11 @@ def test_local_file_receipt_has_no_proposal_file_hash() -> None:
                 "input_digest": "sha256:" + "e" * 64,
                 "proposal_digest": "sha256:" + "f" * 64,
                 "transaction_digest": "sha256:" + "1" * 64,
+                "digest_controls": {
+                    "profile_version": "0.5.0",
+                    "manifest_schema_version": "0.5.0",
+                    "stream_schema_versions": {"sources": "pco/source/v1"},
+                },
                 "committed_at": "2026-09-01T00:00:00+00:00",
             }
         )
@@ -318,6 +384,100 @@ def test_semantic_noop_requires_both_prior_digests_and_current_record_equivalenc
     assert isinstance(result, SemanticNoOp)
     assert result.equivalent_records[0]["id"] == "src_build"
     assert result.warnings[0]["code"] == "INPUT_REPLAY"
+
+
+def test_compatible_manifest_digest_controls_support_real_later_noop(
+    workspace, proposal_factory, business_markdown_factory
+) -> None:
+    prior_root, prior_snapshot, prior_validated = _source_proposal(
+        workspace,
+        proposal_factory,
+        business_markdown_factory,
+        review_id="review_manifest_051_prior",
+        manifest_schema_version="0.5.1",
+    )
+    prior_request = build_commit_request(workspace, prior_snapshot, prior_validated)
+    assert isinstance(prior_request, ApplicationCommitRequest)
+    assert prior_request.receipt["digest_controls"] == {
+        "profile_version": workspace.profile.version,
+        "manifest_schema_version": "0.5.1",
+        "stream_schema_versions": {
+            name: stream.schema_version
+            for name, stream in workspace.profile.config.streams.items()
+        },
+    }
+    TransactionManager(workspace.repository, workspace.paths.tmp).commit_application(
+        prior_request
+    )
+    shutil.rmtree(prior_root)
+
+    _root, snapshot, validated = _source_proposal(
+        workspace,
+        proposal_factory,
+        business_markdown_factory,
+        review_id="review_manifest_051_again",
+        manifest_schema_version="0.5.1",
+    )
+
+    assert isinstance(
+        build_commit_request(workspace, snapshot, validated), SemanticNoOp
+    )
+
+
+def test_historical_receipt_uses_profile_controls_from_its_exact_base(
+    workspace, proposal_factory, business_markdown_factory
+) -> None:
+    prior_root, _request = _committed_source_request(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    migrated = _migrate_profile_version(
+        workspace, "0.5.1", source_schema="pco/source/v2"
+    )
+    snapshot = _snapshot_at_current_head(migrated, prior_root)
+
+    warnings = replay_warnings(migrated, snapshot)
+
+    assert warnings[0]["code"] == "INPUT_REPLAY"
+
+
+@pytest.mark.parametrize(
+    "mutate_controls",
+    [
+        pytest.param(
+            lambda controls: controls.update(profile_version="0.5.1"),
+            id="profile-version",
+        ),
+        pytest.param(
+            lambda controls: controls["stream_schema_versions"].update(
+                sources="pco/source/v999"
+            ),
+            id="stream-schema-version",
+        ),
+        pytest.param(
+            lambda controls: controls.update(manifest_schema_version="0.6.0"),
+            id="incompatible-manifest-schema-version",
+        ),
+    ],
+)
+def test_replay_rejects_digest_controls_forged_against_exact_base_profile(
+    workspace, proposal_factory, business_markdown_factory, mutate_controls
+) -> None:
+    root, _request = _committed_source_request(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    ledger = workspace.repository.root / "transactions/transactions.jsonl"
+    line = json.loads(ledger.read_text(encoding="utf-8"))
+    controls = deepcopy(line["receipt"]["digest_controls"])
+    mutate_controls(controls)
+    forged = _rebind_transaction_to_controls(line, controls)
+    _commit_corrupt_ledger(
+        workspace, json.dumps(forged, ensure_ascii=False, sort_keys=True) + "\n"
+    )
+    snapshot = _snapshot_at_current_head(workspace, root)
+
+    with pytest.raises(MemError) as exc:
+        replay_warnings(workspace, snapshot)
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
 
 
 def test_same_input_and_prior_receipt_with_changed_proposal_is_not_noop(

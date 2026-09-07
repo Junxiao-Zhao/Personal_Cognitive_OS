@@ -19,6 +19,29 @@ from ..versioning import CompatibilityContract
 ReviewOperation = Literal["create", "revise", "retire"]
 MaterialFidelity = Literal["full_source", "selected_excerpt"]
 HashValue = Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
+NonEmptyString = Annotated[str, Field(min_length=1)]
+
+
+def _compatible_manifest_version(value: Any) -> str:
+    supported = CompatibilityContract.for_package().proposal_manifest
+    compatible = False
+    if isinstance(value, str) and value == value.strip():
+        try:
+            compatible = Version(value) in supported
+        except InvalidVersion:
+            pass
+    if not compatible:
+        raise MemError(
+            "WORKSPACE_FORMAT_MISMATCH",
+            "compatibility",
+            f"proposal manifest version {value!r} is outside the supported range {supported}",
+            path="proposal manifest",
+            value={"observed": value, "supported": str(supported)},
+            recovery=["Use a proposal manifest with a compatible v0.5 contract"],
+            canonical_changed=False,
+            retry_safe=False,
+        )
+    return value
 
 
 def _normalized_relative_path(value: Any) -> PurePosixPath:
@@ -108,25 +131,7 @@ class ProposalManifest(_StrictModel):
     @field_validator("schema_version", mode="before")
     @classmethod
     def require_supported_schema_version(cls, value: Any) -> str:
-        supported = CompatibilityContract.for_package().proposal_manifest
-        compatible = False
-        if isinstance(value, str) and value == value.strip():
-            try:
-                compatible = Version(value) in supported
-            except InvalidVersion:
-                pass
-        if not compatible:
-            raise MemError(
-                "WORKSPACE_FORMAT_MISMATCH",
-                "compatibility",
-                f"proposal manifest version {value!r} is outside the supported range {supported}",
-                path="proposal manifest",
-                value={"observed": value, "supported": str(supported)},
-                recovery=["Use a proposal manifest with a compatible v0.5 contract"],
-                canonical_changed=False,
-                retry_safe=False,
-            )
-        return value
+        return _compatible_manifest_version(value)
 
     @model_validator(mode="after")
     def require_unique_manifest_entries(self) -> "ProposalManifest":
@@ -200,6 +205,19 @@ ReceiptInputMaterial = Annotated[
 ]
 
 
+class ProposalDigestControls(_StrictModel):
+    """Exact pre-digest controls persisted for historical recomputation."""
+
+    profile_version: NonEmptyString
+    manifest_schema_version: NonEmptyString
+    stream_schema_versions: dict[NonEmptyString, NonEmptyString] = Field(min_length=1)
+
+    @field_validator("manifest_schema_version", mode="before")
+    @classmethod
+    def require_supported_manifest_version(cls, value: Any) -> str:
+        return _compatible_manifest_version(value)
+
+
 class ProposalCommitReceipt(_StrictModel):
     """Canonical, application-owned receipt for one reviewed proposal."""
 
@@ -213,6 +231,7 @@ class ProposalCommitReceipt(_StrictModel):
     input_digest: HashValue
     proposal_digest: HashValue
     transaction_digest: HashValue
+    digest_controls: ProposalDigestControls
     committed_at: str
 
     @field_validator("committed_at")

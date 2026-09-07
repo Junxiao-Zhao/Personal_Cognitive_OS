@@ -4,13 +4,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+from pathlib import PurePosixPath
 import subprocess
 from typing import Any
 
+from jsonschema import Draft202012Validator, FormatChecker
 from mem_core.errors import MemError
 from mem_core.delta import validate_structured_delta
 from mem_core.application import application_transaction_id
-from mem_core.models import ApplicationCommitRequest, Operation, latest_by_id, utc_now
+from mem_core.models import (
+    ApplicationCommitRequest,
+    Operation,
+    RecordEnvelope,
+    latest_by_id,
+    utc_now,
+)
+from mem_core.profile import ProfileConfig
+from referencing import Registry, Resource
+import yaml
 
 from .digests import input_digest, proposal_digest, receipt_id, transaction_digest
 from .markdown import parse_business_markdown
@@ -19,9 +30,9 @@ from .models import (
     LocalFileMaterial,
     ProposalArtifactMaterial,
     ProposalCommitReceipt,
+    ProposalDigestControls,
     ProposalTransactionLine,
 )
-from ..config import PROPOSAL_MANIFEST_VERSION
 from .snapshot import ProposalSnapshot, snapshot_identity
 from .validation import ValidationResult
 
@@ -145,6 +156,141 @@ def _reject_nonfinite(value: str) -> None:
     raise ValueError(f"non-finite JSON number: {value}")
 
 
+@dataclass(frozen=True, slots=True)
+class _ExactBaseProfile:
+    config: ProfileConfig
+    validators: dict[str, Draft202012Validator]
+
+    @property
+    def stream_schema_versions(self) -> dict[str, str]:
+        return {
+            name: stream.schema_version
+            for name, stream in self.config.streams.items()
+        }
+
+    def validate_record(self, stream_name: str, record: dict[str, Any]) -> None:
+        stream = self.config.streams.get(stream_name)
+        if stream is None:
+            raise ValueError("proposal append targets an unknown exact-base stream")
+        RecordEnvelope.model_validate(record)
+        if record.get("schema_version") != stream.schema_version:
+            raise ValueError("proposal record schema version differs from its exact base")
+        validator = self.validators[stream_name]
+        errors = sorted(
+            validator.iter_errors(record), key=lambda error: list(error.absolute_path)
+        )
+        if errors:
+            raise ValueError(
+                "proposal record fails its exact-base schema: " + errors[0].message
+            )
+
+
+def _git_tree_paths(workspace: Any, base_commit: str, prefix: str) -> tuple[str, ...]:
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(workspace.repository.root),
+                "ls-tree",
+                "-r",
+                "-z",
+                "--name-only",
+                base_commit,
+                "--",
+                prefix,
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise ValueError("exact-base Profile tree cannot be inspected") from exc
+    if result.returncode:
+        raise ValueError("exact-base Profile tree cannot be inspected")
+    try:
+        paths = tuple(
+            item
+            for item in result.stdout.decode("utf-8", errors="strict").split("\0")
+            if item
+        )
+    except UnicodeDecodeError as exc:
+        raise ValueError("exact-base Profile tree paths are not UTF-8") from exc
+    if len(paths) != len(set(paths)) or any(
+        not path.startswith(prefix + "/") for path in paths
+    ):
+        raise ValueError("exact-base Profile tree contains invalid paths")
+    return paths
+
+
+def _exact_base_profile(workspace: Any, base_commit: str) -> _ExactBaseProfile:
+    repository_root = workspace.repository.root.resolve()
+    try:
+        relative_root = workspace.profile.root.resolve().relative_to(repository_root)
+    except ValueError as exc:
+        raise ValueError("opened Profile is outside the canonical repository") from exc
+    profile_root = PurePosixPath(relative_root.as_posix())
+    if not profile_root.parts or ".." in profile_root.parts:
+        raise ValueError("canonical Profile path is unsafe")
+    profile_prefix = profile_root.as_posix()
+    raw_profile = _git_object(
+        workspace,
+        base_commit,
+        f"{profile_prefix}/profile.yaml",
+        required=True,
+    )
+    assert raw_profile is not None
+    try:
+        loaded = yaml.safe_load(raw_profile.decode("utf-8", errors="strict"))
+        if not isinstance(loaded, dict):
+            raise ValueError("Profile YAML must be one mapping")
+        config = ProfileConfig.model_validate(loaded, strict=True)
+    except (UnicodeDecodeError, yaml.YAMLError, TypeError, ValueError) as exc:
+        raise ValueError("exact-base Profile YAML is invalid") from exc
+
+    schema_paths = tuple(
+        path
+        for path in _git_tree_paths(workspace, base_commit, profile_prefix)
+        if path.endswith(".schema.json")
+    )
+    schemas: dict[str, dict[str, Any]] = {}
+    registry = Registry()
+    resource_ids: set[str] = set()
+    for path in schema_paths:
+        raw_schema = _git_object(workspace, base_commit, path, required=True)
+        assert raw_schema is not None
+        try:
+            schema = json.loads(
+                raw_schema.decode("utf-8", errors="strict"),
+                object_pairs_hook=_strict_object,
+                parse_constant=_reject_nonfinite,
+            )
+            if not isinstance(schema, dict):
+                raise ValueError("Profile schema must be one JSON object")
+            Draft202012Validator.check_schema(schema)
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError("exact-base Profile schema is invalid") from exc
+        relative_schema = PurePosixPath(path).relative_to(profile_root).as_posix()
+        schemas[relative_schema] = schema
+        resource_id = schema.get("$id")
+        if isinstance(resource_id, str):
+            if resource_id in resource_ids:
+                raise ValueError("exact-base Profile schema IDs are not unique")
+            resource_ids.add(resource_id)
+            registry = registry.with_resource(
+                resource_id, Resource.from_contents(schema)
+            )
+
+    validators: dict[str, Draft202012Validator] = {}
+    for name, stream in config.streams.items():
+        schema = schemas.get(PurePosixPath(stream.schema_path).as_posix())
+        if schema is None:
+            raise ValueError("exact-base Profile stream schema is missing")
+        validators[name] = Draft202012Validator(
+            schema, registry=registry, format_checker=FormatChecker()
+        )
+    return _ExactBaseProfile(config=config, validators=validators)
+
+
 def _operation_path(operation: Operation) -> str:
     if operation.op == "write_artifact":
         assert operation.path is not None and operation.content is not None
@@ -189,7 +335,7 @@ def _operation_order_key(operation: Operation) -> tuple[int, bytes]:
 
 
 def _validate_stored_operations(
-    workspace: Any,
+    exact_profile: _ExactBaseProfile,
     raw_operations: Any,
     operations: list[Operation],
 ) -> None:
@@ -213,7 +359,7 @@ def _validate_stored_operations(
             paths.add(operation.path)
             continue
         assert operation.stream is not None and operation.record is not None
-        workspace.profile.validate_record_schema(operation.stream, operation.record)
+        exact_profile.validate_record(operation.stream, operation.record)
         key = (operation.stream, operation.record["id"])
         if key in records:
             raise ValueError("proposal business append targets must be unique")
@@ -250,6 +396,7 @@ def _transactions(workspace: Any, base_commit: str) -> tuple[dict[str, Any], ...
     transaction_ids: set[str] = set()
     fingerprints: set[str] = set()
     receipt_ids: set[str] = set()
+    base_profiles: dict[str, _ExactBaseProfile] = {}
     verified: list[dict[str, Any]] = []
     try:
         for record in records:
@@ -272,6 +419,11 @@ def _transactions(workspace: Any, base_commit: str) -> tuple[dict[str, Any], ...
                 continue
             transaction = ProposalTransactionLine.model_validate(record)
             receipt = transaction.receipt
+            controls = receipt.digest_controls
+            exact_profile = base_profiles.get(transaction.base_commit)
+            if exact_profile is None:
+                exact_profile = _exact_base_profile(workspace, transaction.base_commit)
+                base_profiles[transaction.base_commit] = exact_profile
             if receipt.receipt_id in receipt_ids:
                 raise ValueError("duplicate canonical proposal receipt ID")
             receipt_ids.add(receipt.receipt_id)
@@ -283,7 +435,19 @@ def _transactions(workspace: Any, base_commit: str) -> tuple[dict[str, Any], ...
                 raise ValueError("proposal transaction ID is not digest-derived")
             if receipt.workspace_id != workspace.identity["workspace_id"]:
                 raise ValueError("proposal receipt belongs to another workspace")
-            if transaction.application_policy != workspace.profile.config.application_commit_policy:
+            if controls.profile_version != exact_profile.config.version:
+                raise ValueError("proposal Profile version differs from its exact base")
+            if (
+                controls.stream_schema_versions
+                != exact_profile.stream_schema_versions
+            ):
+                raise ValueError(
+                    "proposal stream schema controls differ from their exact base"
+                )
+            if (
+                transaction.application_policy
+                != exact_profile.config.application_commit_policy
+            ):
                 raise ValueError("proposal transaction policy does not match the Profile")
             if receipt.receipt_id != receipt_id(
                 receipt.workspace_id, receipt.review_id
@@ -292,11 +456,8 @@ def _transactions(workspace: Any, base_commit: str) -> tuple[dict[str, Any], ...
             if receipt.transaction_digest != transaction.transaction_fingerprint:
                 raise ValueError("proposal receipt digest does not match its transaction")
             _validate_stored_operations(
-                workspace, record.get("operations"), transaction.operations
+                exact_profile, record.get("operations"), transaction.operations
             )
-            # v0.5 receipts intentionally omit their manifest schema version.
-            # This verifier is therefore deliberately limited to the current
-            # v0.5 manifest contract rather than guessing a historical value.
             recomputed = transaction_digest(
                 workspace_id=receipt.workspace_id,
                 base_commit=transaction.base_commit,
@@ -304,18 +465,15 @@ def _transactions(workspace: Any, base_commit: str) -> tuple[dict[str, Any], ...
                 proposal_digest_value=receipt.proposal_digest,
                 manifest_hash=receipt.manifest_hash,
                 receipt_id_value=receipt.receipt_id,
-                profile_version=workspace.profile.version,
-                manifest_schema_version=PROPOSAL_MANIFEST_VERSION,
-                stream_schema_versions={
-                    name: config.schema_version
-                    for name, config in workspace.profile.config.streams.items()
-                },
+                profile_version=controls.profile_version,
+                manifest_schema_version=controls.manifest_schema_version,
+                stream_schema_versions=controls.stream_schema_versions,
                 operations=transaction.operations,
             )
             if recomputed != transaction.transaction_fingerprint:
                 raise ValueError("proposal transaction digest cannot be recomputed")
             verified.append(transaction.model_dump(mode="json"))
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, MemError, TypeError, ValueError) as exc:
         raise _error(
             "WORKSPACE_INTEGRITY_ERROR",
             "Canonical proposal transaction is malformed or unbound",
@@ -655,6 +813,14 @@ def build_commit_request(
     if not operations:
         raise _error("TRANSACTION_EMPTY", "Proposal creates no canonical operation")
 
+    digest_controls = ProposalDigestControls(
+        profile_version=workspace.profile.version,
+        manifest_schema_version=manifest.schema_version,
+        stream_schema_versions={
+            name: config.schema_version
+            for name, config in workspace.profile.config.streams.items()
+        },
+    )
     transaction_value = transaction_digest(
         workspace_id=workspace_id,
         base_commit=manifest.base_commit,
@@ -662,12 +828,9 @@ def build_commit_request(
         proposal_digest_value=proposal_value,
         manifest_hash=manifest_hash,
         receipt_id_value=commit_reference,
-        profile_version=workspace.profile.version,
-        manifest_schema_version=manifest.schema_version,
-        stream_schema_versions={
-            name: config.schema_version
-            for name, config in workspace.profile.config.streams.items()
-        },
+        profile_version=digest_controls.profile_version,
+        manifest_schema_version=digest_controls.manifest_schema_version,
+        stream_schema_versions=digest_controls.stream_schema_versions,
         operations=operations,
     )
     receipt = ProposalCommitReceipt(
@@ -695,6 +858,7 @@ def build_commit_request(
         input_digest=input_value,
         proposal_digest=proposal_value,
         transaction_digest=transaction_value,
+        digest_controls=digest_controls,
         committed_at=generated_at,
     )
     return ApplicationCommitRequest(
