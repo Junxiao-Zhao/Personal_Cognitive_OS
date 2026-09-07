@@ -11,8 +11,67 @@ import yaml
 from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import BaseModel, ConfigDict, Field
 from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
 from .errors import MemError, ensure
+
+
+class _StrictProfileLoader(yaml.SafeLoader):
+    """Safe YAML loader whose mappings have one unambiguous spelling."""
+
+
+def _strict_profile_mapping(
+    loader: _StrictProfileLoader, node: MappingNode
+) -> dict[Any, Any]:
+    if not isinstance(node, MappingNode):
+        raise ConstructorError(
+            None, None, "expected a Profile mapping", node.start_mark
+        )
+    result: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        if key_node.tag == "tag:yaml.org,2002:merge":
+            raise ConstructorError(
+                "while constructing a Profile mapping",
+                node.start_mark,
+                "YAML merge keys are not allowed in Profile files",
+                key_node.start_mark,
+            )
+        key = loader.construct_object(key_node, deep=True)
+        try:
+            duplicate = key in result
+        except TypeError as exc:
+            raise ConstructorError(
+                "while constructing a Profile mapping",
+                node.start_mark,
+                "Profile mapping keys must be hashable",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise ConstructorError(
+                "while constructing a Profile mapping",
+                node.start_mark,
+                f"duplicate Profile mapping key: {key!r}",
+                key_node.start_mark,
+            )
+        result[key] = loader.construct_object(value_node, deep=True)
+    return result
+
+
+_StrictProfileLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _strict_profile_mapping,
+)
+
+
+def load_profile_yaml(text: str) -> Any:
+    """Parse one Profile YAML document without duplicate or merge semantics."""
+
+    try:
+        return yaml.load(text, Loader=_StrictProfileLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid or ambiguous Profile YAML: {exc}") from exc
 
 
 class ValidationPolicy(BaseModel):
@@ -128,7 +187,7 @@ class Profile:
             retry_safe=False,
         )
         try:
-            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+            raw = load_profile_yaml(config_path.read_text(encoding="utf-8"))
             config = ProfileConfig.model_validate(raw)
         except Exception as exc:
             raise MemError(
@@ -282,7 +341,10 @@ class Profile:
             resource_id = resource_schema.get("$id")
             if isinstance(resource_id, str):
                 registry = registry.with_resource(
-                    resource_id, Resource.from_contents(resource_schema)
+                    resource_id,
+                    Resource.from_contents(
+                        resource_schema, default_specification=DRAFT202012
+                    ),
                 )
         validator = Draft202012Validator(
             schema, registry=registry, format_checker=FormatChecker()

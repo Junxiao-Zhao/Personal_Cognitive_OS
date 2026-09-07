@@ -159,6 +159,16 @@ def _migrate_profile_version(workspace, version: str, *, source_schema: str) -> 
     return Workspace.open(workspace.root)
 
 
+def _commit_profile_base(workspace, mutate) -> None:
+    profile_path = workspace.repository.root / "profiles/pco/profile.yaml"
+    original = profile_path.read_text(encoding="utf-8")
+    profile_path.write_text(mutate(original), encoding="utf-8")
+    workspace.repository._git("add", "profiles/pco/profile.yaml")
+    workspace.repository._git(
+        "commit", "--no-verify", "-m", "seed historical Profile edge case"
+    )
+
+
 def _rebind_transaction_to_controls(line: dict, controls: dict) -> dict:
     receipt = {**line["receipt"], "digest_controls": controls}
     fingerprint = transaction_digest(
@@ -438,6 +448,113 @@ def test_historical_receipt_uses_profile_controls_from_its_exact_base(
     warnings = replay_warnings(migrated, snapshot)
 
     assert warnings[0]["code"] == "INPUT_REPLAY"
+
+
+@pytest.mark.parametrize(
+    "mutate_profile",
+    [
+        pytest.param(
+            lambda text: text.replace(
+                "version: 0.5.0", "version: 0.5.1\nversion: 0.5.0", 1
+            ),
+            id="duplicate-top-level-version",
+        ),
+        pytest.param(
+            lambda text: text.replace(
+                "    schema_version: pco/source/v1",
+                "    schema_version: pco/source/v2\n"
+                "    schema_version: pco/source/v1",
+                1,
+            ),
+            id="duplicate-nested-stream-schema-version",
+        ),
+        pytest.param(
+            lambda text: (
+                "profile_defaults: &profile_defaults\n"
+                "  version: 0.5.1\n"
+                "<<: *profile_defaults\n"
+                + text
+            ),
+            id="merge-key-override",
+        ),
+    ],
+)
+def test_replay_rejects_ambiguous_exact_base_profile_yaml(
+    workspace,
+    proposal_factory,
+    business_markdown_factory,
+    mutate_profile,
+) -> None:
+    _commit_profile_base(workspace, mutate_profile)
+    root, _request = _committed_source_request(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    snapshot = _snapshot_at_current_head(workspace, root)
+
+    with pytest.raises(MemError) as exc:
+        replay_warnings(workspace, snapshot)
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+
+
+def test_exact_base_profile_accepts_id_resource_without_schema_dialect(
+    workspace, proposal_factory, business_markdown_factory
+) -> None:
+    extension = (
+        workspace.repository.root
+        / "profiles/pco/schemas/local-extension.schema.json"
+    )
+    extension.write_text(
+        json.dumps({"$id": "pco/local-extension/v1", "type": "object"}) + "\n",
+        encoding="utf-8",
+    )
+    workspace.repository._git("add", extension.relative_to(workspace.repository.root))
+    workspace.repository._git(
+        "commit", "--no-verify", "-m", "seed schema without dialect declaration"
+    )
+    root, _request = _committed_source_request(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    snapshot = _snapshot_at_current_head(workspace, root)
+
+    assert replay_warnings(workspace, snapshot)[0]["code"] == "INPUT_REPLAY"
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        pytest.param(
+            "https://example.invalid/missing-profile-schema",
+            id="unavailable-external-resource",
+        ),
+        pytest.param(
+            "pco/source/v1#/$defs/missing-schema",
+            id="missing-local-json-pointer",
+        ),
+    ],
+)
+def test_replay_normalizes_unresolved_exact_base_schema_reference(
+    workspace, proposal_factory, business_markdown_factory, reference
+) -> None:
+    workspace.profile.schema_validator("sources")
+    schema_path = workspace.repository.root / "profiles/pco/schemas/source.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema.setdefault("allOf", []).append({"$ref": reference})
+    schema_path.write_text(
+        json.dumps(schema, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    workspace.repository._git("add", schema_path.relative_to(workspace.repository.root))
+    workspace.repository._git(
+        "commit", "--no-verify", "-m", "seed unresolved historical schema reference"
+    )
+    root, _request = _committed_source_request(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    snapshot = _snapshot_at_current_head(workspace, root)
+
+    with pytest.raises(MemError) as exc:
+        replay_warnings(workspace, snapshot)
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,7 @@ import subprocess
 from typing import Any
 
 from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import SchemaError
 from mem_core.errors import MemError
 from mem_core.delta import validate_structured_delta
 from mem_core.application import application_transaction_id
@@ -19,9 +20,10 @@ from mem_core.models import (
     latest_by_id,
     utc_now,
 )
-from mem_core.profile import ProfileConfig
+from mem_core.profile import ProfileConfig, load_profile_yaml
 from referencing import Registry, Resource
-import yaml
+from referencing.exceptions import CannotDetermineSpecification, Unresolvable
+from referencing.jsonschema import DRAFT202012
 
 from .digests import input_digest, proposal_digest, receipt_id, transaction_digest
 from .markdown import parse_business_markdown
@@ -240,11 +242,11 @@ def _exact_base_profile(workspace: Any, base_commit: str) -> _ExactBaseProfile:
     )
     assert raw_profile is not None
     try:
-        loaded = yaml.safe_load(raw_profile.decode("utf-8", errors="strict"))
+        loaded = load_profile_yaml(raw_profile.decode("utf-8", errors="strict"))
         if not isinstance(loaded, dict):
             raise ValueError("Profile YAML must be one mapping")
         config = ProfileConfig.model_validate(loaded, strict=True)
-    except (UnicodeDecodeError, yaml.YAMLError, TypeError, ValueError) as exc:
+    except (UnicodeDecodeError, TypeError, ValueError) as exc:
         raise ValueError("exact-base Profile YAML is invalid") from exc
 
     schema_paths = tuple(
@@ -277,7 +279,10 @@ def _exact_base_profile(workspace: Any, base_commit: str) -> _ExactBaseProfile:
                 raise ValueError("exact-base Profile schema IDs are not unique")
             resource_ids.add(resource_id)
             registry = registry.with_resource(
-                resource_id, Resource.from_contents(schema)
+                resource_id,
+                Resource.from_contents(
+                    schema, default_specification=DRAFT202012
+                ),
             )
 
     validators: dict[str, Draft202012Validator] = {}
@@ -473,7 +478,15 @@ def _transactions(workspace: Any, base_commit: str) -> tuple[dict[str, Any], ...
             if recomputed != transaction.transaction_fingerprint:
                 raise ValueError("proposal transaction digest cannot be recomputed")
             verified.append(transaction.model_dump(mode="json"))
-    except (KeyError, MemError, TypeError, ValueError) as exc:
+    except (
+        CannotDetermineSpecification,
+        KeyError,
+        MemError,
+        SchemaError,
+        TypeError,
+        Unresolvable,
+        ValueError,
+    ) as exc:
         raise _error(
             "WORKSPACE_INTEGRITY_ERROR",
             "Canonical proposal transaction is malformed or unbound",

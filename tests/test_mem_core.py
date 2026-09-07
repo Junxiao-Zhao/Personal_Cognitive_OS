@@ -111,6 +111,49 @@ def test_record_envelope_defers_id_policy_to_selected_profile(tmp_path: Path) ->
     assert exc.value.detail.path == "/id"
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda text: text.replace(
+                "version: 1.0.0", "version: 1.0.1\nversion: 1.0.0", 1
+            ),
+            id="duplicate-top-level-version",
+        ),
+        pytest.param(
+            lambda text: text.replace(
+                "    schema_version: public/log/v1",
+                "    schema_version: public/log/v2\n"
+                "    schema_version: public/log/v1",
+                1,
+            ),
+            id="duplicate-nested-stream-schema-version",
+        ),
+        pytest.param(
+            lambda text: (
+                "profile_defaults: &profile_defaults\n"
+                "  version: 1.0.1\n"
+                "<<: *profile_defaults\n"
+                + text
+            ),
+            id="merge-key-override",
+        ),
+    ],
+)
+def test_profile_load_rejects_ambiguous_yaml_mappings(
+    tmp_path: Path, mutate
+) -> None:
+    root = make_public_logs_profile(tmp_path / "ambiguous-profile")
+    profile_path = root / "profile.yaml"
+    profile_path.write_text(
+        mutate(profile_path.read_text(encoding="utf-8")), encoding="utf-8"
+    )
+
+    with pytest.raises(MemError) as exc:
+        Profile.load(root)
+    assert exc.value.detail.code == "PROFILE_INVALID"
+
+
 def test_schema_validator_is_cached_and_reports_invalid_public_record(
     repository: MemoryRepository,
 ) -> None:
