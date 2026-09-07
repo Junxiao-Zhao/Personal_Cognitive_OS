@@ -539,6 +539,35 @@ def _matching_receipts(
     return tuple(matches)
 
 
+def find_proposal_receipt(
+    workspace: Any, review_id: str
+) -> dict[str, Any] | None:
+    """Return one exact-HEAD, fully verified workspace/review receipt.
+
+    The complete proposal transaction history is verified before filtering so
+    archive-only retry cannot be enabled by a merely receipt-shaped ledger
+    fragment or by a transaction bound to different historical controls.
+    """
+
+    if not isinstance(review_id, str) or not review_id.startswith("review_"):
+        return None
+    head = workspace.repository.head()
+    matches = tuple(
+        transaction["receipt"]
+        for transaction in _transactions(workspace, head)
+        if transaction["receipt"]["workspace_id"]
+        == workspace.identity["workspace_id"]
+        and transaction["receipt"]["review_id"] == review_id
+    )
+    if len(matches) > 1:
+        raise _error(
+            "WORKSPACE_INTEGRITY_ERROR",
+            "Canonical history contains more than one receipt for a review",
+            value={"review_id": review_id},
+        )
+    return None if not matches else json.loads(_canonical_json(matches[0]))
+
+
 def replay_warnings(
     workspace: Any, snapshot: ProposalSnapshot
 ) -> tuple[dict[str, Any], ...]:

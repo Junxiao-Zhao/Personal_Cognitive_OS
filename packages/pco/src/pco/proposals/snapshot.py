@@ -449,6 +449,7 @@ def _capture(
     expected_manifest: ProposalManifest | None,
     *,
     include_local: bool,
+    expected_review_id: str | None = None,
 ) -> ProposalSnapshot:
     root = Path(proposal_root)
     root_fd, root_identity = _open_root(root)
@@ -471,7 +472,7 @@ def _capture(
             ) from exc
         total = _budget(0, len(manifest_bytes))
         manifest = _parse_manifest(manifest_bytes, root)
-        if manifest.review_id != root.name:
+        if manifest.review_id != (expected_review_id or root.name):
             raise _error("PROPOSAL_MANIFEST_MISMATCH", "Manifest review_id does not match its proposal root", path=root)
         if expected_manifest is not None and manifest.model_dump(mode="json") != expected_manifest.model_dump(mode="json"):
             raise _error("PROPOSAL_MANIFEST_MISMATCH", "Supplied manifest does not match exact manifest.json bytes", path=root / "manifest.json")
@@ -586,8 +587,16 @@ def capture_snapshot(
 
 
 def capture_snapshot_from_root(
-    proposal_root: Path, *, include_local: bool
+    proposal_root: Path,
+    *,
+    include_local: bool,
+    expected_review_id: str | None = None,
 ) -> ProposalSnapshot:
     """Capture and parse manifest.json without a preliminary path-based read."""
 
-    return _capture(proposal_root, None, include_local=include_local)
+    return _capture(
+        proposal_root,
+        None,
+        include_local=include_local,
+        expected_review_id=expected_review_id,
+    )
