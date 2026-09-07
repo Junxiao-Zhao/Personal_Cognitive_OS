@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 from mem_core.errors import MemError
+from mem_core.models import Operation
 from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -234,3 +235,15 @@ class ProposalCommitReceipt(_StrictModel):
         if len(material_ids) != len(set(material_ids)):
             raise ValueError("receipt input material IDs must be unique")
         return self
+
+
+class ProposalTransactionLine(_StrictModel):
+    """Exact canonical ledger shape written by mem-core application commits."""
+
+    id: str = Field(pattern=r"^txn_[0-9a-f]{64}$")
+    application_policy: Literal["pco_proposal"]
+    base_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    operation_count: int = Field(ge=1)
+    operations: list[Operation] = Field(min_length=1)
+    transaction_fingerprint: HashValue
+    receipt: ProposalCommitReceipt

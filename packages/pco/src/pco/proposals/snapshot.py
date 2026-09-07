@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -87,6 +88,56 @@ class ProposalSnapshot:
     @property
     def input_material(self) -> tuple[CapturedMaterial, ...]:
         return tuple(item.public() for item in self._input_material)
+
+
+def snapshot_identity(snapshot: ProposalSnapshot) -> str:
+    """Bind every byte and metadata field in one immutable captured snapshot."""
+
+    hasher = hashlib.sha256(b"pco-proposal-snapshot-v0.5\0")
+
+    def add(value: bytes | str) -> None:
+        data = value.encode("utf-8") if isinstance(value, str) else value
+        hasher.update(len(data).to_bytes(8, "big", signed=False))
+        hasher.update(data)
+
+    def encoded(value: Any) -> bytes:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+
+    add("manifest")
+    add(snapshot.manifest_bytes)
+    add("business_files")
+    add(str(len(snapshot.business_files)))
+    for item in snapshot.business_files:
+        add(item.path.as_posix())
+        add(item.operation)
+        add(item.data)
+        add(item.file_hash)
+        add(encoded(item.identity))
+    add("input_material")
+    materials = snapshot.input_material
+    add(str(len(materials)))
+    for item in materials:
+        add(encoded(item.material.model_dump(mode="json")))
+        add(item.raw_bytes)
+        add(item.normalized_bytes)
+        add(item.content_hash)
+        add("" if item.file_hash is None else item.file_hash)
+        add(encoded(item.identity))
+    add("tree_entries")
+    add(str(len(snapshot.tree_entries)))
+    for item in snapshot.tree_entries:
+        add(item.path.as_posix())
+        add(item.kind)
+        add(encoded(item.identity))
+    add("total_bytes")
+    add(str(snapshot.total_bytes))
+    return "sha256:" + hasher.hexdigest()
 
 
 def _error(

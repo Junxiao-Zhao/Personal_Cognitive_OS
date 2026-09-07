@@ -32,7 +32,10 @@ def latest_by_id(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]
 class RecordEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    # Record IDs are Profile-owned business data.  The generic envelope only
+    # requires a non-empty string; each selected Profile supplies any syntax
+    # or length restrictions through its stream schema.
+    id: str = Field(min_length=1)
     revision: int = Field(ge=1)
     recorded_at: str
     schema_version: str = Field(min_length=1)

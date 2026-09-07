@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+from copy import deepcopy
 
 from mem_core.application import application_transaction_id
 from mem_core.errors import MemError
 from mem_core.models import ApplicationCommitRequest
+from mem_core.transaction import TransactionManager
 import pytest
 from pydantic import ValidationError
 
@@ -32,16 +35,18 @@ def _source_proposal(
     review_id="review_build",
     content=b"captured excerpt\n",
     title="Reviewed source",
+    record_id="src_build",
 ):
     root = proposal_factory(review_id)
     (root / "inputs").mkdir()
     (root / "sources").mkdir()
     (root / "inputs/excerpt.txt").write_bytes(content)
     content_hash = "sha256:" + hashlib.sha256(content).hexdigest()
-    (root / "sources/src_build.md").write_bytes(
+    business_path = f"sources/{record_id}.md"
+    (root / business_path).write_bytes(
         business_markdown_factory(
             object_type="source",
-            record_id="src_build",
+            record_id=record_id,
             fields={
                 "change_summary": "Create source",
                 "material_id": "excerpt",
@@ -70,7 +75,7 @@ def _source_proposal(
                 fidelity="selected_excerpt",
             )
         ],
-        files=[BusinessFile(path="sources/src_build.md", operation="create")],
+        files=[BusinessFile(path=business_path, operation="create")],
     )
     (root / "manifest.json").write_text(
         json.dumps(manifest.model_dump(mode="json"), sort_keys=True) + "\n",
@@ -78,6 +83,80 @@ def _source_proposal(
     )
     snapshot = capture_snapshot_from_root(root, include_local=True)
     return root, snapshot, validate_snapshot(snapshot, workspace, require_hashes=True)
+
+
+def _committed_source_request(
+    workspace, proposal_factory, business_markdown_factory
+) -> tuple[object, ApplicationCommitRequest]:
+    root, snapshot, validated = _source_proposal(
+        workspace,
+        proposal_factory,
+        business_markdown_factory,
+        review_id="review_ledger_seed",
+    )
+    request = build_commit_request(workspace, snapshot, validated)
+    assert isinstance(request, ApplicationCommitRequest)
+    TransactionManager(workspace.repository, workspace.paths.tmp).commit_application(
+        request
+    )
+    return root, request
+
+
+def _snapshot_at_current_head(workspace, root):
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["base_commit"] = workspace.repository.head()
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return capture_snapshot_from_root(root, include_local=True)
+
+
+def _commit_corrupt_ledger(workspace, raw: str) -> None:
+    ledger = workspace.repository.root / "transactions/transactions.jsonl"
+    ledger.write_text(raw, encoding="utf-8")
+    workspace.repository._git("add", "transactions/transactions.jsonl")
+    workspace.repository._git(
+        "commit", "--no-verify", "-m", "inject malformed proposal ledger"
+    )
+
+
+def _unicode_evidence_proposal(
+    workspace, proposal_factory, business_markdown_factory
+):
+    record_id = "用户:偏好"
+    root = proposal_factory("review_unicode")
+    (root / "evidence").mkdir()
+    business_path = f"evidence/{record_id}.md"
+    (root / business_path).write_bytes(
+        business_markdown_factory(
+            object_type="evidence",
+            record_id=record_id,
+            fields={
+                "change_summary": "记录用户偏好",
+                "speaker": "user",
+                "source_kind": "conversation",
+                "user_authored": True,
+                "fidelity": "selected_excerpt",
+                "status": "active",
+            },
+            body="用户明确表达的偏好。\n",
+        )
+    )
+    manifest = ProposalManifest(
+        review_id=root.name,
+        base_commit=workspace.repository.head(),
+        workspace_version=workspace.identity["workspace_format_version"],
+        profile_version=workspace.profile.version,
+        files=[BusinessFile(path=business_path, operation="create")],
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(manifest.model_dump(mode="json"), ensure_ascii=False, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    snapshot = capture_snapshot_from_root(root, include_local=True)
+    return snapshot, validate_snapshot(snapshot, workspace, require_hashes=True)
 
 
 def test_build_commit_request_generates_source_blob_revision_and_strict_receipt(
@@ -112,6 +191,23 @@ def test_build_commit_request_generates_source_blob_revision_and_strict_receipt(
     assert receipt.files[0].path.as_posix() == "sources/src_build.md"
     assert receipt.input_material[0].file_hash is not None
     assert receipt.transaction_digest == request.transaction_digest
+
+
+def test_unicode_and_colon_id_flows_through_real_application_commit(
+    workspace, proposal_factory, business_markdown_factory
+) -> None:
+    snapshot, validated = _unicode_evidence_proposal(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    request = build_commit_request(workspace, snapshot, validated)
+    assert isinstance(request, ApplicationCommitRequest)
+
+    TransactionManager(workspace.repository, workspace.paths.tmp).commit_application(
+        request
+    )
+
+    current = workspace.repository.current_records("evidence")
+    assert current["用户:偏好"]["id"] == "用户:偏好"
 
 
 def test_build_request_is_retry_stable_except_for_excluded_timestamps(
@@ -196,84 +292,61 @@ def test_local_file_receipt_has_no_proposal_file_hash() -> None:
 
 
 def test_semantic_noop_requires_both_prior_digests_and_current_record_equivalence(
-    workspace, proposal_factory, business_markdown_factory, monkeypatch
+    workspace, proposal_factory, business_markdown_factory
 ) -> None:
-    _root, snapshot, validated = _source_proposal(
-        workspace, proposal_factory, business_markdown_factory
+    prior_root, prior_snapshot, prior_validated = _source_proposal(
+        workspace,
+        proposal_factory,
+        business_markdown_factory,
+        review_id="review_prior",
     )
-    request = build_commit_request(workspace, snapshot, validated)
-    assert isinstance(request, ApplicationCommitRequest)
-    # Simulate the exact state a concurrent equivalent application produced,
-    # while keeping this captured/validated proposal immutable.
-    for operation in request.operations:
-        if operation.op == "write_artifact":
-            target = workspace.repository.root / operation.path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(operation.content, encoding="utf-8")
-        else:
-            operation.record["commit_ref"] = "commit_" + "9" * 64
-            workspace.repository.append_record(
-                workspace.repository.root, operation.stream, operation.record
-            )
-    transaction = {
-        "id": application_transaction_id(request.transaction_digest),
-        "application_policy": request.policy,
-        "base_commit": request.base_commit,
-        "operation_count": len(request.operations),
-        "operations": [operation.normalized() for operation in request.operations],
-        "transaction_fingerprint": request.transaction_digest,
-        "receipt": request.receipt,
-    }
-    with (workspace.repository.root / "transactions/transactions.jsonl").open(
-        "a", encoding="utf-8"
-    ) as handle:
-        handle.write(json.dumps(transaction, sort_keys=True) + "\n")
-    workspace.repository._git("add", ".")
-    workspace.repository._git("commit", "--no-verify", "-m", "seed equivalent proposal")
-    # The builder is deliberately anchored by the immutable snapshot base. For
-    # this no-op branch, point the manifest at the state containing the prior
-    # receipt without changing the already validated semantic previews.
-    changed = json.loads(snapshot.manifest_bytes)
-    changed["base_commit"] = workspace.repository.head()
-    object.__setattr__(
-        snapshot,
-        "manifest_bytes",
-        (json.dumps(changed, sort_keys=True) + "\n").encode("utf-8"),
+    prior_request = build_commit_request(workspace, prior_snapshot, prior_validated)
+    assert isinstance(prior_request, ApplicationCommitRequest)
+    TransactionManager(workspace.repository, workspace.paths.tmp).commit_application(
+        prior_request
+    )
+    shutil.rmtree(prior_root)
+
+    _root, snapshot, validated = _source_proposal(
+        workspace,
+        proposal_factory,
+        business_markdown_factory,
+        review_id="review_again",
     )
 
     result = build_commit_request(workspace, snapshot, validated)
     assert isinstance(result, SemanticNoOp)
     assert result.equivalent_records[0]["id"] == "src_build"
+    assert result.warnings[0]["code"] == "INPUT_REPLAY"
 
 
 def test_same_input_and_prior_receipt_with_changed_proposal_is_not_noop(
     workspace, proposal_factory, business_markdown_factory
 ) -> None:
-    _root, snapshot, validated = _source_proposal(
-        workspace, proposal_factory, business_markdown_factory
+    prior_root, prior_snapshot, prior_validated = _source_proposal(
+        workspace,
+        proposal_factory,
+        business_markdown_factory,
+        review_id="review_replay_prior",
     )
-    request = build_commit_request(workspace, snapshot, validated)
-    assert isinstance(request, ApplicationCommitRequest)
-    prior = {
-        "id": application_transaction_id(request.transaction_digest),
-        "application_policy": request.policy,
-        "base_commit": request.base_commit,
-        "operation_count": len(request.operations),
-        "operations": [operation.normalized() for operation in request.operations],
-        "transaction_fingerprint": request.transaction_digest,
-        "receipt": {**request.receipt, "proposal_digest": "sha256:" + "0" * 64},
-    }
-    with (workspace.repository.root / "transactions/transactions.jsonl").open(
-        "a", encoding="utf-8"
-    ) as handle:
-        handle.write(json.dumps(prior, sort_keys=True) + "\n")
-    workspace.repository._git("add", ".")
-    workspace.repository._git("commit", "--no-verify", "-m", "seed input replay only")
-    changed = json.loads(snapshot.manifest_bytes)
-    changed["base_commit"] = workspace.repository.head()
-    object.__setattr__(snapshot, "manifest_bytes", (json.dumps(changed) + "\n").encode())
+    prior_request = build_commit_request(
+        workspace, prior_snapshot, prior_validated
+    )
+    assert isinstance(prior_request, ApplicationCommitRequest)
+    TransactionManager(workspace.repository, workspace.paths.tmp).commit_application(
+        prior_request
+    )
+    shutil.rmtree(prior_root)
 
-    revalidated = validate_snapshot(snapshot, workspace, require_hashes=True)
+    _root, snapshot, revalidated = _source_proposal(
+        workspace,
+        proposal_factory,
+        business_markdown_factory,
+        review_id="review_replay_new_output",
+        record_id="src_new_output",
+        title="New business output",
+    )
+
     assert revalidated.warnings[0]["code"] == "INPUT_REPLAY"
     assert isinstance(
         build_commit_request(workspace, snapshot, revalidated),
@@ -306,35 +379,163 @@ def test_build_rejects_validation_result_from_different_snapshot(
     assert exc.value.detail.code == "PROPOSAL_SNAPSHOT_INCOMPLETE"
 
 
-def test_prior_matching_digests_without_current_equivalence_is_not_noop(
+def test_build_rejects_old_validation_when_only_material_bytes_changed(
     workspace, proposal_factory, business_markdown_factory
 ) -> None:
-    _root, snapshot, validated = _source_proposal(
+    root, _snapshot, validated = _source_proposal(
         workspace, proposal_factory, business_markdown_factory
     )
-    request = build_commit_request(workspace, snapshot, validated)
-    assert isinstance(request, ApplicationCommitRequest)
-    transaction = {
-        "id": application_transaction_id(request.transaction_digest),
-        "application_policy": request.policy,
-        "base_commit": request.base_commit,
-        "operation_count": len(request.operations),
-        "operations": [operation.normalized() for operation in request.operations],
-        "transaction_fingerprint": request.transaction_digest,
-        "receipt": request.receipt,
-    }
-    with (workspace.repository.root / "transactions/transactions.jsonl").open(
-        "a", encoding="utf-8"
-    ) as handle:
-        handle.write(json.dumps(transaction, sort_keys=True) + "\n")
-    workspace.repository._git("add", ".")
-    workspace.repository._git(
-        "commit", "--no-verify", "-m", "seed receipt without business state"
-    )
-    changed = json.loads(snapshot.manifest_bytes)
-    changed["base_commit"] = workspace.repository.head()
-    object.__setattr__(snapshot, "manifest_bytes", (json.dumps(changed) + "\n").encode())
+    (root / "inputs/excerpt.txt").write_bytes(b"changed after validation\n")
+    changed_snapshot = capture_snapshot_from_root(root, include_local=True)
 
-    assert isinstance(
-        build_commit_request(workspace, snapshot, validated), ApplicationCommitRequest
+    with pytest.raises(MemError) as exc:
+        build_commit_request(workspace, changed_snapshot, validated)
+    assert exc.value.detail.code == "PROPOSAL_SNAPSHOT_INCOMPLETE"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda manifest: manifest["files"][0].update(operation="revise"),
+            id="operation",
+        ),
+        pytest.param(
+            lambda manifest: manifest["input_material"][0].update(
+                expected_content_hash="sha256:" + "0" * 64
+            ),
+            id="expected-content-hash",
+        ),
+        pytest.param(
+            lambda manifest: manifest.update(base_commit="0" * 40),
+            id="base-commit",
+        ),
+    ],
+)
+def test_build_rejects_old_validation_when_only_one_manifest_control_changed(
+    workspace, proposal_factory, business_markdown_factory, mutate
+) -> None:
+    root, _snapshot, validated = _source_proposal(
+        workspace, proposal_factory, business_markdown_factory
     )
+    manifest = json.loads((root / "manifest.json").read_bytes())
+    mutate(manifest)
+    (root / "manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    changed_snapshot = capture_snapshot_from_root(root, include_local=True)
+
+    with pytest.raises(MemError) as exc:
+        build_commit_request(workspace, changed_snapshot, validated)
+    assert exc.value.detail.code == "PROPOSAL_SNAPSHOT_INCOMPLETE"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(
+            lambda line: {**line, "id": "txn_" + "0" * 64},
+            id="derived-transaction-id",
+        ),
+        pytest.param(
+            lambda line: {**line, "operation_count": line["operation_count"] + 1},
+            id="operation-count",
+        ),
+        pytest.param(
+            lambda line: {
+                **line,
+                "operations": [{"op": "write_artifact", "path": "source_blobs/bad"}],
+            },
+            id="operation-shape",
+        ),
+        pytest.param(
+            lambda line: {
+                **line,
+                "receipt": {**line["receipt"], "workspace_id": "workspace_other"},
+            },
+            id="workspace-ownership",
+        ),
+        pytest.param(
+            lambda line: {
+                **line,
+                "operations": [
+                    *line["operations"][:-1],
+                    {
+                        **line["operations"][-1],
+                        "record": {
+                            **line["operations"][-1]["record"],
+                            "payload": {
+                                **line["operations"][-1]["record"]["payload"],
+                                "title": "Fingerprint bypass",
+                            },
+                        },
+                    },
+                ],
+            },
+            id="digest-bound-operation",
+        ),
+        pytest.param(
+            lambda line: {**line, "operations": list(reversed(line["operations"]))},
+            id="operation-order",
+        ),
+    ],
+)
+def test_replay_rejects_malformed_proposal_transaction_fields(
+    workspace, proposal_factory, business_markdown_factory, mutation
+) -> None:
+    root, _request = _committed_source_request(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    ledger = workspace.repository.root / "transactions/transactions.jsonl"
+    line = json.loads(ledger.read_text(encoding="utf-8"))
+    _commit_corrupt_ledger(
+        workspace,
+        json.dumps(mutation(deepcopy(line)), sort_keys=True) + "\n",
+    )
+    snapshot = _snapshot_at_current_head(workspace, root)
+
+    with pytest.raises(MemError) as exc:
+        replay_warnings(workspace, snapshot)
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+
+
+def test_replay_rejects_ledger_wide_duplicate_transaction_identity(
+    workspace, proposal_factory, business_markdown_factory
+) -> None:
+    root, _request = _committed_source_request(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    ledger = workspace.repository.root / "transactions/transactions.jsonl"
+    line = ledger.read_text(encoding="utf-8").strip()
+    _commit_corrupt_ledger(workspace, line + "\n" + line + "\n")
+    snapshot = _snapshot_at_current_head(workspace, root)
+
+    with pytest.raises(MemError) as exc:
+        replay_warnings(workspace, snapshot)
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+
+
+@pytest.mark.parametrize("invalid", ["duplicate-key", "non-finite"])
+def test_replay_rejects_noncanonical_json_at_any_nesting(
+    workspace, proposal_factory, business_markdown_factory, invalid
+) -> None:
+    root, request = _committed_source_request(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    ledger = workspace.repository.root / "transactions/transactions.jsonl"
+    line = ledger.read_text(encoding="utf-8").strip()
+    if invalid == "duplicate-key":
+        needle = f'"input_digest": "{request.receipt["input_digest"]}"'
+        replacement = needle + ", " + needle
+        assert needle in line
+        line = line.replace(needle, replacement, 1)
+    else:
+        needle = f'"operation_count": {len(request.operations)}'
+        assert needle in line
+        line = line.replace(needle, '"operation_count": NaN', 1)
+    _commit_corrupt_ledger(workspace, line + "\n")
+    snapshot = _snapshot_at_current_head(workspace, root)
+
+    with pytest.raises(MemError) as exc:
+        replay_warnings(workspace, snapshot)
+    assert exc.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"

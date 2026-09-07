@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
-from pathlib import Path
 import subprocess
 from typing import Any
 
 from mem_core.errors import MemError
+from mem_core.delta import validate_structured_delta
+from mem_core.application import application_transaction_id
 from mem_core.models import ApplicationCommitRequest, Operation, latest_by_id, utc_now
 
 from .digests import input_digest, proposal_digest, receipt_id, transaction_digest
@@ -18,8 +19,10 @@ from .models import (
     LocalFileMaterial,
     ProposalArtifactMaterial,
     ProposalCommitReceipt,
+    ProposalTransactionLine,
 )
-from .snapshot import ProposalSnapshot
+from ..config import PROPOSAL_MANIFEST_VERSION
+from .snapshot import ProposalSnapshot, snapshot_identity
 from .validation import ValidationResult
 
 
@@ -129,6 +132,101 @@ def _git_object(
     return result.stdout
 
 
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _operation_path(operation: Operation) -> str:
+    if operation.op == "write_artifact":
+        assert operation.path is not None and operation.content is not None
+        if not operation.path.startswith("source_blobs/"):
+            raise ValueError("proposal artifacts must be source blobs")
+        suffix = operation.path.removeprefix("source_blobs/")
+        if len(suffix) != 64 or any(char not in "0123456789abcdef" for char in suffix):
+            raise ValueError("source blob path must contain one lowercase SHA-256 hex")
+        if digest(operation.content.encode("utf-8")) != "sha256:" + suffix:
+            raise ValueError("source blob path does not match its UTF-8 content")
+        return operation.path
+    assert operation.stream is not None and operation.record is not None
+    record_id = operation.record.get("id")
+    if not isinstance(record_id, str) or not record_id or "/" in record_id or "\\" in record_id:
+        raise ValueError("proposal record ID cannot be mapped to one business path")
+    if operation.stream == "meta_revisions":
+        return "META_MEMORY.md"
+    if operation.stream == "session_handoffs":
+        return "SESSION_HANDOFF.md"
+    directories = {
+        "evidence": "evidence",
+        "sources": "sources",
+        "events": "events",
+        "psychologies": "psychologies",
+        "philosophies": "philosophies",
+        "archetypes": "archetypes",
+        "hypotheses": "hypotheses",
+    }
+    if operation.stream not in directories:
+        raise ValueError("proposal append targets an unknown business stream")
+    return f"{directories[operation.stream]}/{record_id}.md"
+
+
+def _operation_order_key(operation: Operation) -> tuple[int, bytes]:
+    if operation.op == "write_artifact":
+        rank = 0
+    elif operation.stream == "sources":
+        rank = 1
+    else:
+        rank = 2
+    return rank, _operation_path(operation).encode("utf-8")
+
+
+def _validate_stored_operations(
+    workspace: Any,
+    raw_operations: Any,
+    operations: list[Operation],
+) -> None:
+    if not isinstance(raw_operations, list) or len(raw_operations) != len(operations):
+        raise ValueError("proposal operations must be one JSON array")
+    if any(
+        not isinstance(raw, dict) or raw != operation.normalized()
+        for raw, operation in zip(raw_operations, operations, strict=True)
+    ):
+        raise ValueError("proposal operations must use the canonical normalized shape")
+    if operations != sorted(operations, key=_operation_order_key):
+        raise ValueError("proposal operations are not in canonical source/business order")
+    paths: set[str] = set()
+    records: set[tuple[str, str]] = set()
+    for operation in operations:
+        _operation_path(operation)
+        if operation.op == "write_artifact":
+            assert operation.path is not None
+            if operation.path in paths:
+                raise ValueError("proposal source blob operations must be unique")
+            paths.add(operation.path)
+            continue
+        assert operation.stream is not None and operation.record is not None
+        workspace.profile.validate_record_schema(operation.stream, operation.record)
+        key = (operation.stream, operation.record["id"])
+        if key in records:
+            raise ValueError("proposal business append targets must be unique")
+        records.add(key)
+        if operation.stream == "sources":
+            payload = operation.record["payload"]
+            content_hash = payload.get("content_hash")
+            if payload.get("snapshot_ref") != "source_blobs/" + str(
+                content_hash
+            ).removeprefix("sha256:"):
+                raise ValueError("source revision snapshot_ref does not match content_hash")
+
+
 def _transactions(workspace: Any, base_commit: str) -> tuple[dict[str, Any], ...]:
     raw = _git_object(
         workspace, base_commit, "transactions/transactions.jsonl", required=True
@@ -136,12 +234,94 @@ def _transactions(workspace: Any, base_commit: str) -> tuple[dict[str, Any], ...
     assert raw is not None
     try:
         text = raw.decode("utf-8", errors="strict")
-        records = tuple(json.loads(line) for line in text.splitlines() if line.strip())
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        records = tuple(
+            json.loads(
+                line,
+                object_pairs_hook=_strict_object,
+                parse_constant=_reject_nonfinite,
+            )
+            for line in text.splitlines()
+            if line.strip()
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise _error("WORKSPACE_INTEGRITY_ERROR", "Canonical transaction ledger is invalid", value=str(exc)) from exc
     if not all(isinstance(record, dict) for record in records):
         raise _error("WORKSPACE_INTEGRITY_ERROR", "Canonical transaction ledger contains a non-object")
-    return records
+    transaction_ids: set[str] = set()
+    fingerprints: set[str] = set()
+    receipt_ids: set[str] = set()
+    verified: list[dict[str, Any]] = []
+    try:
+        for record in records:
+            transaction_id = record.get("id")
+            fingerprint = record.get("transaction_fingerprint")
+            if isinstance(transaction_id, str):
+                if transaction_id in transaction_ids:
+                    raise ValueError("duplicate canonical transaction ID")
+                transaction_ids.add(transaction_id)
+            if isinstance(fingerprint, str):
+                if fingerprint in fingerprints:
+                    raise ValueError("duplicate canonical transaction fingerprint")
+                fingerprints.add(fingerprint)
+            receipt_value = record.get("receipt")
+            is_proposal = record.get("application_policy") == "pco_proposal" or (
+                isinstance(receipt_value, dict)
+                and receipt_value.get("type") == "proposal_commit_receipt"
+            )
+            if not is_proposal:
+                continue
+            transaction = ProposalTransactionLine.model_validate(record)
+            receipt = transaction.receipt
+            if receipt.receipt_id in receipt_ids:
+                raise ValueError("duplicate canonical proposal receipt ID")
+            receipt_ids.add(receipt.receipt_id)
+            if transaction.operation_count != len(transaction.operations):
+                raise ValueError("proposal operation_count does not match operations")
+            if transaction.id != application_transaction_id(
+                transaction.transaction_fingerprint
+            ):
+                raise ValueError("proposal transaction ID is not digest-derived")
+            if receipt.workspace_id != workspace.identity["workspace_id"]:
+                raise ValueError("proposal receipt belongs to another workspace")
+            if transaction.application_policy != workspace.profile.config.application_commit_policy:
+                raise ValueError("proposal transaction policy does not match the Profile")
+            if receipt.receipt_id != receipt_id(
+                receipt.workspace_id, receipt.review_id
+            ):
+                raise ValueError("proposal receipt ID is not workspace/review derived")
+            if receipt.transaction_digest != transaction.transaction_fingerprint:
+                raise ValueError("proposal receipt digest does not match its transaction")
+            _validate_stored_operations(
+                workspace, record.get("operations"), transaction.operations
+            )
+            # v0.5 receipts intentionally omit their manifest schema version.
+            # This verifier is therefore deliberately limited to the current
+            # v0.5 manifest contract rather than guessing a historical value.
+            recomputed = transaction_digest(
+                workspace_id=receipt.workspace_id,
+                base_commit=transaction.base_commit,
+                input_digest_value=receipt.input_digest,
+                proposal_digest_value=receipt.proposal_digest,
+                manifest_hash=receipt.manifest_hash,
+                receipt_id_value=receipt.receipt_id,
+                profile_version=workspace.profile.version,
+                manifest_schema_version=PROPOSAL_MANIFEST_VERSION,
+                stream_schema_versions={
+                    name: config.schema_version
+                    for name, config in workspace.profile.config.streams.items()
+                },
+                operations=transaction.operations,
+            )
+            if recomputed != transaction.transaction_fingerprint:
+                raise ValueError("proposal transaction digest cannot be recomputed")
+            verified.append(transaction.model_dump(mode="json"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _error(
+            "WORKSPACE_INTEGRITY_ERROR",
+            "Canonical proposal transaction is malformed or unbound",
+            value=str(exc),
+        ) from exc
+    return tuple(verified)
 
 
 def _matching_receipts(
@@ -205,26 +385,85 @@ def replay_warnings(
     )
 
 
-def _base_current_records(
-    workspace: Any, base_commit: str, streams: set[str]
-) -> dict[str, dict[str, dict[str, Any]]]:
-    result: dict[str, dict[str, dict[str, Any]]] = {}
-    for stream in sorted(streams, key=lambda value: value.encode("utf-8")):
-        path = Path(workspace.profile.stream(stream).path).as_posix()
-        raw = _git_object(workspace, base_commit, path, required=True)
-        assert raw is not None
-        try:
-            records = [
-                json.loads(line)
-                for line in raw.decode("utf-8", errors="strict").splitlines()
-                if line.strip()
-            ]
-            if not all(isinstance(record, dict) for record in records):
-                raise ValueError("non-object record")
-            result[stream] = latest_by_id(records)
-        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            raise _error("WORKSPACE_INTEGRITY_ERROR", "Canonical business stream is invalid", path=path, value=str(exc)) from exc
-    return result
+def proposal_history(
+    workspace: Any,
+    snapshot: ProposalSnapshot,
+    parsed: tuple[Any, ...],
+    base_records: dict[str, list[dict[str, Any]]],
+) -> tuple[tuple[dict[str, Any], ...], tuple[dict[str, Any], ...]]:
+    """Return replay warnings and a fully proven semantic-no-op candidate."""
+
+    input_value = input_digest(snapshot.input_material)
+    proposal_value = proposal_digest(parsed)
+    input_matches = _matching_receipts(
+        workspace, snapshot.manifest.base_commit, input_value, None
+    )
+    if not input_matches:
+        return (), ()
+    warnings = (
+        {
+            "code": "INPUT_REPLAY",
+            "message": "The captured input material matches a prior proposal commit",
+            "input_digest": input_value,
+        },
+    )
+    if not _matching_receipts(
+        workspace,
+        snapshot.manifest.base_commit,
+        input_value,
+        proposal_value,
+    ):
+        return warnings, ()
+
+    by_material = {item.material_id: item for item in snapshot.input_material}
+    current = {
+        stream: latest_by_id(records) for stream, records in base_records.items()
+    }
+    equivalent: list[dict[str, Any]] = []
+    for item in parsed:
+        proposed = item.to_record_preview()
+        if item.stream == "sources":
+            material = by_material.get(item.material_id or "")
+            if material is None:
+                return warnings, ()
+            proposed["payload"]["content_hash"] = material.content_hash
+            proposed["payload"]["snapshot_ref"] = (
+                "source_blobs/" + material.content_hash.removeprefix("sha256:")
+            )
+        effective = current.get(item.stream, {}).get(item.record_id)
+        if effective is None or _without_generated_metadata(
+            effective
+        ) != _without_generated_metadata(proposed):
+            return warnings, ()
+        workspace.profile.validate_record_schema(item.stream, effective)
+        if item.stream == "sources":
+            content_hash = proposed["payload"]["content_hash"]
+            relative = "source_blobs/" + content_hash.removeprefix("sha256:")
+            existing = _git_object(
+                workspace,
+                snapshot.manifest.base_commit,
+                relative,
+                required=False,
+            )
+            if existing is None or digest(existing) != content_hash:
+                raise _error(
+                    "SOURCE_SNAPSHOT_INVALID",
+                    "Semantically equivalent source record lacks its valid canonical snapshot",
+                    path=relative,
+                    value={
+                        "expected": content_hash,
+                        "observed": None if existing is None else digest(existing),
+                    },
+                )
+        equivalent.append(effective)
+
+    validate_structured_delta(
+        profile=workspace.profile,
+        base_records=base_records,
+        delta={stream: [] for stream in workspace.profile.config.streams},
+        root=workspace.repository.root,
+    )
+    return warnings, tuple(equivalent)
 
 
 def _without_generated_metadata(record: dict[str, Any]) -> dict[str, Any]:
@@ -232,50 +471,6 @@ def _without_generated_metadata(record: dict[str, Any]) -> dict[str, Any]:
     result.pop("recorded_at", None)
     result.pop("commit_ref", None)
     return result
-
-
-def _semantic_noop(
-    workspace: Any,
-    snapshot: ProposalSnapshot,
-    input_value: str,
-    proposal_value: str,
-    records: list[tuple[str, dict[str, Any]]],
-    source_materials: dict[str, CapturedMaterial],
-) -> SemanticNoOp | None:
-    if not _matching_receipts(
-        workspace,
-        snapshot.manifest.base_commit,
-        input_value,
-        proposal_value,
-    ):
-        return None
-    current = _base_current_records(
-        workspace, snapshot.manifest.base_commit, {stream for stream, _ in records}
-    )
-    equivalent: list[dict[str, Any]] = []
-    for stream, proposed in records:
-        effective = current[stream].get(proposed["id"])
-        if effective is None or _without_generated_metadata(
-            effective
-        ) != _without_generated_metadata(proposed):
-            return None
-        equivalent.append(effective)
-    for content_hash in source_materials:
-        relative = "source_blobs/" + content_hash.removeprefix("sha256:")
-        existing = _git_object(
-            workspace, snapshot.manifest.base_commit, relative, required=False
-        )
-        if existing is None or digest(existing) != content_hash:
-            raise _error(
-                "SOURCE_SNAPSHOT_INVALID",
-                "Semantically equivalent source record lacks its valid canonical snapshot",
-                path=relative,
-                value={
-                    "expected": content_hash,
-                    "observed": None if existing is None else digest(existing),
-                },
-            )
-    return SemanticNoOp(input_value, proposal_value, tuple(equivalent))
 
 
 def _receipt_material(material: CapturedMaterial) -> dict[str, Any]:
@@ -364,6 +559,11 @@ def build_commit_request(
     """Build one deterministic transaction from exactly the validated snapshot."""
 
     manifest = snapshot.manifest
+    if validated.snapshot_identity != snapshot_identity(snapshot):
+        raise _error(
+            "PROPOSAL_SNAPSHOT_INCOMPLETE",
+            "Validation result does not belong to the complete immutable proposal snapshot",
+        )
     captured_materials, business_file_hashes = _verified_snapshot_values(
         snapshot, validated
     )
@@ -372,6 +572,22 @@ def build_commit_request(
     input_value = input_digest(captured_materials)
     proposal_value = proposal_digest(validated.parsed)
     manifest_hash = digest(snapshot.manifest_bytes)
+    if validated.is_semantic_noop:
+        if not _matching_receipts(
+            workspace,
+            manifest.base_commit,
+            input_value,
+            proposal_value,
+        ):
+            raise _error(
+                "WORKSPACE_INTEGRITY_ERROR",
+                "Validated semantic no-op has no exact prior proposal transaction",
+            )
+        return SemanticNoOp(
+            input_value,
+            proposal_value,
+            validated.equivalent_records,
+        )
     generated_at = utc_now()
 
     if len(validated.parsed) != len(validated.revisions):
@@ -400,17 +616,6 @@ def build_commit_request(
             source_materials[material.content_hash] = material
         workspace.profile.validate_record_schema(parsed.stream, record)
         records.append((parsed.stream, record))
-
-    no_op = _semantic_noop(
-        workspace,
-        snapshot,
-        input_value,
-        proposal_value,
-        records,
-        source_materials,
-    )
-    if no_op is not None:
-        return no_op
 
     blob_operations: list[Operation] = []
     for content_hash in sorted(source_materials, key=lambda value: value.encode("utf-8")):

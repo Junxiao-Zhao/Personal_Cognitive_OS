@@ -11,6 +11,7 @@ import yaml
 from mem_core.errors import MemError
 from mem_core.models import (
     Operation,
+    RecordEnvelope,
     latest_by_id,
     proposal_hash,
     transaction_fingerprint,
@@ -89,6 +90,25 @@ def test_latest_by_id_keeps_highest_revision() -> None:
         {"id": "b", "revision": 1, "payload": {}},
     ]
     assert latest_by_id(records) == {"a": records[1], "b": records[2]}
+
+
+def test_record_envelope_defers_id_policy_to_selected_profile(tmp_path: Path) -> None:
+    record = log_record(record_id="对象:一")
+    assert RecordEnvelope.model_validate(record).id == "对象:一"
+
+    profile_root = make_public_logs_profile(tmp_path / "restricted-profile")
+    schema_path = profile_root / "schemas/log.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    schema["properties"]["id"].update(
+        {"pattern": "^log_[A-Za-z0-9]+$", "maxLength": 12}
+    )
+    schema_path.write_text(json.dumps(schema), encoding="utf-8")
+    profile = Profile.load(profile_root)
+
+    with pytest.raises(MemError) as exc:
+        profile.validate_record_schema("logs", record)
+    assert exc.value.detail.code == "SCHEMA_VALIDATION_FAILED"
+    assert exc.value.detail.path == "/id"
 
 
 def test_schema_validator_is_cached_and_reports_invalid_public_record(

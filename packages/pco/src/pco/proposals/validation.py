@@ -16,7 +16,7 @@ from ..config import WORKSPACE_FORMAT_VERSION
 from .markdown import ParsedBusinessObject, parse_business_markdown
 from .materials import CapturedMaterial
 from .models import InputMaterial, LocalFileMaterial, ProposalArtifactMaterial
-from .snapshot import ProposalSnapshot, capture_snapshot_from_root
+from .snapshot import ProposalSnapshot, capture_snapshot_from_root, snapshot_identity
 
 if TYPE_CHECKING:
     from ..workspace import Workspace
@@ -53,12 +53,17 @@ class ValidationResult:
     parsed: tuple[ParsedBusinessObject, ...]
     revisions: tuple[RevisionPreview, ...]
     _warnings_json: tuple[bytes, ...]
+    _snapshot_identity: str | None
+    _equivalent_json: tuple[bytes, ...]
 
     def __init__(
         self,
         parsed: tuple[ParsedBusinessObject, ...],
         revisions: tuple[RevisionPreview, ...],
         warnings: tuple[dict[str, Any], ...] = (),
+        *,
+        snapshot_identity_value: str | None = None,
+        equivalent_records: tuple[dict[str, Any], ...] = (),
     ) -> None:
         object.__setattr__(self, "parsed", tuple(parsed))
         object.__setattr__(self, "revisions", tuple(revisions))
@@ -76,12 +81,39 @@ class ValidationResult:
                 for warning in warnings
             ),
         )
+        object.__setattr__(self, "_snapshot_identity", snapshot_identity_value)
+        object.__setattr__(
+            self,
+            "_equivalent_json",
+            tuple(
+                json.dumps(
+                    record,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+                for record in equivalent_records
+            ),
+        )
 
     @property
     def warnings(self) -> tuple[dict[str, Any], ...]:
         """Return detached warnings so result state cannot be mutated."""
 
         return tuple(json.loads(item) for item in self._warnings_json)
+
+    @property
+    def snapshot_identity(self) -> str | None:
+        return self._snapshot_identity
+
+    @property
+    def equivalent_records(self) -> tuple[dict[str, Any], ...]:
+        return tuple(json.loads(item) for item in self._equivalent_json)
+
+    @property
+    def is_semantic_noop(self) -> bool:
+        return bool(self._equivalent_json)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -316,8 +348,8 @@ def validate_snapshot(
     """Validate only snapshot bytes against the exact canonical base and Profile."""
 
     # Imported lazily because transaction construction consumes ValidationResult;
-    # replay detection itself reads only the immutable snapshot and exact Git base.
-    from .operations import replay_warnings
+    # history classification itself reads only this snapshot and exact Git base.
+    from .operations import proposal_history
 
     _validate_controls(snapshot, workspace)
     base_commit = snapshot.manifest.base_commit
@@ -343,6 +375,27 @@ def validate_snapshot(
         tuple(snapshot.manifest.input_material),
         require_hashes=require_hashes,
     )
+    warnings, equivalent_records = proposal_history(
+        workspace, snapshot, parsed, base_records
+    )
+    if equivalent_records:
+        final_head = workspace.repository.head()
+        if final_head != base_commit:
+            raise _error(
+                "PROPOSAL_STALE",
+                "Canonical HEAD changed during proposal validation",
+                value={"expected": base_commit, "observed": final_head},
+            )
+        return ValidationResult(
+            parsed=parsed,
+            revisions=tuple(
+                RevisionPreview(item.stream, record)
+                for item, record in zip(parsed, equivalent_records, strict=True)
+            ),
+            warnings=warnings,
+            snapshot_identity_value=snapshot_identity(snapshot),
+            equivalent_records=equivalent_records,
+        )
     revisions = _preview(parsed, workspace, base_records)
     delta: dict[str, list[dict[str, Any]]] = {
         stream: [] for stream in workspace.profile.config.streams
@@ -365,7 +418,8 @@ def validate_snapshot(
     return ValidationResult(
         parsed=parsed,
         revisions=revisions,
-        warnings=replay_warnings(workspace, snapshot),
+        warnings=warnings,
+        snapshot_identity_value=snapshot_identity(snapshot),
     )
 
 
