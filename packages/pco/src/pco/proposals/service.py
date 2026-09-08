@@ -85,12 +85,14 @@ class ProposalService:
             result["error"].update(diagnostic)
             return result
 
-    def _require_active(self, review_id: str) -> Any:
+    def _require_active(
+        self, review_id: str, *, operation: str = "proposal_commit"
+    ) -> Any:
         active = self.paths.active_proposals()
         ensure(
             len(active) == 1 and active[0].name == review_id,
             "PROPOSAL_MANIFEST_MISMATCH",
-            "proposal_commit",
+            operation,
             "The requested review is not the single active proposal",
             path=str(self.paths.root / review_id),
             canonical_changed=False,
@@ -122,10 +124,12 @@ class ProposalService:
     def commit(self, review_id: str) -> dict[str, Any]:
         """Commit once, then independently archive and derive after lock release."""
 
-        manager = TransactionManager(self.workspace.repository, self.workspace.paths.tmp)
+        manager = TransactionManager(
+            self.workspace.repository, self.workspace.paths.tmp
+        )
         existing = find_proposal_receipt(self.workspace, review_id)
         if existing is not None:
-            manager._cleanup_application_attempt(  # noqa: SLF001 - verified recovery boundary
+            manager.cleanup_application_attempt(
                 existing["transaction_digest"], review_id=review_id
             )
             archive = _run_archive(self.workspace, existing)
@@ -141,7 +145,9 @@ class ProposalService:
             else:
                 active = self._require_active(review_id)
                 snapshot = capture_snapshot_from_root(active, include_local=True)
-                validated = validate_snapshot(snapshot, self.workspace, require_hashes=True)
+                validated = validate_snapshot(
+                    snapshot, self.workspace, require_hashes=True
+                )
                 request = build_commit_request(self.workspace, snapshot, validated)
                 if isinstance(request, SemanticNoOp):
                     return request.as_result()
@@ -150,7 +156,7 @@ class ProposalService:
                 receipt = request.receipt
         assert receipt is not None
         if existing is not None:
-            manager._cleanup_application_attempt(  # noqa: SLF001 - verified recovery boundary
+            manager.cleanup_application_attempt(
                 receipt["transaction_digest"], review_id=review_id
             )
         archive = _run_archive(self.workspace, receipt)
@@ -159,30 +165,21 @@ class ProposalService:
     def abort(self, review_id: str) -> dict[str, Any]:
         """Delete only the single matching active proposal, never canonical state."""
 
-        active = self._require_active(review_id)
-        ensure(
-            active.parent == self.paths.root and active.name == review_id,
-            "PROPOSAL_PATH_UNSAFE",
-            "proposal_abort",
-            "Abort target is outside the active proposal root",
-            path=str(active),
-            canonical_changed=False,
-            retry_safe=False,
-        )
         try:
-            remove_active_proposal(self.workspace.paths, review_id)
-        except OSError as exc:
+            return remove_active_proposal(self.workspace.paths, review_id)
+        except MemError:
+            raise
+        except (OSError, TypeError, ValueError, UnicodeError) as exc:
             raise MemError(
                 "PROPOSAL_PATH_UNSAFE",
                 "proposal_abort",
                 "Active proposal changed or contains an unsafe entry",
-                path=str(active),
+                path=str(self.paths.root / review_id),
                 value=str(exc),
                 recovery=["Inspect and restore one closed, real active proposal tree"],
                 canonical_changed=False,
                 retry_safe=False,
             ) from exc
-        return {"ok": True, "status": "aborted", "review_id": review_id}
 
 
 def derive_after_commit(_workspace: "Workspace") -> dict[str, Any]:
@@ -211,12 +208,12 @@ def _run_derivation(workspace: "Workspace") -> dict[str, Any]:
         return {"ok": False, "status": "failed", "error": str(exc)}
 
 
-def _run_archive(
-    workspace: "Workspace", receipt: dict[str, Any]
-) -> ArchiveResult:
+def _run_archive(workspace: "Workspace", receipt: dict[str, Any]) -> ArchiveResult:
     try:
         return archive_committed_proposal(workspace.paths, receipt)
-    except Exception as exc:  # canonical success must survive non-canonical archive failure
+    except (
+        Exception
+    ) as exc:  # canonical success must survive non-canonical archive failure
         active = workspace.paths.proposals / receipt["review_id"]
         committed = workspace.paths.proposals / ".committed" / receipt["receipt_id"]
         return ArchiveResult(

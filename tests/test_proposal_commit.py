@@ -82,11 +82,12 @@ def test_commit_is_atomic_idempotent_and_uses_no_persistent_transaction_state(
     monkeypatch.setattr(
         TransactionManager,
         "_save",
-        lambda *_args, **_kwargs: pytest.fail("application commit persisted TransactionState"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "application commit persisted TransactionState"
+        ),
     )
     before_tmp = sorted(
-        path.relative_to(workspace.paths.tmp)
-        for path in workspace.paths.tmp.rglob("*")
+        path.relative_to(workspace.paths.tmp) for path in workspace.paths.tmp.rglob("*")
     )
 
     first = ProposalService(workspace).commit("review_commit")
@@ -122,7 +123,9 @@ def test_derivation_runs_after_lock_release(
 def test_archive_failure_does_not_block_derivation_or_canonical_success(
     workspace, proposal_factory, business_markdown_factory, monkeypatch
 ) -> None:
-    root = _write_evidence_proposal(workspace, proposal_factory, business_markdown_factory)
+    root = _write_evidence_proposal(
+        workspace, proposal_factory, business_markdown_factory
+    )
     derived = []
     monkeypatch.setattr(
         "pco.proposals.archive.atomic_rename",
@@ -240,14 +243,17 @@ def test_commit_calls_application_path_with_lock_held_true(
 
     monkeypatch.setattr(TransactionManager, "commit_application", commit)
 
-    assert ProposalService(workspace).commit("review_commit")["canonical_status"] == "committed"
+    assert (
+        ProposalService(workspace).commit("review_commit")["canonical_status"]
+        == "committed"
+    )
 
 
 def test_retry_after_fast_forward_cleanup_crash_finds_receipt_and_does_not_recommit(
     workspace, proposal_factory, business_markdown_factory, monkeypatch
 ) -> None:
     _write_evidence_proposal(workspace, proposal_factory, business_markdown_factory)
-    real_cleanup = TransactionManager._cleanup_application_attempt
+    real_cleanup = TransactionManager.cleanup_application_attempt
     calls = 0
 
     def fail_once(manager, transaction_digest, *, review_id):
@@ -257,7 +263,7 @@ def test_retry_after_fast_forward_cleanup_crash_finds_receipt_and_does_not_recom
             raise RuntimeError("crash after canonical fast-forward")
         return real_cleanup(manager, transaction_digest, review_id=review_id)
 
-    monkeypatch.setattr(TransactionManager, "_cleanup_application_attempt", fail_once)
+    monkeypatch.setattr(TransactionManager, "cleanup_application_attempt", fail_once)
 
     with pytest.raises(RuntimeError, match="fast-forward"):
         ProposalService(workspace).commit("review_commit")
@@ -280,7 +286,9 @@ def test_retry_after_fast_forward_cleanup_crash_finds_receipt_and_does_not_recom
 def test_archive_only_retry_skips_stale_base_validation(
     workspace, proposal_factory, business_markdown_factory, monkeypatch
 ) -> None:
-    root = _write_evidence_proposal(workspace, proposal_factory, business_markdown_factory)
+    root = _write_evidence_proposal(
+        workspace, proposal_factory, business_markdown_factory
+    )
     real_rename = archive_module.atomic_rename
     failures = 1
 

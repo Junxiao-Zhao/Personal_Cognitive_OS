@@ -15,8 +15,12 @@ from pydantic import TypeAdapter, ValidationError
 
 from . import materials as material_reader
 from .materials import MAX_INPUT_MATERIAL_BYTES, CapturedMaterial, digest
-from .models import InputMaterial, LocalFileMaterial, ProposalArtifactMaterial, ProposalManifest
-
+from .models import (
+    InputMaterial,
+    LocalFileMaterial,
+    ProposalArtifactMaterial,
+    ProposalManifest,
+)
 
 MAX_IMMUTABLE_SNAPSHOT_BYTES = 67_108_864
 _READ_CHUNK_BYTES = 1024 * 1024
@@ -182,7 +186,9 @@ def _open_root(root: Path) -> tuple[int, tuple[int, int, int, int, int, int]]:
         and os.scandir in getattr(os, "supports_fd", set())
     )
     if not required:
-        raise _error("PROPOSAL_PATH_UNSAFE", "Safe proposal traversal is unavailable", path=root)
+        raise _error(
+            "PROPOSAL_PATH_UNSAFE", "Safe proposal traversal is unavailable", path=root
+        )
     try:
         observed = os.stat(root, follow_symlinks=False)
         descriptor = os.open(
@@ -190,7 +196,12 @@ def _open_root(root: Path) -> tuple[int, tuple[int, int, int, int, int, int]]:
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
     except OSError as exc:
-        raise _error("PROPOSAL_PATH_UNSAFE", "Proposal root cannot be opened safely", path=root, value=str(exc)) from exc
+        raise _error(
+            "PROPOSAL_PATH_UNSAFE",
+            "Proposal root cannot be opened safely",
+            path=root,
+            value=str(exc),
+        ) from exc
     try:
         try:
             anchored = os.fstat(descriptor)
@@ -201,8 +212,13 @@ def _open_root(root: Path) -> tuple[int, tuple[int, int, int, int, int, int]]:
                 path=root,
                 value=str(exc),
             ) from exc
-        if not stat.S_ISDIR(observed.st_mode) or _identity(observed)[:3] != _identity(anchored)[:3]:
-            raise _error("PROPOSAL_PATH_UNSAFE", "Proposal root changed while opening", path=root)
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or _identity(observed)[:3] != _identity(anchored)[:3]
+        ):
+            raise _error(
+                "PROPOSAL_PATH_UNSAFE", "Proposal root changed while opening", path=root
+            )
         return descriptor, _identity(anchored)
     except BaseException:
         os.close(descriptor)
@@ -213,13 +229,22 @@ def _named_stat(parent_fd: int, name: str, display: Path) -> os.stat_result:
     try:
         return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as exc:
-        raise _error("PROPOSAL_CHANGED_DURING_SNAPSHOT", "Proposal entry disappeared during capture", path=display, value=str(exc)) from exc
+        raise _error(
+            "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+            "Proposal entry disappeared during capture",
+            path=display,
+            value=str(exc),
+        ) from exc
 
 
 def _open_directory(parent_fd: int, name: str, display: Path) -> int:
     observed = _named_stat(parent_fd, name, display)
     if not stat.S_ISDIR(observed.st_mode):
-        raise _error("PROPOSAL_PATH_UNSAFE", "Proposal path component is not a real directory", path=display)
+        raise _error(
+            "PROPOSAL_PATH_UNSAFE",
+            "Proposal path component is not a real directory",
+            path=display,
+        )
     try:
         descriptor = os.open(
             name,
@@ -227,7 +252,12 @@ def _open_directory(parent_fd: int, name: str, display: Path) -> int:
             dir_fd=parent_fd,
         )
     except OSError as exc:
-        raise _error("PROPOSAL_PATH_UNSAFE", "Proposal directory cannot be opened without following links", path=display, value=str(exc)) from exc
+        raise _error(
+            "PROPOSAL_PATH_UNSAFE",
+            "Proposal directory cannot be opened without following links",
+            path=display,
+            value=str(exc),
+        ) from exc
     try:
         try:
             anchored = os.fstat(descriptor)
@@ -239,14 +269,20 @@ def _open_directory(parent_fd: int, name: str, display: Path) -> int:
                 value=str(exc),
             ) from exc
         if _identity(observed)[:3] != _identity(anchored)[:3]:
-            raise _error("PROPOSAL_CHANGED_DURING_SNAPSHOT", "Proposal directory changed while opening", path=display)
+            raise _error(
+                "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+                "Proposal directory changed while opening",
+                path=display,
+            )
         return descriptor
     except BaseException:
         os.close(descriptor)
         raise
 
 
-def _open_parent(root_fd: int, root: Path, path: PurePosixPath) -> tuple[list[int], int]:
+def _open_parent(
+    root_fd: int, root: Path, path: PurePosixPath
+) -> tuple[list[int], int]:
     anchors: list[int] = []
     current = root_fd
     display = root
@@ -276,25 +312,58 @@ def _read_exact(
     try:
         observed = _named_stat(parent, path.name, display)
         if not stat.S_ISREG(observed.st_mode):
-            raise _error("PROPOSAL_PATH_UNSAFE", "Proposal file must be a no-follow regular file", path=display)
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+            raise _error(
+                "PROPOSAL_PATH_UNSAFE",
+                "Proposal file must be a no-follow regular file",
+                path=display,
+            )
+        flags = (
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        )
         try:
             descriptor = os.open(path.name, flags, dir_fd=parent)
         except OSError as exc:
-            raise _error("PROPOSAL_PATH_UNSAFE", "Proposal file cannot be opened safely", path=display, value=str(exc)) from exc
+            raise _error(
+                "PROPOSAL_PATH_UNSAFE",
+                "Proposal file cannot be opened safely",
+                path=display,
+                value=str(exc),
+            ) from exc
         before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or _identity(observed)[:3] != _identity(before)[:3]:
-            raise _error("PROPOSAL_CHANGED_DURING_SNAPSHOT", "Proposal file changed while opening", path=display)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or _identity(observed)[:3] != _identity(before)[:3]
+        ):
+            raise _error(
+                "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+                "Proposal file changed while opening",
+                path=display,
+            )
         if before.st_size > limit:
-            raise _error("INPUT_MATERIAL_TOO_LARGE", "Proposal file exceeds its individual limit", path=display, value={"limit": limit})
+            raise _error(
+                "INPUT_MATERIAL_TOO_LARGE",
+                "Proposal file exceeds its individual limit",
+                path=display,
+                value={"limit": limit},
+            )
         data = bytearray()
         while True:
-            chunk = os.read(descriptor, min(_READ_CHUNK_BYTES, max(1, limit - len(data) + 1)))
+            chunk = os.read(
+                descriptor, min(_READ_CHUNK_BYTES, max(1, limit - len(data) + 1))
+            )
             if not chunk:
                 break
             if len(data) + len(chunk) > limit:
-                raise _error("INPUT_MATERIAL_TOO_LARGE", "Proposal file exceeds its individual limit", path=display, value={"limit": limit})
-            if aggregate_remaining is not None and len(data) + len(chunk) > aggregate_remaining:
+                raise _error(
+                    "INPUT_MATERIAL_TOO_LARGE",
+                    "Proposal file exceeds its individual limit",
+                    path=display,
+                    value={"limit": limit},
+                )
+            if (
+                aggregate_remaining is not None
+                and len(data) + len(chunk) > aggregate_remaining
+            ):
                 raise _error(
                     "PROPOSAL_SNAPSHOT_TOO_LARGE",
                     "Immutable proposal snapshot exceeds the aggregate byte limit while reading a proposal file",
@@ -304,10 +373,19 @@ def _read_exact(
             data.extend(chunk)
         after = os.fstat(descriptor)
         if _identity(after) != _identity(before):
-            raise _error("PROPOSAL_CHANGED_DURING_SNAPSHOT", "Proposal file changed while being read", path=display)
+            raise _error(
+                "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+                "Proposal file changed while being read",
+                path=display,
+            )
         return bytes(data), _identity(before)
     except OSError as exc:
-        raise _error("PROPOSAL_PATH_UNSAFE", "Proposal file could not be inspected or read", path=display, value=str(exc)) from exc
+        raise _error(
+            "PROPOSAL_PATH_UNSAFE",
+            "Proposal file could not be inspected or read",
+            path=display,
+            value=str(exc),
+        ) from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -321,9 +399,7 @@ def _enumerate_tree(root_fd: int, root: Path) -> tuple[TreeEntry, ...]:
     def walk(directory_fd: int, prefix: PurePosixPath) -> None:
         try:
             with os.scandir(directory_fd) as children:
-                observed = sorted(
-                    children, key=lambda item: item.name.encode("utf-8")
-                )
+                observed = sorted(children, key=lambda item: item.name.encode("utf-8"))
         except TypeError as exc:
             raise _error(
                 "PROPOSAL_PATH_UNSAFE",
@@ -339,16 +415,34 @@ def _enumerate_tree(root_fd: int, root: Path) -> tuple[TreeEntry, ...]:
                 value=str(exc),
             ) from exc
         except OSError as exc:
-            raise _error("PROPOSAL_PATH_UNSAFE", "Proposal directory cannot be enumerated safely", path=root / Path(*prefix.parts), value=str(exc)) from exc
+            raise _error(
+                "PROPOSAL_PATH_UNSAFE",
+                "Proposal directory cannot be enumerated safely",
+                path=root / Path(*prefix.parts),
+                value=str(exc),
+            ) from exc
         for child in observed:
-            relative = PurePosixPath(child.name) if str(prefix) == "." else prefix / child.name
+            relative = (
+                PurePosixPath(child.name) if str(prefix) == "." else prefix / child.name
+            )
             display = root / Path(*relative.parts)
             try:
                 info = child.stat(follow_symlinks=False)
             except OSError as exc:
-                raise _error("PROPOSAL_CHANGED_DURING_SNAPSHOT", "Proposal entry changed during enumeration", path=display, value=str(exc)) from exc
-            if stat.S_ISLNK(info.st_mode) or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
-                raise _error("PROPOSAL_PATH_UNSAFE", "Proposal tree contains a symlink or special file", path=display)
+                raise _error(
+                    "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+                    "Proposal entry changed during enumeration",
+                    path=display,
+                    value=str(exc),
+                ) from exc
+            if stat.S_ISLNK(info.st_mode) or not (
+                stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)
+            ):
+                raise _error(
+                    "PROPOSAL_PATH_UNSAFE",
+                    "Proposal tree contains a symlink or special file",
+                    path=display,
+                )
             kind = "directory" if stat.S_ISDIR(info.st_mode) else "file"
             entries.append(TreeEntry(relative, kind, _identity(info)))
             if kind == "directory":
@@ -363,11 +457,15 @@ def _enumerate_tree(root_fd: int, root: Path) -> tuple[TreeEntry, ...]:
     return tuple(entries)
 
 
-def _validate_closed_set(entries: tuple[TreeEntry, ...], manifest: ProposalManifest) -> None:
+def _validate_closed_set(
+    entries: tuple[TreeEntry, ...], manifest: ProposalManifest
+) -> None:
     expected_files = {PurePosixPath("manifest.json")}
     expected_files.update(item.path for item in manifest.files)
     expected_files.update(
-        item.path for item in manifest.input_material if isinstance(item, ProposalArtifactMaterial)
+        item.path
+        for item in manifest.input_material
+        if isinstance(item, ProposalArtifactMaterial)
     )
     actual_files = {item.path for item in entries if item.kind == "file"}
     if actual_files != expected_files:
@@ -375,22 +473,38 @@ def _validate_closed_set(entries: tuple[TreeEntry, ...], manifest: ProposalManif
             "PROPOSAL_MANIFEST_MISMATCH",
             "Proposal files do not equal the manifest closed set",
             value={
-                "missing": sorted((str(path) for path in expected_files - actual_files), key=lambda value: value.encode("utf-8")),
-                "unlisted": sorted((str(path) for path in actual_files - expected_files), key=lambda value: value.encode("utf-8")),
+                "missing": sorted(
+                    (str(path) for path in expected_files - actual_files),
+                    key=lambda value: value.encode("utf-8"),
+                ),
+                "unlisted": sorted(
+                    (str(path) for path in actual_files - expected_files),
+                    key=lambda value: value.encode("utf-8"),
+                ),
             },
         )
     required_directories: set[PurePosixPath] = set()
     for path in expected_files:
-        required_directories.update(parent for parent in path.parents if str(parent) != ".")
+        required_directories.update(
+            parent for parent in path.parents if str(parent) != "."
+        )
     for entry in entries:
         if entry.kind != "directory":
             continue
         path = entry.path
         legal_empty_top = len(path.parts) == 1 and path.name in _LEGAL_TOP_DIRECTORIES
         if path not in required_directories and not legal_empty_top:
-            raise _error("PROPOSAL_MANIFEST_MISMATCH", "Proposal tree contains an illegal directory", path=path)
+            raise _error(
+                "PROPOSAL_MANIFEST_MISMATCH",
+                "Proposal tree contains an illegal directory",
+                path=path,
+            )
         if len(path.parts) > 1 and path.parts[0] != "inputs":
-            raise _error("PROPOSAL_MANIFEST_MISMATCH", "Business directories cannot be nested", path=path)
+            raise _error(
+                "PROPOSAL_MANIFEST_MISMATCH",
+                "Business directories cannot be nested",
+                path=path,
+            )
 
 
 def _parse_manifest(data: bytes, root: Path) -> ProposalManifest:
@@ -415,8 +529,19 @@ def _parse_manifest(data: bytes, root: Path) -> ProposalManifest:
         return manifest
     except MemError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
-        raise _error("PROPOSAL_MANIFEST_MISMATCH", "manifest.json is not a valid proposal manifest", path=root / "manifest.json", value=str(exc)) from exc
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValidationError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise _error(
+            "PROPOSAL_MANIFEST_MISMATCH",
+            "manifest.json is not a valid proposal manifest",
+            path=root / "manifest.json",
+            value=str(exc),
+        ) from exc
 
 
 def _budget(total: int, addition: int) -> int:
@@ -424,12 +549,17 @@ def _budget(total: int, addition: int) -> int:
         raise _error(
             "PROPOSAL_SNAPSHOT_TOO_LARGE",
             "Immutable proposal snapshot exceeds the aggregate byte limit",
-            value={"limit": MAX_IMMUTABLE_SNAPSHOT_BYTES, "observed_at_least": total + addition},
+            value={
+                "limit": MAX_IMMUTABLE_SNAPSHOT_BYTES,
+                "observed_at_least": total + addition,
+            },
         )
     return total + addition
 
 
-def _aggregate_guard(remaining: int, *, value: Any) -> material_reader.NormalizedByteGuard:
+def _aggregate_guard(
+    remaining: int, *, value: Any
+) -> material_reader.NormalizedByteGuard:
     def guard(current: int, addition: int) -> None:
         if addition < 0 or current > remaining - addition:
             raise _error(
@@ -444,15 +574,15 @@ def _aggregate_guard(remaining: int, *, value: Any) -> material_reader.Normalize
     return guard
 
 
-def _capture(
-    proposal_root: Path,
+def _capture_anchored(
+    root_fd: int,
+    root: Path,
+    root_identity: tuple[int, int, int, int, int, int],
     expected_manifest: ProposalManifest | None,
     *,
     include_local: bool,
     expected_review_id: str | None = None,
 ) -> ProposalSnapshot:
-    root = Path(proposal_root)
-    root_fd, root_identity = _open_root(root)
     try:
         try:
             manifest_bytes, manifest_identity = _read_exact(
@@ -473,17 +603,26 @@ def _capture(
         total = _budget(0, len(manifest_bytes))
         manifest = _parse_manifest(manifest_bytes, root)
         if manifest.review_id != (expected_review_id or root.name):
-            raise _error("PROPOSAL_MANIFEST_MISMATCH", "Manifest review_id does not match its proposal root", path=root)
-        if expected_manifest is not None and manifest.model_dump(mode="json") != expected_manifest.model_dump(mode="json"):
-            raise _error("PROPOSAL_MANIFEST_MISMATCH", "Supplied manifest does not match exact manifest.json bytes", path=root / "manifest.json")
+            raise _error(
+                "PROPOSAL_MANIFEST_MISMATCH",
+                "Manifest review_id does not match its proposal root",
+                path=root,
+            )
+        if expected_manifest is not None and manifest.model_dump(
+            mode="json"
+        ) != expected_manifest.model_dump(mode="json"):
+            raise _error(
+                "PROPOSAL_MANIFEST_MISMATCH",
+                "Supplied manifest does not match exact manifest.json bytes",
+                path=root / "manifest.json",
+            )
 
         before_tree = _enumerate_tree(root_fd, root)
         enumerated_manifest = next(
             (
                 entry
                 for entry in before_tree
-                if entry.path == PurePosixPath("manifest.json")
-                and entry.kind == "file"
+                if entry.path == PurePosixPath("manifest.json") and entry.kind == "file"
             ),
             None,
         )
@@ -498,7 +637,9 @@ def _capture(
             )
         _validate_closed_set(before_tree, manifest)
         business: list[CapturedBusinessFile] = []
-        for listed in sorted(manifest.files, key=lambda item: item.path.as_posix().encode("utf-8")):
+        for listed in sorted(
+            manifest.files, key=lambda item: item.path.as_posix().encode("utf-8")
+        ):
             data, identity = _read_exact(
                 root_fd,
                 root,
@@ -507,10 +648,16 @@ def _capture(
                 aggregate_remaining=MAX_IMMUTABLE_SNAPSHOT_BYTES - total,
             )
             total = _budget(total, len(data))
-            business.append(CapturedBusinessFile(listed.path, listed.operation, data, digest(data), identity))
+            business.append(
+                CapturedBusinessFile(
+                    listed.path, listed.operation, data, digest(data), identity
+                )
+            )
 
         materials: list[_MaterialValue] = []
-        for descriptor in sorted(manifest.input_material, key=lambda item: item.material_id.encode("utf-8")):
+        for descriptor in sorted(
+            manifest.input_material, key=lambda item: item.material_id.encode("utf-8")
+        ):
             if isinstance(descriptor, LocalFileMaterial):
                 if not include_local:
                     continue
@@ -524,9 +671,14 @@ def _capture(
                     ),
                 )
             else:
-                raw, identity6 = _read_exact(root_fd, root, descriptor.path, limit=MAX_INPUT_MATERIAL_BYTES)
+                raw, identity6 = _read_exact(
+                    root_fd, root, descriptor.path, limit=MAX_INPUT_MATERIAL_BYTES
+                )
                 _ignored_raw, normalized = material_reader.normalize_utf8_stream(
-                    (raw[index : index + _READ_CHUNK_BYTES] for index in range(0, len(raw), _READ_CHUNK_BYTES)),
+                    (
+                        raw[index : index + _READ_CHUNK_BYTES]
+                        for index in range(0, len(raw), _READ_CHUNK_BYTES)
+                    ),
                     limit=MAX_INPUT_MATERIAL_BYTES,
                     capture_raw=False,
                     normalized_byte_guard=_aggregate_guard(
@@ -544,7 +696,10 @@ def _capture(
                 )
             total = _budget(total, len(captured.normalized_bytes))
             descriptor_json = json.dumps(
-                captured.material.model_dump(mode="json"), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                captured.material.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
             ).encode("utf-8")
             materials.append(
                 _MaterialValue(
@@ -559,11 +714,20 @@ def _capture(
 
         after_tree = _enumerate_tree(root_fd, root)
         try:
-            named_root = os.stat(root, follow_symlinks=False)
+            anchored_root = os.fstat(root_fd)
         except OSError as exc:
-            raise _error("PROPOSAL_CHANGED_DURING_SNAPSHOT", "Proposal root changed during capture", path=root, value=str(exc)) from exc
-        if after_tree != before_tree or _identity(named_root) != root_identity:
-            raise _error("PROPOSAL_CHANGED_DURING_SNAPSHOT", "Proposal tree changed during capture", path=root)
+            raise _error(
+                "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+                "Proposal root changed during capture",
+                path=root,
+                value=str(exc),
+            ) from exc
+        if after_tree != before_tree or _identity(anchored_root) != root_identity:
+            raise _error(
+                "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+                "Proposal tree changed during capture",
+                path=root,
+            )
         return ProposalSnapshot(
             manifest_bytes=manifest_bytes,
             business_files=tuple(business),
@@ -571,8 +735,80 @@ def _capture(
             tree_entries=before_tree,
             total_bytes=total,
         )
+    except (MemError, OSError, TypeError, ValueError, UnicodeError):
+        raise
+
+
+def _capture(
+    proposal_root: Path,
+    expected_manifest: ProposalManifest | None,
+    *,
+    include_local: bool,
+    expected_review_id: str | None = None,
+) -> ProposalSnapshot:
+    root = Path(proposal_root)
+    root_fd, root_identity = _open_root(root)
+    try:
+        snapshot = _capture_anchored(
+            root_fd,
+            root,
+            root_identity,
+            expected_manifest,
+            include_local=include_local,
+            expected_review_id=expected_review_id,
+        )
+        try:
+            named_root = os.stat(root, follow_symlinks=False)
+        except OSError as exc:
+            raise _error(
+                "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+                "Proposal root changed during capture",
+                path=root,
+                value=str(exc),
+            ) from exc
+        if _identity(named_root) != root_identity:
+            raise _error(
+                "PROPOSAL_CHANGED_DURING_SNAPSHOT",
+                "Proposal root changed during capture",
+                path=root,
+            )
+        return snapshot
     finally:
         os.close(root_fd)
+
+
+def capture_snapshot_from_descriptor(
+    proposal_fd: int,
+    proposal_root: Path,
+    *,
+    include_local: bool,
+    expected_review_id: str | None = None,
+) -> ProposalSnapshot:
+    """Capture through a caller-owned, already no-follow-anchored directory."""
+
+    try:
+        anchored = os.fstat(proposal_fd)
+    except OSError as exc:
+        raise _error(
+            "PROPOSAL_PATH_UNSAFE",
+            "Anchored proposal descriptor cannot be inspected",
+            path=proposal_root,
+            value=str(exc),
+        ) from exc
+    if not stat.S_ISDIR(anchored.st_mode):
+        raise _error(
+            "PROPOSAL_PATH_UNSAFE",
+            "Anchored proposal descriptor is not a directory",
+            path=proposal_root,
+        )
+    return _capture_anchored(
+        proposal_fd,
+        Path(proposal_root),
+        _identity(anchored),
+        None,
+        include_local=include_local,
+        expected_review_id=expected_review_id,
+    )
 
 
 def capture_snapshot(

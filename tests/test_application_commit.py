@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -384,7 +385,14 @@ def test_cleanup_failure_reports_committed_canonical_and_safe_retry(
     manager = TransactionManager(
         pco_repository, pco_repository.root.parent / "application-state"
     )
-    monkeypatch.setattr(pco_repository, "remove_worktree", lambda _path: None)
+    real_git = pco_repository._git
+
+    def skip_prune(*args, **kwargs):
+        if args == ("worktree", "prune"):
+            return ""
+        return real_git(*args, **kwargs)
+
+    monkeypatch.setattr(pco_repository, "_git", skip_prune)
 
     with pytest.raises(MemError) as exc:
         manager.commit_application(application_request)
@@ -394,6 +402,139 @@ def test_cleanup_failure_reports_committed_canonical_and_safe_retry(
     assert exc.value.detail.canonical_changed is True
     assert exc.value.detail.retry_safe is True
     assert exc.value.detail.recovery == ["pco proposal commit review_application_1"]
+
+
+def test_public_cleanup_rejects_symlinked_attempt_without_removing_foreign_worktree(
+    pco_repository: MemoryRepository,
+    application_request: ApplicationCommitRequest,
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    application_root = state_root / "application-worktrees"
+    application_root.mkdir(parents=True)
+    manager = TransactionManager(pco_repository, state_root)
+    attempt = manager._application_attempt_dir(application_request.transaction_digest)
+    foreign_attempt = tmp_path / "foreign-attempt"
+    foreign_worktree = foreign_attempt / "worktree"
+    pco_repository.add_worktree(foreign_worktree, pco_repository.head())
+    sentinel = foreign_worktree / "UNOWNED_SENTINEL"
+    sentinel.write_text("must survive\n", encoding="utf-8")
+    attempt.symlink_to(foreign_attempt, target_is_directory=True)
+    before = git_worktree_paths(pco_repository)
+
+    with pytest.raises(MemError) as exc:
+        manager.cleanup_application_attempt(
+            application_request.transaction_digest,
+            review_id=application_request.receipt["review_id"],
+        )
+
+    assert exc.value.detail.code == "CANONICAL_WORKTREE_CLEANUP_FAILED"
+    assert exc.value.detail.canonical_changed is True
+    assert exc.value.detail.retry_safe is True
+    assert sentinel.read_text(encoding="utf-8") == "must survive\n"
+    assert foreign_worktree.is_dir()
+    assert git_worktree_paths(pco_repository) == before
+
+
+def test_public_cleanup_rejects_symlinked_worktree_without_removing_foreign_registration(
+    pco_repository: MemoryRepository,
+    application_request: ApplicationCommitRequest,
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    manager = TransactionManager(pco_repository, state_root)
+    attempt = manager._application_attempt_dir(application_request.transaction_digest)
+    attempt.mkdir(parents=True)
+    foreign_worktree = tmp_path / "foreign-worktree"
+    pco_repository.add_worktree(foreign_worktree, pco_repository.head())
+    (attempt / "worktree").symlink_to(foreign_worktree, target_is_directory=True)
+    before = git_worktree_paths(pco_repository)
+
+    with pytest.raises(MemError) as exc:
+        manager.cleanup_application_attempt(
+            application_request.transaction_digest,
+            review_id=application_request.receipt["review_id"],
+        )
+
+    assert exc.value.detail.code == "CANONICAL_WORKTREE_CLEANUP_FAILED"
+    assert foreign_worktree.is_dir()
+    assert git_worktree_paths(pco_repository) == before
+
+
+def test_public_cleanup_prunes_only_missing_owned_registration_and_preserves_real_worktrees(
+    pco_repository: MemoryRepository,
+    application_request: ApplicationCommitRequest,
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    manager = TransactionManager(pco_repository, state_root)
+    owned = manager._application_worktree_path(application_request.transaction_digest)
+    foreign = tmp_path / "foreign-real-worktree"
+    pco_repository.add_worktree(owned, pco_repository.head())
+    pco_repository.add_worktree(foreign, pco_repository.head())
+    foreign_head = pco_repository._git("rev-parse", "HEAD", cwd=foreign)
+
+    manager.cleanup_application_attempt(
+        application_request.transaction_digest,
+        review_id=application_request.receipt["review_id"],
+    )
+
+    assert not owned.exists()
+    assert foreign.is_dir()
+    assert pco_repository._git("rev-parse", "HEAD", cwd=foreign) == foreign_head
+    assert str(foreign.absolute()) in git_worktree_paths(pco_repository)
+
+
+@pytest.mark.parametrize("swap", ["attempt", "worktree"])
+def test_public_cleanup_rejects_parent_or_worktree_swap_before_destructive_git_cleanup(
+    pco_repository: MemoryRepository,
+    application_request: ApplicationCommitRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swap: str,
+) -> None:
+    state_root = tmp_path / "state"
+    manager = TransactionManager(pco_repository, state_root)
+    attempt = manager._application_attempt_dir(application_request.transaction_digest)
+    worktree = attempt / "worktree"
+    pco_repository.add_worktree(worktree, pco_repository.head())
+    displaced = tmp_path / f"displaced-{swap}"
+    foreign_attempt = tmp_path / f"foreign-{swap}"
+    foreign_worktree = foreign_attempt / "worktree"
+    pco_repository.add_worktree(foreign_worktree, pco_repository.head())
+    sentinel = foreign_worktree / "UNOWNED_SENTINEL"
+    sentinel.write_text("must survive\n", encoding="utf-8")
+    real_detach = TransactionManager._cleanup_rename_noreplace
+    swapped = False
+
+    def swap_before_detach(parent_fd, source, target, expected):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            if swap == "attempt":
+                attempt.rename(displaced)
+                attempt.symlink_to(foreign_attempt, target_is_directory=True)
+            else:
+                worktree.rename(displaced)
+                worktree.symlink_to(foreign_worktree, target_is_directory=True)
+        return real_detach(parent_fd, source, target, expected)
+
+    monkeypatch.setattr(
+        TransactionManager,
+        "_cleanup_rename_noreplace",
+        staticmethod(swap_before_detach),
+    )
+
+    with pytest.raises(MemError) as exc:
+        manager.cleanup_application_attempt(
+            application_request.transaction_digest,
+            review_id=application_request.receipt["review_id"],
+        )
+
+    assert exc.value.detail.code == "CANONICAL_WORKTREE_CLEANUP_FAILED"
+    assert sentinel.read_text(encoding="utf-8") == "must survive\n"
+    assert displaced.is_dir()
+    assert foreign_worktree.is_dir()
 
 
 def test_unrelated_head_advance_without_digest_is_stale(
