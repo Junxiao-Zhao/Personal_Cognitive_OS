@@ -19,7 +19,6 @@ from .models import ProposalArtifactReceiptMaterial, ProposalCommitReceipt
 from .snapshot import (
     ProposalSnapshot,
     capture_snapshot_from_descriptor,
-    capture_snapshot_from_root,
 )
 
 
@@ -61,18 +60,6 @@ def _warning(status: str, active: Path, target: Path, message: str) -> ArchiveRe
     )
 
 
-def _lstat_kind(path: Path) -> str:
-    try:
-        info = os.stat(path, follow_symlinks=False)
-    except FileNotFoundError:
-        return "missing"
-    except OSError:
-        return "unsafe"
-    if stat.S_ISDIR(info.st_mode):
-        return "directory"
-    return "unsafe"
-
-
 def _snapshot_matches_receipt(
     snapshot: ProposalSnapshot, receipt: ProposalCommitReceipt
 ) -> bool:
@@ -96,16 +83,6 @@ def _snapshot_matches_receipt(
     return artifacts == expected_artifacts
 
 
-def _tree_matches_receipt(root: Path, receipt: ProposalCommitReceipt) -> bool:
-    try:
-        snapshot = capture_snapshot_from_root(
-            root, include_local=False, expected_review_id=receipt.review_id
-        )
-    except (MemError, OSError, TypeError, ValueError):
-        return False
-    return _snapshot_matches_receipt(snapshot, receipt)
-
-
 def _anchored_tree_matches_receipt(
     directory_fd: int, display: Path, receipt: ProposalCommitReceipt
 ) -> bool:
@@ -119,22 +96,6 @@ def _anchored_tree_matches_receipt(
     except (MemError, OSError, TypeError, ValueError, UnicodeError):
         return False
     return _snapshot_matches_receipt(snapshot, receipt)
-
-
-def _verified_tree_identity(
-    root: Path, receipt: ProposalCommitReceipt
-) -> tuple[int, int, int, int, int, int] | None:
-    try:
-        before = os.stat(root, follow_symlinks=False)
-    except OSError:
-        return None
-    if not stat.S_ISDIR(before.st_mode) or not _tree_matches_receipt(root, receipt):
-        return None
-    try:
-        after = os.stat(root, follow_symlinks=False)
-    except OSError:
-        return None
-    return _identity(after) if _identity(after) == _identity(before) else None
 
 
 def _identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
@@ -198,6 +159,8 @@ def _recheck_child(
 
 
 def atomic_rename(
+    workspace_parent_fd: int,
+    workspace_name: str,
     workspace_fd: int,
     proposals_name: str,
     root_fd: int,
@@ -206,6 +169,7 @@ def atomic_rename(
     committed_fd: int,
     target_name: str,
     workspace_root: Path,
+    expected_workspace_identity: tuple[int, int, int, int, int, int],
     expected_root_identity: tuple[int, int, int, int, int, int],
     expected_active_identity: tuple[int, int, int, int, int, int],
     expected_committed_identity: tuple[int, int, int, int, int, int],
@@ -220,6 +184,12 @@ def atomic_rename(
 
     active_display = workspace_root / proposals_name / active_name
     committed_display = workspace_root / proposals_name / ".committed"
+    _recheck_child(
+        workspace_parent_fd,
+        workspace_name,
+        expected_workspace_identity,
+        workspace_root,
+    )
     _recheck_child(
         workspace_fd,
         proposals_name,
@@ -242,6 +212,12 @@ def atomic_rename(
         )
     # These are the only path lookups between the complete receipt recheck and
     # renameat2. They bind the source/destination names to the verified inodes.
+    _recheck_child(
+        workspace_parent_fd,
+        workspace_name,
+        expected_workspace_identity,
+        workspace_root,
+    )
     _recheck_child(
         workspace_fd,
         proposals_name,
@@ -280,6 +256,12 @@ def atomic_rename(
         code = ctypes.get_errno()
         raise OSError(code, os.strerror(code), target_name)
     _recheck_child(
+        workspace_parent_fd,
+        workspace_name,
+        expected_workspace_identity,
+        workspace_root,
+    )
+    _recheck_child(
         workspace_fd,
         proposals_name,
         expected_root_identity,
@@ -310,11 +292,15 @@ def _rename_exact_active(
     receipt: ProposalCommitReceipt,
 ) -> None:
     workspace_root = root.parent
-    workspace_fd, _workspace_identity = _open_directory(workspace_root)
+    workspace_parent_fd, _ = _open_directory(workspace_root.parent)
+    workspace_fd: int | None = None
     root_fd: int | None = None
     active_fd: int | None = None
     committed_fd: int | None = None
     try:
+        workspace_fd, workspace_identity = _open_child_directory(
+            workspace_parent_fd, workspace_root.name, workspace_root
+        )
         root_fd, root_identity = _open_child_directory(workspace_fd, root.name, root)
         try:
             os.mkdir(".committed", mode=0o700, dir_fd=root_fd)
@@ -327,6 +313,8 @@ def _rename_exact_active(
         if active_identity != expected_active_identity:
             raise OSError("active proposal is no longer a directory")
         atomic_rename(
+            workspace_parent_fd,
+            workspace_root.name,
             workspace_fd,
             root.name,
             root_fd,
@@ -335,6 +323,7 @@ def _rename_exact_active(
             committed_fd,
             target.name,
             workspace_root,
+            workspace_identity,
             root_identity,
             active_identity,
             committed_identity,
@@ -347,7 +336,130 @@ def _rename_exact_active(
             os.close(committed_fd)
         if root_fd is not None:
             os.close(root_fd)
-        os.close(workspace_fd)
+        if workspace_fd is not None:
+            os.close(workspace_fd)
+        os.close(workspace_parent_fd)
+
+
+def _archive_declared_state(
+    root: Path,
+    active: Path,
+    target: Path,
+    receipt: ProposalCommitReceipt,
+    expected_active_identity: tuple[int, int, int, int, int, int] | None = None,
+) -> tuple[str, tuple[int, int, int, int, int, int] | None]:
+    """Classify only a receipt-bound tree in the complete declared hierarchy."""
+
+    workspace_parent_fd: int | None = None
+    workspace_fd: int | None = None
+    root_fd: int | None = None
+    committed_fd: int | None = None
+    active_fd: int | None = None
+    target_fd: int | None = None
+    try:
+        workspace_root = root.parent
+        workspace_parent_fd, _ = _open_directory(workspace_root.parent)
+        workspace_fd, workspace_identity = _open_child_directory(
+            workspace_parent_fd, workspace_root.name, workspace_root
+        )
+        root_fd, root_identity = _open_child_directory(workspace_fd, root.name, root)
+        try:
+            committed_fd, committed_identity = _open_child_directory(
+                root_fd, ".committed", root / ".committed"
+            )
+        except FileNotFoundError:
+            committed_identity = None
+        try:
+            active_fd, active_identity = _open_child_directory(
+                root_fd, active.name, active
+            )
+        except FileNotFoundError:
+            active_identity = None
+        if committed_fd is None:
+            target_identity = None
+        else:
+            try:
+                target_fd, target_identity = _open_child_directory(
+                    committed_fd, target.name, target
+                )
+            except FileNotFoundError:
+                target_identity = None
+        if active_identity is None and target_identity is None:
+            state = "missing"
+            selected_identity = None
+        elif active_identity is not None and target_identity is not None:
+            return "conflict", None
+        elif target_fd is not None and target_identity is not None:
+            if (
+                expected_active_identity is not None
+                and target_identity[:3] != expected_active_identity[:3]
+            ) or not _anchored_tree_matches_receipt(target_fd, target, receipt):
+                return "conflict", None
+            state = "archived"
+            selected_identity = target_identity
+        elif active_fd is not None and active_identity is not None:
+            if (
+                expected_active_identity is not None
+                and active_identity[:3] != expected_active_identity[:3]
+            ) or not _anchored_tree_matches_receipt(active_fd, active, receipt):
+                return "conflict", None
+            state = "ready"
+            selected_identity = active_identity
+        else:
+            return "conflict", None
+
+        _recheck_child(
+            workspace_parent_fd,
+            workspace_root.name,
+            workspace_identity,
+            workspace_root,
+        )
+        _recheck_child(workspace_fd, root.name, root_identity, root)
+        if committed_fd is not None and committed_identity is not None:
+            _recheck_child(
+                root_fd, ".committed", committed_identity, root / ".committed"
+            )
+        else:
+            try:
+                os.stat(".committed", dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                return "conflict", None
+        if active_identity is None:
+            try:
+                os.stat(active.name, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                return "conflict", None
+        else:
+            _recheck_child(root_fd, active.name, active_identity, active)
+        if target_identity is None:
+            if committed_fd is not None:
+                try:
+                    os.stat(target.name, dir_fd=committed_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    return "conflict", None
+        else:
+            assert committed_fd is not None
+            _recheck_child(committed_fd, target.name, target_identity, target)
+        return state, selected_identity
+    except (MemError, OSError, TypeError, ValueError, UnicodeError):
+        return "conflict", None
+    finally:
+        for descriptor in (
+            target_fd,
+            active_fd,
+            committed_fd,
+            root_fd,
+            workspace_fd,
+            workspace_parent_fd,
+        ):
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _archive_poststate(
@@ -357,54 +469,10 @@ def _archive_poststate(
     receipt: ProposalCommitReceipt,
     expected_active_identity: tuple[int, int, int, int, int, int],
 ) -> str:
-    """Classify an uncertain rename through one newly anchored named hierarchy."""
-
-    workspace_fd: int | None = None
-    root_fd: int | None = None
-    committed_fd: int | None = None
-    active_fd: int | None = None
-    target_fd: int | None = None
-    try:
-        workspace_fd, _ = _open_directory(root.parent)
-        root_fd, _ = _open_child_directory(workspace_fd, root.name, root)
-        committed_fd, _ = _open_child_directory(
-            root_fd, ".committed", root / ".committed"
-        )
-        try:
-            active_fd, active_identity = _open_child_directory(
-                root_fd, active.name, active
-            )
-        except FileNotFoundError:
-            active_identity = None
-        try:
-            target_fd, target_identity = _open_child_directory(
-                committed_fd, target.name, target
-            )
-        except FileNotFoundError:
-            target_identity = None
-        if (
-            active_identity is None
-            and target_fd is not None
-            and target_identity is not None
-            and target_identity[:3] == expected_active_identity[:3]
-            and _anchored_tree_matches_receipt(target_fd, target, receipt)
-        ):
-            return "archived"
-        if (
-            target_identity is None
-            and active_fd is not None
-            and active_identity is not None
-            and active_identity[:3] == expected_active_identity[:3]
-            and _anchored_tree_matches_receipt(active_fd, active, receipt)
-        ):
-            return "pending"
-        return "conflict"
-    except (MemError, OSError, TypeError, ValueError, UnicodeError):
-        return "conflict"
-    finally:
-        for descriptor in (target_fd, active_fd, committed_fd, root_fd, workspace_fd):
-            if descriptor is not None:
-                os.close(descriptor)
+    state, _ = _archive_declared_state(
+        root, active, target, receipt, expected_active_identity
+    )
+    return "pending" if state == "ready" else state
 
 
 def archive_committed_proposal(paths: Any, receipt_value: Any) -> ArchiveResult:
@@ -419,40 +487,21 @@ def archive_committed_proposal(paths: Any, receipt_value: Any) -> ArchiveResult:
     active = root / receipt.review_id
     committed_root = root / ".committed"
     target = committed_root / receipt.receipt_id
-    committed_root_kind = _lstat_kind(committed_root)
-    if committed_root_kind not in {"missing", "directory"}:
-        return _warning(
-            "conflict",
-            active,
-            target,
-            "Committed proposal root is not a real directory",
-        )
-    active_kind = _lstat_kind(active)
-    target_kind = _lstat_kind(target)
-    if active_kind == "missing" and target_kind == "missing":
+    state, active_identity = _archive_declared_state(root, active, target, receipt)
+    if state == "missing":
         return _warning(
             "missing", active, target, "Neither review artifact path exists"
         )
-    if active_kind != "missing" and target_kind != "missing":
-        return _warning(
-            "conflict", active, target, "Active and committed review paths both exist"
-        )
-    if target_kind != "missing":
-        if (
-            target_kind == "directory"
-            and _verified_tree_identity(target, receipt) is not None
-        ):
-            return ArchiveResult("archived", str(active), str(target))
+    if state == "archived":
+        return ArchiveResult("archived", str(active), str(target))
+    if state == "conflict":
         return _warning(
             "conflict",
             active,
             target,
-            "Committed destination does not match its receipt",
+            "Declared proposal hierarchy does not name one exact receipt-bound tree",
         )
-    active_identity = (
-        _verified_tree_identity(active, receipt) if active_kind == "directory" else None
-    )
-    if active_identity is None:
+    if state != "ready" or active_identity is None:
         return _warning(
             "conflict",
             active,
@@ -680,6 +729,32 @@ def _detach_active_noreplace(
     )
 
 
+def _abort_detach_poststate(
+    proposals_fd: int,
+    quarantine_fd: int,
+    *,
+    active_name: str,
+    tombstone_name: str,
+    active_identity: tuple[int, int, int, int, int, int],
+) -> str:
+    """Classify an uncertain detach using only the retained parent anchors."""
+
+    def identity_or_none(parent_fd: int, name: str):
+        try:
+            return _identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False))
+        except FileNotFoundError:
+            return None
+
+    source = identity_or_none(proposals_fd, active_name)
+    tombstone = identity_or_none(quarantine_fd, tombstone_name)
+    expected = active_identity[:3]
+    if source is None and tombstone is not None and tombstone[:3] == expected:
+        return "detached"
+    if tombstone is None and source is not None and source[:3] == expected:
+        return "active"
+    return "conflict"
+
+
 def remove_active_proposal(paths: Any, review_id: str) -> dict[str, Any]:
     """Atomically remove one active name, then clean only its quarantine inode."""
 
@@ -748,22 +823,50 @@ def remove_active_proposal(paths: Any, review_id: str) -> dict[str, Any]:
             root_fd, review_id, root / review_id
         )
         _preflight_safe_tree(active_fd, root / review_id)
-        _detach_active_noreplace(
-            workspace_fd,
-            root_fd,
-            pco_fd,
-            tmp_fd,
-            quarantine_fd,
-            workspace_root=workspace_root,
-            proposals_identity=root_identity,
-            pco_identity=pco_identity,
-            tmp_identity=tmp_identity,
-            quarantine_identity=quarantine_identity,
-            active_name=review_id,
-            active_fd=active_fd,
-            active_identity=active_identity,
-            tombstone_name=tombstone_name,
-        )
+        try:
+            _detach_active_noreplace(
+                workspace_fd,
+                root_fd,
+                pco_fd,
+                tmp_fd,
+                quarantine_fd,
+                workspace_root=workspace_root,
+                proposals_identity=root_identity,
+                pco_identity=pco_identity,
+                tmp_identity=tmp_identity,
+                quarantine_identity=quarantine_identity,
+                active_name=review_id,
+                active_fd=active_fd,
+                active_identity=active_identity,
+                tombstone_name=tombstone_name,
+            )
+        except (OSError, TypeError, ValueError, UnicodeError) as exc:
+            poststate = _abort_detach_poststate(
+                root_fd,
+                quarantine_fd,
+                active_name=review_id,
+                tombstone_name=tombstone_name,
+                active_identity=active_identity,
+            )
+            if poststate == "active":
+                raise
+            if poststate != "detached":
+                raise MemError(
+                    "PROPOSAL_ABORT_CONFLICT",
+                    "proposal_abort",
+                    "Abort detach acknowledgement is ambiguous; no tree was deleted",
+                    path=str(root / review_id),
+                    value={
+                        "active_path": str(root / review_id),
+                        "quarantine_path": str(quarantine_path),
+                        "error": str(exc),
+                    },
+                    recovery=[
+                        "Preserve both reported paths and inspect their identities"
+                    ],
+                    canonical_changed=False,
+                    retry_safe=False,
+                ) from exc
         try:
             _remove_tree(active_fd, quarantine_path)
             _recheck_child(

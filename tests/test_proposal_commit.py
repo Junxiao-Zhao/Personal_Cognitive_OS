@@ -256,12 +256,18 @@ def test_retry_after_fast_forward_cleanup_crash_finds_receipt_and_does_not_recom
     real_cleanup = TransactionManager.cleanup_application_attempt
     calls = 0
 
-    def fail_once(manager, transaction_digest, *, review_id):
+    def fail_once(manager, transaction_digest, *, review_id, canonical_changed=True):
         nonlocal calls
-        calls += 1
-        if calls == 1:
+        if canonical_changed:
+            calls += 1
+        if canonical_changed and calls == 1:
             raise RuntimeError("crash after canonical fast-forward")
-        return real_cleanup(manager, transaction_digest, review_id=review_id)
+        return real_cleanup(
+            manager,
+            transaction_digest,
+            review_id=review_id,
+            canonical_changed=canonical_changed,
+        )
 
     monkeypatch.setattr(TransactionManager, "cleanup_application_attempt", fail_once)
 

@@ -182,20 +182,24 @@ def test_archive_does_not_rename_a_tree_replaced_after_hash_verification(
     root, receipt = _archive_fixture(
         workspace, proposal_factory, business_markdown_factory
     )
-    real_capture = archive_module.capture_snapshot_from_root
+    real_verify = archive_module._anchored_tree_matches_receipt
+    replaced = False
 
-    def capture_then_replace(*args, **kwargs):
-        snapshot = real_capture(*args, **kwargs)
-        displaced = root.with_name("review_displaced")
-        root.rename(displaced)
-        shutil.copytree(displaced, root)
-        (root / "evidence/ev_archive.md").write_text(
-            "attacker replacement\n", encoding="utf-8"
-        )
-        return snapshot
+    def verify_then_replace(*args, **kwargs):
+        nonlocal replaced
+        result = real_verify(*args, **kwargs)
+        if result and not replaced:
+            replaced = True
+            displaced = root.with_name("review_displaced")
+            root.rename(displaced)
+            shutil.copytree(displaced, root)
+            (root / "evidence/ev_archive.md").write_text(
+                "attacker replacement\n", encoding="utf-8"
+            )
+        return result
 
     monkeypatch.setattr(
-        archive_module, "capture_snapshot_from_root", capture_then_replace
+        archive_module, "_anchored_tree_matches_receipt", verify_then_replace
     )
 
     result = archive_committed_proposal(workspace.paths, receipt)
@@ -324,6 +328,68 @@ def test_archive_rejects_proposals_root_swap_at_atomic_boundary(
     assert proposals.is_dir()
 
 
+def test_archive_rejects_workspace_root_swap_at_atomic_boundary(
+    workspace, proposal_factory, business_markdown_factory, monkeypatch
+) -> None:
+    root, receipt = _archive_fixture(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    workspace_root = workspace.paths.root
+    displaced = workspace_root.with_name(workspace_root.name + "-displaced")
+    real_rename = archive_module.atomic_rename
+
+    def swap_workspace_then_rename(*args, **kwargs):
+        workspace_root.rename(displaced)
+        workspace_root.mkdir()
+        (workspace_root / "PCO_PROPOSALS").mkdir()
+        return real_rename(*args, **kwargs)
+
+    monkeypatch.setattr(archive_module, "atomic_rename", swap_workspace_then_rename)
+
+    result = archive_committed_proposal(workspace.paths, receipt)
+
+    assert result.status == "conflict"
+    assert (displaced / "PCO_PROPOSALS" / receipt.review_id).is_dir()
+    assert not (
+        displaced / "PCO_PROPOSALS" / ".committed" / receipt.receipt_id
+    ).exists()
+
+
+def test_archive_already_target_never_reports_detached_workspace_hierarchy(
+    workspace, proposal_factory, business_markdown_factory, monkeypatch
+) -> None:
+    _root, receipt = _archive_fixture(
+        workspace, proposal_factory, business_markdown_factory
+    )
+    assert archive_committed_proposal(workspace.paths, receipt).status == "archived"
+    workspace_root = workspace.paths.root
+    displaced = workspace_root.with_name(workspace_root.name + "-detached")
+    real_verify = archive_module._anchored_tree_matches_receipt
+    swapped = False
+
+    def verify_then_detach(*args, **kwargs):
+        nonlocal swapped
+        result = real_verify(*args, **kwargs)
+        if result and not swapped:
+            swapped = True
+            workspace_root.rename(displaced)
+            workspace_root.mkdir()
+            (workspace_root / "PCO_PROPOSALS/.committed").mkdir(parents=True)
+        return result
+
+    monkeypatch.setattr(
+        archive_module, "_anchored_tree_matches_receipt", verify_then_detach
+    )
+
+    result = archive_committed_proposal(workspace.paths, receipt)
+
+    assert result.status == "conflict"
+    assert (displaced / "PCO_PROPOSALS" / ".committed" / receipt.receipt_id).is_dir()
+    assert not (
+        workspace_root / "PCO_PROPOSALS" / ".committed" / receipt.receipt_id
+    ).exists()
+
+
 def test_archive_rejects_committed_parent_swap_at_atomic_boundary(
     workspace, proposal_factory, business_markdown_factory, monkeypatch
 ) -> None:
@@ -448,7 +514,12 @@ def test_abort_rejects_parent_or_active_swap_before_detach_without_deleting_eith
     with pytest.raises(MemError) as exc:
         ProposalService(workspace).abort(root.name)
 
-    assert exc.value.detail.code == "PROPOSAL_PATH_UNSAFE"
+    expected_code = (
+        "PROPOSAL_PATH_UNSAFE"
+        if swap == "proposals_root"
+        else "PROPOSAL_ABORT_CONFLICT"
+    )
+    assert exc.value.detail.code == expected_code
     original_after = (
         displaced / root.name / "original.txt"
         if swap == "proposals_root"
@@ -509,6 +580,104 @@ def test_abort_cleanup_failure_after_detach_returns_success_with_exact_remnant(
     assert (remnant / "keep.txt").read_text(encoding="utf-8") == "owned remnant\n"
     assert not root.exists()
     assert workspace.repository.head() == canonical_head
+
+
+def test_abort_detach_ack_loss_continues_cleanup_from_exact_anchored_tombstone(
+    workspace, proposal_factory, monkeypatch
+) -> None:
+    root = proposal_factory("review_abort_ack_loss")
+    (root / "owned.txt").write_text("remove after detach\n", encoding="utf-8")
+    real_detach = archive_module._detach_active_noreplace
+
+    def detach_then_raise(*args, **kwargs):
+        real_detach(*args, **kwargs)
+        raise OSError("lost detach acknowledgement")
+
+    monkeypatch.setattr(archive_module, "_detach_active_noreplace", detach_then_raise)
+
+    result = ProposalService(workspace).abort(root.name)
+
+    assert result == {"ok": True, "status": "aborted", "review_id": root.name}
+    assert not root.exists()
+    quarantine = workspace.paths.tmp / "proposal-abort-quarantine"
+    assert not list(quarantine.iterdir())
+
+
+def test_abort_detach_ack_loss_mixed_state_is_explicit_conflict_and_deletes_neither(
+    workspace, proposal_factory, monkeypatch
+) -> None:
+    root = proposal_factory("review_abort_ack_conflict")
+    (root / "owned.txt").write_text("owned tombstone\n", encoding="utf-8")
+    real_detach = archive_module._detach_active_noreplace
+    tombstone_path: Path | None = None
+
+    def detach_replace_source_then_raise(*args, **kwargs):
+        nonlocal tombstone_path
+        real_detach(*args, **kwargs)
+        tombstone_path = (
+            workspace.paths.tmp / "proposal-abort-quarantine" / kwargs["tombstone_name"]
+        )
+        root.mkdir()
+        (root / "replacement.txt").write_text("replacement active\n", encoding="utf-8")
+        raise OSError("lost acknowledgement with mixed state")
+
+    monkeypatch.setattr(
+        archive_module, "_detach_active_noreplace", detach_replace_source_then_raise
+    )
+
+    with pytest.raises(MemError) as exc:
+        ProposalService(workspace).abort(root.name)
+
+    assert exc.value.detail.code == "PROPOSAL_ABORT_CONFLICT"
+    assert (root / "replacement.txt").read_text(
+        encoding="utf-8"
+    ) == "replacement active\n"
+    assert tombstone_path is not None
+    assert (tombstone_path / "owned.txt").read_text(
+        encoding="utf-8"
+    ) == "owned tombstone\n"
+
+
+def test_abort_detach_ack_loss_replaced_tombstone_is_conflict_without_deletion(
+    workspace, proposal_factory, monkeypatch
+) -> None:
+    root = proposal_factory("review_abort_ack_replaced")
+    (root / "owned.txt").write_text("owned displaced\n", encoding="utf-8")
+    real_detach = archive_module._detach_active_noreplace
+    displaced_path: Path | None = None
+    replacement_path: Path | None = None
+
+    def detach_replace_tombstone_then_raise(*args, **kwargs):
+        nonlocal displaced_path, replacement_path
+        real_detach(*args, **kwargs)
+        replacement_path = (
+            workspace.paths.tmp / "proposal-abort-quarantine" / kwargs["tombstone_name"]
+        )
+        displaced_path = replacement_path.with_name(
+            replacement_path.name + "-displaced"
+        )
+        replacement_path.rename(displaced_path)
+        replacement_path.mkdir()
+        (replacement_path / "replacement.txt").write_text(
+            "replacement tombstone\n", encoding="utf-8"
+        )
+        raise OSError("lost acknowledgement after tombstone replacement")
+
+    monkeypatch.setattr(
+        archive_module, "_detach_active_noreplace", detach_replace_tombstone_then_raise
+    )
+
+    with pytest.raises(MemError) as exc:
+        ProposalService(workspace).abort(root.name)
+
+    assert exc.value.detail.code == "PROPOSAL_ABORT_CONFLICT"
+    assert displaced_path is not None and replacement_path is not None
+    assert (displaced_path / "owned.txt").read_text(
+        encoding="utf-8"
+    ) == "owned displaced\n"
+    assert (replacement_path / "replacement.txt").read_text(
+        encoding="utf-8"
+    ) == "replacement tombstone\n"
 
 
 def test_abort_never_implicitly_resumes_or_deletes_an_old_quarantine_remnant(

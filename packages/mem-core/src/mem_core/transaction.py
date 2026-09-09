@@ -498,6 +498,141 @@ class TransactionManager:
             raise ValueError("Git returned duplicate worktree registrations")
         return tuple(paths)
 
+    @classmethod
+    def _cleanup_read_regular(cls, parent_fd: int, name: str, display: Path) -> bytes:
+        def file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+            return (
+                stat.S_IFMT(info.st_mode),
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(observed.st_mode):
+            raise OSError(
+                errno.EPERM, "registration metadata is not a regular file", str(display)
+            )
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            anchored = os.fstat(descriptor)
+            if file_identity(observed)[:3] != file_identity(anchored)[:3]:
+                raise OSError(
+                    errno.ESTALE,
+                    "registration metadata changed while opening",
+                    str(display),
+                )
+            data = bytearray()
+            while True:
+                chunk = os.read(descriptor, 4096)
+                if not chunk:
+                    break
+                if len(data) + len(chunk) > 65536:
+                    raise OSError(
+                        errno.EFBIG,
+                        "registration metadata is unexpectedly large",
+                        str(display),
+                    )
+                data.extend(chunk)
+            if file_identity(os.fstat(descriptor)) != file_identity(anchored):
+                raise OSError(
+                    errno.ESTALE,
+                    "registration metadata changed while reading",
+                    str(display),
+                )
+            return bytes(data)
+        finally:
+            os.close(descriptor)
+
+    def _remove_exact_worktree_registration(self, expected: Path) -> None:
+        """Remove only the linked-worktree admin record bound to ``expected``."""
+
+        if expected not in self._registered_worktree_paths():
+            return
+        common_raw = self.repository._git("rev-parse", "--git-common-dir")
+        common = Path(common_raw)
+        if not common.is_absolute():
+            common = self.repository.root / common
+        common_fd: int | None = None
+        worktrees_fd: int | None = None
+        selected_fd: int | None = None
+        parent_fd: int | None = None
+        try:
+            parent_fd = os.open(
+                common.parent,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            common_fd, _ = self._cleanup_open_directory(parent_fd, common.name, common)
+            worktrees_fd, _ = self._cleanup_open_directory(
+                common_fd, "worktrees", common / "worktrees"
+            )
+            with os.scandir(worktrees_fd) as entries:
+                candidates = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+            matches: list[tuple[str, tuple[int, int, int]]] = []
+            for candidate in candidates:
+                info = candidate.stat(follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise OSError(errno.EPERM, "Git worktree admin entry is unsafe")
+                candidate_fd, candidate_identity = self._cleanup_open_directory(
+                    worktrees_fd, candidate.name, common / "worktrees" / candidate.name
+                )
+                try:
+                    raw = self._cleanup_read_regular(
+                        candidate_fd,
+                        "gitdir",
+                        common / "worktrees" / candidate.name / "gitdir",
+                    )
+                    value = raw.decode("utf-8").rstrip("\r\n")
+                    gitfile = Path(value)
+                    if not gitfile.is_absolute() or gitfile.name != ".git":
+                        raise OSError(
+                            errno.EINVAL, "Git worktree admin path is ambiguous"
+                        )
+                    if gitfile.parent.absolute() == expected:
+                        matches.append((candidate.name, candidate_identity))
+                finally:
+                    os.close(candidate_fd)
+            if len(matches) != 1:
+                raise OSError(
+                    errno.ESTALE,
+                    "exact Git worktree registration is missing or ambiguous",
+                )
+            selected_name, selected_identity = matches[0]
+            selected_fd, anchored_identity = self._cleanup_open_directory(
+                worktrees_fd,
+                selected_name,
+                common / "worktrees" / selected_name,
+            )
+            if anchored_identity != selected_identity:
+                raise OSError(
+                    errno.ESTALE, "Git worktree registration changed before removal"
+                )
+            self._cleanup_owned_tree(selected_fd, common / "worktrees" / selected_name)
+            self._cleanup_recheck(
+                worktrees_fd,
+                selected_name,
+                selected_identity,
+                common / "worktrees" / selected_name,
+            )
+            os.rmdir(selected_name, dir_fd=worktrees_fd)
+        finally:
+            for descriptor in (selected_fd, worktrees_fd, common_fd, parent_fd):
+                if descriptor is not None:
+                    os.close(descriptor)
+        if expected in self._registered_worktree_paths():
+            raise OSError(
+                errno.EBUSY, "Git worktree registration remains after scoped cleanup"
+            )
+
     @staticmethod
     def _cleanup_rename_noreplace(
         parent_fd: int,
@@ -598,11 +733,7 @@ class TransactionManager:
             state_info = os.stat(self.state_root, follow_symlinks=False)
         except FileNotFoundError:
             if expected_registrations:
-                self.repository._git("worktree", "prune")
-                if expected in self._registered_worktree_paths():
-                    raise OSError(
-                        errno.EBUSY, "stale application worktree registration remains"
-                    )
+                self._remove_exact_worktree_registration(expected)
             return
         if not stat.S_ISDIR(state_info.st_mode):
             raise OSError(
@@ -629,12 +760,7 @@ class TransactionManager:
                 )
             except FileNotFoundError:
                 if expected_registrations:
-                    self.repository._git("worktree", "prune")
-                    if expected in self._registered_worktree_paths():
-                        raise OSError(
-                            errno.EBUSY,
-                            "stale application worktree registration remains",
-                        )
+                    self._remove_exact_worktree_registration(expected)
                 return
             try:
                 attempt_fd, attempt_identity = self._cleanup_open_directory(
@@ -642,12 +768,7 @@ class TransactionManager:
                 )
             except FileNotFoundError:
                 if expected_registrations:
-                    self.repository._git("worktree", "prune")
-                    if expected in self._registered_worktree_paths():
-                        raise OSError(
-                            errno.EBUSY,
-                            "stale application worktree registration remains",
-                        )
+                    self._remove_exact_worktree_registration(expected)
                 return
 
             with os.scandir(attempt_fd) as entries:
@@ -733,11 +854,7 @@ class TransactionManager:
                 self.state_root / "application-worktrees" / quarantine_name,
             )
             os.rmdir(quarantine_name, dir_fd=applications_fd)
-            self.repository._git("worktree", "prune")
-            if expected in self._registered_worktree_paths():
-                raise OSError(
-                    errno.EBUSY, "Git worktree registration remains after cleanup"
-                )
+            self._remove_exact_worktree_registration(expected)
             try:
                 with os.scandir(applications_fd) as entries:
                     applications_empty = not any(True for _entry in entries)
@@ -758,7 +875,11 @@ class TransactionManager:
                     os.close(descriptor)
 
     def cleanup_application_attempt(
-        self, transaction_digest: str, *, review_id: str
+        self,
+        transaction_digest: str,
+        *,
+        review_id: str,
+        canonical_changed: bool = True,
     ) -> None:
         """Safely remove one proven, registered application worktree attempt."""
 
@@ -778,7 +899,7 @@ class TransactionManager:
                 "Committed application worktree ownership or cleanup could not be proven",
                 path=str(self._application_attempt_dir(transaction_digest)),
                 value=str(exc),
-                canonical_changed=True,
+                canonical_changed=canonical_changed,
                 retry_safe=True,
                 recovery=[f"pco proposal commit {review_id}"],
             ) from exc
@@ -840,14 +961,138 @@ class TransactionManager:
             "delta": {name: len(records) for name, records in delta.items()},
         }
 
+    def _create_application_worktree(
+        self, transaction_digest: str, base_commit: str
+    ) -> Path:
+        """Create one empty digest-derived attempt through retained parent anchors."""
+
+        attempt = self._application_attempt_dir(transaction_digest)
+        worktree = attempt / "worktree"
+        parent_fd: int | None = None
+        state_fd: int | None = None
+        applications_fd: int | None = None
+        attempt_fd: int | None = None
+        worktree_fd: int | None = None
+        try:
+            parent_fd = os.open(
+                self.state_root.parent,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.mkdir(self.state_root.name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            state_fd, state_identity = self._cleanup_open_directory(
+                parent_fd, self.state_root.name, self.state_root
+            )
+            try:
+                os.mkdir("application-worktrees", mode=0o700, dir_fd=state_fd)
+            except FileExistsError:
+                pass
+            applications_fd, applications_identity = self._cleanup_open_directory(
+                state_fd,
+                "application-worktrees",
+                self.state_root / "application-worktrees",
+            )
+            try:
+                os.mkdir(attempt.name, mode=0o700, dir_fd=applications_fd)
+            except FileExistsError:
+                pass
+            attempt_fd, attempt_identity = self._cleanup_open_directory(
+                applications_fd, attempt.name, attempt
+            )
+            with os.scandir(attempt_fd) as entries:
+                if any(True for _entry in entries):
+                    raise OSError(
+                        errno.ENOTEMPTY,
+                        "application attempt is not empty before creation",
+                    )
+            self._cleanup_recheck(
+                parent_fd, self.state_root.name, state_identity, self.state_root
+            )
+            self._cleanup_recheck(
+                state_fd,
+                "application-worktrees",
+                applications_identity,
+                self.state_root / "application-worktrees",
+            )
+            self._cleanup_recheck(
+                applications_fd, attempt.name, attempt_identity, attempt
+            )
+            self.repository._git(
+                "worktree", "add", "--detach", str(worktree), base_commit
+            )
+            self._cleanup_recheck(
+                parent_fd, self.state_root.name, state_identity, self.state_root
+            )
+            self._cleanup_recheck(
+                state_fd,
+                "application-worktrees",
+                applications_identity,
+                self.state_root / "application-worktrees",
+            )
+            self._cleanup_recheck(
+                applications_fd, attempt.name, attempt_identity, attempt
+            )
+            with os.scandir(attempt_fd) as entries:
+                names = sorted((entry.name for entry in entries), key=os.fsencode)
+            if names != ["worktree"]:
+                raise OSError(
+                    errno.ENOTEMPTY,
+                    "application worktree creation produced an ambiguous attempt",
+                )
+            worktree_fd, worktree_identity = self._cleanup_open_directory(
+                attempt_fd, "worktree", worktree
+            )
+            registered = self._registered_worktree_paths()
+            if registered.count(worktree.absolute()) != 1:
+                raise OSError(
+                    errno.ESTALE,
+                    "created application worktree registration is missing or ambiguous",
+                )
+            self._cleanup_recheck(attempt_fd, "worktree", worktree_identity, worktree)
+            return worktree
+        finally:
+            for descriptor in (
+                worktree_fd,
+                attempt_fd,
+                applications_fd,
+                state_fd,
+                parent_fd,
+            ):
+                if descriptor is not None:
+                    os.close(descriptor)
+
     def _commit_application_worktree(
         self, request: ApplicationCommitRequest
     ) -> dict[str, Any]:
         transaction_id = application_transaction_id(request.transaction_digest)
-        worktree = self._application_worktree_path(request.transaction_digest)
         self.repository.assert_clean()
-        self.repository.remove_worktree(worktree)
-        self.repository.add_worktree(worktree, request.base_commit)
+        self.cleanup_application_attempt(
+            request.transaction_digest,
+            review_id=str(request.receipt["review_id"]),
+            canonical_changed=False,
+        )
+        try:
+            worktree = self._create_application_worktree(
+                request.transaction_digest, request.base_commit
+            )
+        except MemError:
+            raise
+        except Exception as exc:
+            raise MemError(
+                "CANONICAL_WORKTREE_CLEANUP_FAILED",
+                "application_creation",
+                "Application worktree could not be created through its owned path",
+                path=str(self._application_attempt_dir(request.transaction_digest)),
+                value=str(exc),
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=[f"pco proposal commit {request.receipt['review_id']}"],
+            ) from exc
         self._apply_operations(worktree, request.operations)
         validation = self._validate_application_operations(request, worktree)
         transaction_record = {

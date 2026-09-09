@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 import os
 from pathlib import Path
+import shutil
 from typing import Any, Mapping
 
 import pytest
@@ -385,14 +386,13 @@ def test_cleanup_failure_reports_committed_canonical_and_safe_retry(
     manager = TransactionManager(
         pco_repository, pco_repository.root.parent / "application-state"
     )
-    real_git = pco_repository._git
-
-    def skip_prune(*args, **kwargs):
-        if args == ("worktree", "prune"):
-            return ""
-        return real_git(*args, **kwargs)
-
-    monkeypatch.setattr(pco_repository, "_git", skip_prune)
+    monkeypatch.setattr(
+        manager,
+        "_remove_exact_worktree_registration",
+        lambda _expected: (_ for _ in ()).throw(
+            OSError("injected scoped registration cleanup failure")
+        ),
+    )
 
     with pytest.raises(MemError) as exc:
         manager.commit_application(application_request)
@@ -402,6 +402,59 @@ def test_cleanup_failure_reports_committed_canonical_and_safe_retry(
     assert exc.value.detail.canonical_changed is True
     assert exc.value.detail.retry_safe is True
     assert exc.value.detail.recovery == ["pco proposal commit review_application_1"]
+
+
+def test_application_creation_never_calls_legacy_path_based_remove(
+    pco_repository: MemoryRepository,
+    application_request: ApplicationCommitRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = TransactionManager(
+        pco_repository, pco_repository.root.parent / "application-state"
+    )
+    monkeypatch.setattr(
+        pco_repository,
+        "remove_worktree",
+        lambda _path: pytest.fail("legacy path-based worktree removal was called"),
+    )
+
+    result = manager.commit_application(application_request)
+
+    assert result["ok"] is True
+
+
+@pytest.mark.parametrize("unexpected_kind", ["symlinked_attempt", "worktree_file"])
+def test_application_creation_rejects_unexpected_attempt_entries_without_canonical_change(
+    pco_repository: MemoryRepository,
+    application_request: ApplicationCommitRequest,
+    tmp_path: Path,
+    unexpected_kind: str,
+) -> None:
+    state_root = tmp_path / "state"
+    manager = TransactionManager(pco_repository, state_root)
+    attempt = manager._application_attempt_dir(application_request.transaction_digest)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    sentinel = foreign / "sentinel"
+    sentinel.write_text("must survive\n", encoding="utf-8")
+    if unexpected_kind == "symlinked_attempt":
+        attempt.parent.mkdir(parents=True)
+        attempt.symlink_to(foreign, target_is_directory=True)
+    else:
+        attempt.mkdir(parents=True)
+        (attempt / "worktree").write_text("unexpected\n", encoding="utf-8")
+    before = pco_repository.head()
+
+    with pytest.raises(MemError) as exc:
+        manager.commit_application(application_request)
+
+    assert pco_repository.head() == before
+    assert exc.value.detail.code == "CANONICAL_WORKTREE_CLEANUP_FAILED"
+    assert exc.value.detail.canonical_changed is False
+    assert exc.value.detail.retry_safe is True
+    assert sentinel.read_text(encoding="utf-8") == "must survive\n"
+    if unexpected_kind == "worktree_file":
+        assert (attempt / "worktree").read_text(encoding="utf-8") == "unexpected\n"
 
 
 def test_public_cleanup_rejects_symlinked_attempt_without_removing_foreign_worktree(
@@ -483,6 +536,54 @@ def test_public_cleanup_prunes_only_missing_owned_registration_and_preserves_rea
     assert foreign.is_dir()
     assert pco_repository._git("rev-parse", "HEAD", cwd=foreign) == foreign_head
     assert str(foreign.absolute()) in git_worktree_paths(pco_repository)
+
+
+def test_public_cleanup_preserves_unrelated_prunable_stale_registration_byte_for_byte(
+    pco_repository: MemoryRepository,
+    application_request: ApplicationCommitRequest,
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    manager = TransactionManager(pco_repository, state_root)
+    owned = manager._application_worktree_path(application_request.transaction_digest)
+    unrelated = tmp_path / "unrelated-stale-worktree"
+    pco_repository.add_worktree(owned, pco_repository.head())
+    pco_repository.add_worktree(unrelated, pco_repository.head())
+    shutil.rmtree(unrelated)
+    unrelated_path = str(unrelated.absolute())
+    before_paths = git_worktree_paths(pco_repository)
+    assert unrelated_path in before_paths
+    git_admin = pco_repository.root / ".git/worktrees"
+    before_admin = {
+        path.relative_to(git_admin): path.read_bytes()
+        for path in git_admin.rglob("*")
+        if path.is_file()
+    }
+
+    manager.cleanup_application_attempt(
+        application_request.transaction_digest,
+        review_id=application_request.receipt["review_id"],
+    )
+
+    assert unrelated_path in git_worktree_paths(pco_repository)
+    after_admin = {
+        path.relative_to(git_admin): path.read_bytes()
+        for path in git_admin.rglob("*")
+        if path.is_file()
+    }
+    matching_gitdirs = [
+        key
+        for key, value in before_admin.items()
+        if key.name == "gitdir" and unrelated_path.encode("utf-8") in value
+    ]
+    assert len(matching_gitdirs) == 1
+    unrelated_admin = matching_gitdirs[0].parts[0]
+    unrelated_keys = {
+        key for key in before_admin if key.parts[0] == unrelated_admin
+    }
+    assert {key: after_admin[key] for key in unrelated_keys} == {
+        key: before_admin[key] for key in unrelated_keys
+    }
 
 
 @pytest.mark.parametrize("swap", ["attempt", "worktree"])
