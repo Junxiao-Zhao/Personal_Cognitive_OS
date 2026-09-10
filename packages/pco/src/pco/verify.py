@@ -1,9 +1,4 @@
-"""Read-only integrity verification for a dedicated PCO workspace.
-
-Projection verification intentionally is not implemented here.  The current
-projection format is owned by the derivation plan; this module verifies only
-the workspace state that exists independently of that future format.
-"""
+"""Read-only integrity verification for a dedicated PCO workspace."""
 
 from __future__ import annotations
 
@@ -19,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import __version__
 from .config import PROPOSAL_MANIFEST_VERSION
+from .derivation_manifest import verify_derivation_tree
 from .skill_resources import inspect_skill_manifest, verify_skill_tree
 from .versioning import check_compatibility
 
@@ -83,14 +79,14 @@ def verify_workspace(
 ) -> dict[str, Any]:
     """Verify all currently defined workspace integrity boundaries without writes.
 
-    ``path`` remains an explicit extension point for derivation verification.
-    No projection verifier exists yet, so requesting ``PCO_MEMORY`` reports a
-    structured deferral rather than treating an empty or legacy tree as valid.
+    A requested ``PCO_MEMORY`` path is verified against canonical HEAD without
+    importing or rewriting any projection bytes.
     """
 
     result = _verify_workspace(workspace, hash_skill_payloads=True)
     if path is not None:
-        _verify_requested_path(workspace, path)
+        result["projection"] = _verify_requested_path(workspace, path)
+        result["ok"] = result["ok"] and result["projection"]["ok"]
     return result
 
 
@@ -251,17 +247,20 @@ def _verify_compatibility(
     }
 
 
-def _verify_requested_path(workspace: "Workspace", path: Path) -> None:
+def verify_projection(path: Path, expected_commit: str | None = None) -> dict[str, Any]:
+    """Verify a v0.5 ``PCO_MEMORY`` derivation without mutating it."""
+
+    return verify_derivation_tree(
+        Path(path), kind="pco_memory", expected_commit=expected_commit
+    )
+
+
+def _verify_requested_path(workspace: "Workspace", path: Path) -> dict[str, Any]:
     requested = Path(path).absolute()
     if requested == workspace.paths.projection:
-        raise MemError(
-            "WORKSPACE_VERIFICATION_DEFERRED",
-            "verify",
-            "PCO_MEMORY verification is deferred until the derivation projection verifier exists",
-            canonical_changed=False,
-            retry_safe=False,
-            path="PCO_MEMORY",
-            recovery=["Use canonical pco search or pco history until derivations are available"],
+        return verify_projection(
+            workspace.paths.projection,
+            expected_commit=workspace.repository.head(),
         )
     raise MemError(
         "WORKSPACE_PATH_UNSAFE",

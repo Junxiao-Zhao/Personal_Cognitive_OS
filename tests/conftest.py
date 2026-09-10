@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -10,8 +12,13 @@ from mem_core.profile import Profile
 from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
 from pco.paths import bundled_profile
+from pco.proposals.models import (
+    BusinessFile,
+    ProposalArtifactMaterial,
+    ProposalManifest,
+)
+from pco.proposals.service import ProposalService
 from pco.workspace import Workspace
-
 
 NOW = "2026-08-30T10:00:00+00:00"
 
@@ -23,7 +30,13 @@ def make_public_logs_profile(root: Path) -> Path:
         json.dumps(
             {
                 "type": "object",
-                "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+                "required": [
+                    "id",
+                    "revision",
+                    "recorded_at",
+                    "schema_version",
+                    "payload",
+                ],
                 "properties": {
                     "id": {"type": "string", "minLength": 1},
                     "revision": {"type": "integer", "minimum": 1},
@@ -268,3 +281,86 @@ def active_proposal_tree(workspace: Workspace, proposal_factory):
     """Return a public v0.5 workspace and its single empty active review root."""
 
     return workspace, proposal_factory("review_active")
+
+
+@pytest.fixture
+def committed_workspace(
+    workspace: Workspace,
+    minimal_records: dict[str, dict],
+    business_markdown_factory,
+) -> Workspace:
+    """A full v0.5 canonical state created only through the public proposal API."""
+
+    root = workspace.paths.proposals / "review_projection"
+    root.mkdir()
+    material = b"Complete reviewed source material.\n"
+    (root / "inputs").mkdir()
+    (root / "inputs/source.txt").write_bytes(material)
+
+    paths = {
+        "evidence": "evidence/ev_1.md",
+        "sources": "sources/src_1.md",
+        "events": "events/evt_1.md",
+        "psychologies": "psychologies/psy_1.md",
+        "philosophies": "philosophies/phi_1.md",
+        "archetypes": "archetypes/arc_1.md",
+        "hypotheses": "hypotheses/hyp_1.md",
+        "meta_revisions": "META_MEMORY.md",
+        "session_handoffs": "SESSION_HANDOFF.md",
+    }
+    object_types = {
+        "evidence": "evidence",
+        "sources": "source",
+        "events": "event",
+        "psychologies": "psychology",
+        "philosophies": "philosophy",
+        "archetypes": "archetype",
+        "hypotheses": "hypothesis",
+        "meta_revisions": "meta",
+        "session_handoffs": "session_handoff",
+    }
+    files: list[BusinessFile] = []
+    for stream, relative in paths.items():
+        record = deepcopy(minimal_records[stream])
+        payload = dict(record["payload"])
+        body = payload.pop("body_markdown")
+        payload.pop("previous_revision")
+        if stream == "sources":
+            payload.pop("content_hash")
+            payload.pop("snapshot_ref")
+            payload["material_id"] = "source_material"
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(
+            business_markdown_factory(
+                object_type=object_types[stream],
+                record_id=record["id"],
+                fields=payload,
+                body=body,
+            )
+        )
+        files.append(BusinessFile(path=relative, operation="create"))
+
+    manifest = ProposalManifest(
+        review_id=root.name,
+        base_commit=workspace.repository.head(),
+        workspace_version=workspace.identity["workspace_format_version"],
+        profile_version=workspace.profile.version,
+        files=files,
+        input_material=[
+            ProposalArtifactMaterial(
+                material_id="source_material",
+                kind="proposal_artifact",
+                path="inputs/source.txt",
+                expected_content_hash="sha256:" + hashlib.sha256(material).hexdigest(),
+                fidelity="full_source",
+            )
+        ],
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(manifest.model_dump(mode="json"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    result = ProposalService(workspace).commit(root.name)
+    assert result["canonical_status"] == "committed"
+    return workspace

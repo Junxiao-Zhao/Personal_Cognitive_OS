@@ -128,7 +128,9 @@ def test_doctor_rejects_workspace_metadata_not_exactly_from_root_commit(
 ) -> None:
     """Ignoring byte-level metadata rewrites would weaken the root anchor."""
     metadata = workspace.paths.canonical / "workspace.json"
-    metadata.write_text(metadata.read_text(encoding="utf-8").rstrip("\n"), encoding="utf-8")
+    metadata.write_text(
+        metadata.read_text(encoding="utf-8").rstrip("\n"), encoding="utf-8"
+    )
 
     with pytest.raises(MemError) as exc:
         workspace.doctor()
@@ -139,9 +141,22 @@ def test_doctor_rejects_workspace_metadata_not_exactly_from_root_commit(
 @pytest.mark.parametrize(
     "replacement",
     [
-        {"workspace_id": "workspace_bad", "workspace_format_version": "0.5.0", "profile_version": "0.5.0"},
-        {"workspace_id": "workspace_" + "a" * 32, "workspace_format_version": "0.6.0", "profile_version": "0.5.0"},
-        {"workspace_id": "workspace_" + "a" * 32, "workspace_format_version": "0.5.0", "profile_version": "0.5.0", "unexpected": True},
+        {
+            "workspace_id": "workspace_bad",
+            "workspace_format_version": "0.5.0",
+            "profile_version": "0.5.0",
+        },
+        {
+            "workspace_id": "workspace_" + "a" * 32,
+            "workspace_format_version": "0.6.0",
+            "profile_version": "0.5.0",
+        },
+        {
+            "workspace_id": "workspace_" + "a" * 32,
+            "workspace_format_version": "0.5.0",
+            "profile_version": "0.5.0",
+            "unexpected": True,
+        },
     ],
     ids=["invalid-id", "unsupported-version", "unknown-field"],
 )
@@ -192,7 +207,9 @@ def test_doctor_keeps_transaction_parse_line_diagnostics(workspace: Workspace) -
     assert exc.value.detail.path == "transactions/transactions.jsonl:1"
 
 
-def test_doctor_accepts_transaction_receipt_for_this_workspace(workspace: Workspace) -> None:
+def test_doctor_accepts_transaction_receipt_for_this_workspace(
+    workspace: Workspace,
+) -> None:
     """Valid workspace-scoped receipts remain verifiable canonical history."""
     _commit_unverified_transaction(
         workspace,
@@ -236,17 +253,16 @@ def test_verify_workspace_is_read_only_on_success(workspace: Workspace) -> None:
     assert _snapshot_tree(workspace.paths.root) == before
 
 
-def test_projection_verification_is_explicitly_deferred_read_only(
+def test_empty_projection_verification_reports_missing_read_only(
     workspace: Workspace,
 ) -> None:
-    """Claiming an empty legacy projection is verified would be misleading."""
+    """The initializer's empty projection is a read-only missing state."""
     before = _snapshot_tree(workspace.paths.root)
 
-    with pytest.raises(MemError) as exc:
-        verify_workspace(workspace, path=workspace.paths.projection)
+    result = verify_workspace(workspace, path=workspace.paths.projection)
 
-    assert exc.value.detail.code == "WORKSPACE_VERIFICATION_DEFERRED"
-    assert exc.value.detail.canonical_changed is False
+    assert result["projection"]["status"] == "missing"
+    assert result["projection"]["missing"] == ["manifest.json"]
     assert _snapshot_tree(workspace.paths.root) == before
 
 
@@ -315,7 +331,9 @@ def test_doctor_rejects_eol_normalized_workspace_bytes_read_only(
     assert _snapshot_tree(workspace.paths.root) == before
 
 
-def test_doctor_rejects_shallow_canonical_repository_read_only(workspace: Workspace) -> None:
+def test_doctor_rejects_shallow_canonical_repository_read_only(
+    workspace: Workspace,
+) -> None:
     """A shallow boundary cannot substitute for the immutable initial commit."""
     root_commit = workspace.repository._git("rev-list", "--max-parents=0", "HEAD")
     (workspace.paths.canonical / ".git/shallow").write_text(
@@ -409,7 +427,9 @@ def test_doctor_rejects_symlinked_skill_ancestors_without_following_outside_work
         workspace.doctor()
 
     assert exc.value.detail.code == "WORKSPACE_SKILL_INVALID"
-    assert "workspace SKILL ancestor must be a real directory" in exc.value.detail.message
+    assert (
+        "workspace SKILL ancestor must be a real directory" in exc.value.detail.message
+    )
     assert _snapshot_tree(workspace.paths.root) == before
     if kind == "symlink":
         assert outside_before is not None

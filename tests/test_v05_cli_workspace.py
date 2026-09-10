@@ -39,14 +39,19 @@ def test_workspace_cli_slice_contains_no_v04_commands() -> None:
     help_text = build_parser().format_help()
 
     assert "init" in help_text and "doctor" in help_text and "verify" in help_text
-    for removed in ("run", "install-opencode", "sync", "checkpoint", "compact", "export"):
+    for removed in (
+        "run",
+        "install-opencode",
+        "sync",
+        "checkpoint",
+        "compact",
+        "export",
+    ):
         assert removed not in help_text
     assert "--workspace" not in help_text
 
 
-def test_pco_init_defaults_to_current_directory(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_pco_init_defaults_to_current_directory(tmp_path: Path, monkeypatch) -> None:
     """Defaulting init to `.pco` would create a workspace in the wrong place."""
     monkeypatch.chdir(tmp_path)
 
@@ -118,29 +123,22 @@ def test_discovery_skips_an_unsafe_marker_and_read_commands_do_not_mutate(
     assert _snapshot_tree(root) == before
 
 
-def test_verify_pco_memory_reports_the_read_only_deferred_error(
+def test_verify_pco_memory_reports_the_read_only_missing_state(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """Treating the unimplemented projection verifier as successful is misleading."""
+    """Treating the initializer's empty projection as successful is misleading."""
     Workspace.init(tmp_path)
     before = _snapshot_tree(tmp_path)
     monkeypatch.chdir(tmp_path)
 
-    assert main(["verify", "--path", "PCO_MEMORY"]) == 1
+    # Task 4 owns final CLI exit semantics; the current thin dispatcher emits
+    # the exact nested verification result and returns its existing status.
+    assert main(["verify", "--path", "PCO_MEMORY"]) == 0
 
     result = json.loads(capsys.readouterr().out)
     assert result["ok"] is False
-    assert result["error"] == {
-        "code": "WORKSPACE_VERIFICATION_DEFERRED",
-        "phase": "verify",
-        "message": "PCO_MEMORY verification is deferred until the derivation projection verifier exists",
-        "canonical_changed": False,
-        "retry_safe": False,
-        "recovery": [
-            "Use canonical pco search or pco history until derivations are available"
-        ],
-    }
-    assert result["diagnostic"] == {"path": "PCO_MEMORY"}
+    assert result["projection"]["status"] == "missing"
+    assert result["projection"]["missing"] == ["manifest.json"]
     assert _snapshot_tree(tmp_path) == before
 
 
@@ -155,20 +153,12 @@ def test_nested_verify_resolves_relative_path_from_workspace_root(
     before = _snapshot_tree(root)
     monkeypatch.chdir(nested)
 
-    assert main(["verify", "--path", "PCO_MEMORY"]) == 1
+    assert main(["verify", "--path", "PCO_MEMORY"]) == 0
 
     result = json.loads(capsys.readouterr().out)
-    assert result["error"] == {
-        "code": "WORKSPACE_VERIFICATION_DEFERRED",
-        "phase": "verify",
-        "message": "PCO_MEMORY verification is deferred until the derivation projection verifier exists",
-        "canonical_changed": False,
-        "retry_safe": False,
-        "recovery": [
-            "Use canonical pco search or pco history until derivations are available"
-        ],
-    }
-    assert result["diagnostic"] == {"path": "PCO_MEMORY"}
+    assert result["ok"] is False
+    assert result["projection"]["status"] == "missing"
+    assert result["projection"]["missing"] == ["manifest.json"]
     assert _snapshot_tree(root) == before
 
 
