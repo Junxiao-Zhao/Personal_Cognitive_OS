@@ -9,7 +9,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping, TypedDict
-from urllib.parse import unquote, urlparse, urlsplit
+from urllib.parse import unquote, urlparse
 
 from mem_core.errors import MemError, ensure
 from mem_core.models import Operation, utc_now
@@ -18,6 +18,7 @@ from mem_core.transaction import TransactionManager
 from .proposals.materials import (
     MAX_INPUT_MATERIAL_BYTES,
     _local_file_path,
+    _material_error,
     digest as material_digest,
     normalize_utf8,
     read_regular_file,
@@ -26,6 +27,7 @@ from .validation import latest_effective
 from .workspace import Workspace
 
 _CONTENT_HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+_URI_SCHEME = re.compile(r"^(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*):")
 
 
 def _source_diff_error(
@@ -37,9 +39,9 @@ def _source_diff_error(
     value: Any = None,
 ) -> MemError:
     recovery = (
-        ["Restore canonical memory from a trusted copy and retry source diff"]
-        if code == "SOURCE_SNAPSHOT_INVALID"
-        else ["Run pco source diff without an ID to list current sources"]
+        ["Run pco source diff without an ID to list current sources"]
+        if code == "SOURCE_NOT_FOUND"
+        else ["Restore canonical memory from a trusted copy and retry source diff"]
     )
     return MemError(
         code,
@@ -215,13 +217,20 @@ def _diff_one_source(
     source_id = revision["id"]
     payload = revision["payload"]
     locator = payload.get("locator")
-    if not isinstance(locator, str) or urlsplit(locator).scheme.lower() != "file":
+    scheme = _URI_SCHEME.match(locator) if isinstance(locator, str) else None
+    if scheme is None or scheme.group("scheme").lower() != "file":
         return {"source_id": source_id, "refresh_required": True}
 
     previous = _verified_snapshot(workspace, commit, revision)
-    current = read_regular_file(
-        _local_file_path(locator), limit=MAX_INPUT_MATERIAL_BYTES
-    )
+    try:
+        local_path = _local_file_path(locator)
+    except ValueError as exc:
+        raise _material_error(
+            "INPUT_MATERIAL_UNSAFE",
+            "Local input material URI has an invalid authority",
+            value=locator,
+        ) from exc
+    current = read_regular_file(local_path, limit=MAX_INPUT_MATERIAL_BYTES)
     diff_bytes = b"".join(
         difflib.diff_bytes(
             difflib.unified_diff,
@@ -241,7 +250,14 @@ def _diff_one_source(
 def source_diff(workspace: Workspace, source_id: str | None = None) -> dict[str, Any]:
     """Compare current local material with its verified immutable snapshot."""
 
-    commit = workspace.repository.head()
+    try:
+        commit = workspace.repository.head()
+    except OSError as exc:
+        raise _source_diff_error(
+            "WORKSPACE_INTEGRITY_ERROR",
+            "Canonical Git HEAD cannot be read",
+            value=str(exc),
+        ) from exc
     revisions = _selected_current_sources(workspace, commit, source_id)
     return {
         "ok": True,

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import stat
+import subprocess
 from typing import Any
 
 from mem_core.errors import MemError
@@ -181,6 +182,41 @@ def test_remote_source_does_not_use_local_or_legacy_reader(
     ]
 
 
+def test_profile_valid_malformed_remote_locator_still_requires_refresh(
+    workspace: Workspace,
+) -> None:
+    record = _source_record("src_remote", "http://[bad", b"cached\n")
+    workspace.profile.validate_record_schema("sources", record)
+    _commit_sources(workspace, [record])
+
+    assert source_diff(workspace, "src_remote") == {
+        "ok": True,
+        "sources": [{"source_id": "src_remote", "refresh_required": True}],
+    }
+
+
+def test_malformed_claimed_file_locator_is_a_structured_material_failure(
+    workspace: Workspace,
+) -> None:
+    record = _source_record("src_local", "FILE://[bad", b"cached\n")
+    _commit_sources(
+        workspace,
+        [record],
+        {record["payload"]["snapshot_ref"]: b"cached\n"},
+    )
+
+    with pytest.raises(MemError) as error:
+        source_diff(workspace, "src_local")
+
+    assert error.value.detail.code == "INPUT_MATERIAL_UNSAFE"
+    assert error.value.detail.phase == "proposal_material"
+    assert error.value.detail.canonical_changed is False
+    assert error.value.detail.retry_safe is False
+    assert error.value.detail.recovery == [
+        "Use a stable regular UTF-8 text file as input material"
+    ]
+
+
 def test_exact_source_id_filter_preserves_collection_shape(
     workspace: Workspace,
 ) -> None:
@@ -211,6 +247,92 @@ def test_unknown_or_retired_exact_source_id_is_a_structured_failure(
         assert _code(error) == "SOURCE_NOT_FOUND"
         assert error.value.detail.record_id == source_id
         assert error.value.detail.canonical_changed is False
+        assert error.value.detail.recovery == [
+            "Run pco source diff without an ID to list current sources"
+        ]
+
+
+def test_head_execution_failure_is_a_structured_integrity_error(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_head() -> str:
+        raise OSError("git executable unavailable")
+
+    monkeypatch.setattr(workspace.repository, "head", failed_head)
+
+    with pytest.raises(MemError) as error:
+        source_diff(workspace)
+
+    assert error.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+    assert error.value.detail.phase == "source_diff"
+    assert error.value.detail.canonical_changed is False
+    assert error.value.detail.retry_safe is False
+    assert error.value.detail.recovery == [
+        "Restore canonical memory from a trusted copy and retry source diff"
+    ]
+
+
+def test_nonzero_head_failure_remains_a_structured_git_error(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=["git", "rev-parse", "HEAD"],
+            returncode=128,
+            stdout="",
+            stderr="cannot resolve HEAD",
+        )
+
+    monkeypatch.setattr("mem_core.repository.subprocess.run", failed_run)
+
+    with pytest.raises(MemError) as error:
+        source_diff(workspace)
+
+    assert error.value.detail.code == "GIT_FAILED"
+    assert error.value.detail.phase == "git"
+    assert error.value.detail.canonical_changed is False
+    assert error.value.detail.retry_safe is True
+    assert error.value.detail.recovery == [
+        "Run mem git verify",
+        "Resolve the reported Git repository problem",
+    ]
+
+
+@pytest.mark.parametrize("failure", ["oserror", "nonzero"])
+def test_git_show_failures_are_structured_workspace_integrity_errors(
+    workspace: Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    record = _source_record("src_remote", "https://example.test", b"cached\n")
+    _commit_sources(workspace, [record])
+    canonical_head = workspace.repository.head()
+    monkeypatch.setattr(workspace.repository, "head", lambda: canonical_head)
+
+    def failed_run(
+        *args: object, **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        if failure == "oserror":
+            raise OSError("git executable unavailable")
+        return subprocess.CompletedProcess(
+            args=["git", "show"],
+            returncode=128,
+            stdout=b"",
+            stderr=b"cannot read canonical object",
+        )
+
+    monkeypatch.setattr(sources_module.subprocess, "run", failed_run)
+
+    with pytest.raises(MemError) as error:
+        source_diff(workspace)
+
+    assert error.value.detail.code == "WORKSPACE_INTEGRITY_ERROR"
+    assert error.value.detail.phase == "source_diff"
+    assert error.value.detail.canonical_changed is False
+    assert error.value.detail.retry_safe is False
+    assert error.value.detail.recovery == [
+        "Restore canonical memory from a trusted copy and retry source diff"
+    ]
 
 
 def test_selection_uses_latest_revision_and_excludes_non_active_sources(
@@ -399,6 +521,9 @@ def test_missing_snapshot_blob_is_an_integrity_error(
         source_diff(workspace, "src_local")
 
     assert _code(error) == "SOURCE_SNAPSHOT_INVALID"
+    assert error.value.detail.recovery == [
+        "Restore canonical memory from a trusted copy and retry source diff"
+    ]
 
 
 def test_snapshot_ref_must_agree_exactly_with_content_hash(
