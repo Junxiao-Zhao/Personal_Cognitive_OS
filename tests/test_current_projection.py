@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 
 from mem_core.errors import MemError
 from mem_core.profile import Profile
@@ -13,6 +14,7 @@ from mem_core.repository import MemoryRepository
 import pytest
 
 from pco.derivation_manifest import DerivationManifest
+from pco import projections as projections_module
 from pco.projections import build_projection, project_markdown, projection_path
 from pco.proposals.markdown import render_business_markdown
 from pco.proposals.models import BusinessFile, ProposalManifest
@@ -367,6 +369,62 @@ def test_build_rejects_source_commit_profile_mismatch_without_target_mutation(
     assert not target.exists()
 
 
+def test_build_rejects_same_repository_commit_outside_head_history(
+    committed_workspace, tmp_path: Path
+) -> None:
+    repository = committed_workspace.repository
+    tree = repository._git("rev-parse", "HEAD^{tree}")
+    orphan = repository._git("commit-tree", tree, "-m", "orphan projection tree")
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", orphan, "HEAD"],
+        cwd=repository.root,
+        check=False,
+    )
+    assert ancestry.returncode == 1
+    target = tmp_path / "projection"
+
+    with pytest.raises(MemError) as caught:
+        build_projection(repository, target, orphan)
+
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+    assert not target.exists()
+
+
+def test_git_launch_failure_at_commit_boundary_is_structured(
+    committed_workspace, tmp_path: Path, monkeypatch
+) -> None:
+    commit = committed_workspace.repository.head()
+
+    def missing_git(*_args, **_kwargs):
+        raise FileNotFoundError("git missing")
+
+    monkeypatch.setattr(projections_module.subprocess, "run", missing_git)
+    target = tmp_path / "projection"
+
+    with pytest.raises(MemError) as caught:
+        build_projection(
+            committed_workspace.repository,
+            target,
+            commit,
+        )
+
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+    assert caught.value.detail.canonical_changed is False
+    assert not target.exists()
+
+
+def test_nonzero_git_commit_probe_is_structured(
+    committed_workspace, tmp_path: Path
+) -> None:
+    target = tmp_path / "projection"
+
+    with pytest.raises(MemError) as caught:
+        build_projection(committed_workspace.repository, target, "0" * 40)
+
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+    assert not target.exists()
+
+
 @pytest.mark.parametrize("existing", ["file", "nonempty", "symlink", "fifo"])
 def test_builder_never_replaces_or_follows_existing_target(
     committed_workspace, tmp_path: Path, existing: str
@@ -410,6 +468,74 @@ def test_empty_existing_real_target_is_accepted(
     )
 
     assert verify_projection(target)["ok"] is True
+
+
+def test_absent_target_parent_swap_never_writes_through_replacement_symlink(
+    committed_workspace, tmp_path: Path, monkeypatch
+) -> None:
+    parent = tmp_path / "declared"
+    displaced = tmp_path / "declared-original"
+    outside = tmp_path / "outside"
+    parent.mkdir()
+    outside.mkdir()
+    target = parent / "projection"
+    real_lstat = os.lstat
+    real_stat = os.stat
+    swapped = False
+
+    def swap_parent() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        parent.rename(displaced)
+        parent.symlink_to(outside, target_is_directory=True)
+        swapped = True
+
+    def racing_lstat(path, *args, **kwargs):
+        if Path(path) == target and not swapped:
+            try:
+                return real_lstat(path, *args, **kwargs)
+            except FileNotFoundError:
+                swap_parent()
+                raise
+        return real_lstat(path, *args, **kwargs)
+
+    def racing_stat(path, *args, **kwargs):
+        if path == target.name and kwargs.get("dir_fd") is not None and not swapped:
+            swap_parent()
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(projections_module.os, "lstat", racing_lstat)
+    monkeypatch.setattr(projections_module.os, "stat", racing_stat)
+
+    with pytest.raises(MemError) as caught:
+        build_projection(
+            committed_workspace.repository,
+            target,
+            committed_workspace.repository.head(),
+        )
+
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+    assert parent.is_symlink()
+    assert parent.resolve() == outside.resolve()
+    assert not any(outside.iterdir())
+    assert displaced.is_dir()
+
+
+def test_builder_rejects_nonportable_target_name_without_mutation(
+    committed_workspace, tmp_path: Path
+) -> None:
+    target = tmp_path / "bad\\name"
+
+    with pytest.raises(MemError) as caught:
+        build_projection(
+            committed_workspace.repository,
+            target,
+            committed_workspace.repository.head(),
+        )
+
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+    assert not target.exists()
 
 
 def test_verify_reports_exact_modified_missing_additional_and_stale_lists(
@@ -578,6 +704,27 @@ def test_manifest_model_forbids_wrong_kinds_extra_fields_and_bad_hashes() -> Non
     ):
         with pytest.raises(Exception):
             DerivationManifest.model_validate(valid | change, strict=True)
+
+
+@pytest.mark.parametrize("length", [39, 41, 63, 65])
+def test_manifest_and_builder_accept_only_exact_git_oid_lengths(
+    committed_workspace, tmp_path: Path, length: int
+) -> None:
+    source_commit = "a" * length
+    manifest = {
+        "kind": "pco_memory",
+        "source_commit": source_commit,
+        "profile_version": "0.5.0",
+        "files": {},
+    }
+
+    with pytest.raises(Exception):
+        DerivationManifest.model_validate(manifest, strict=True)
+    with pytest.raises(MemError) as caught:
+        build_projection(
+            committed_workspace.repository, tmp_path / "projection", source_commit
+        )
+    assert caught.value.detail.code == "DERIVATION_FAILED"
 
 
 def test_projection_paths_encode_valid_unicode_colons_and_traversal_safely(

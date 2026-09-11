@@ -40,7 +40,7 @@ _REQUIRED_STREAMS = frozenset(
     (*_DIRECTORY_STREAMS, "meta_revisions", "session_handoffs")
 )
 _PORTABLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_COMMIT = re.compile(r"^[0-9a-f]{40,64}$")
+_COMMIT = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _WINDOWS_RESERVED = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{index}" for index in range(1, 10)}
@@ -277,17 +277,8 @@ def _exact_profile(repository: MemoryRepository, source_commit: str) -> ProfileC
             value=source_commit,
             retry_safe=False,
         )
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repository.root),
-            "rev-parse",
-            "--verify",
-            f"{source_commit}^{{commit}}",
-        ],
-        capture_output=True,
-        check=False,
+    result = _git_probe(
+        repository, "rev-parse", "--verify", f"{source_commit}^{{commit}}"
     )
     observed_commit = result.stdout.decode("ascii", errors="replace").strip()
     if result.returncode or observed_commit != source_commit:
@@ -296,6 +287,38 @@ def _exact_profile(repository: MemoryRepository, source_commit: str) -> ProfileC
             value=source_commit,
             retry_safe=False,
         )
+    head_result = _git_probe(repository, "rev-parse", "--verify", "HEAD^{commit}")
+    head_commit = head_result.stdout.decode("ascii", errors="replace").strip()
+    if (
+        head_result.returncode
+        or not _COMMIT.fullmatch(head_commit)
+        or len(head_commit) != len(source_commit)
+    ):
+        raise derivation_error(
+            "Canonical HEAD cannot be resolved to one full commit ID",
+            value=head_result.stderr.decode("utf-8", errors="replace").strip(),
+            retry_safe=False,
+        )
+    if source_commit != head_commit:
+        ancestry = _git_probe(
+            repository,
+            "merge-base",
+            "--is-ancestor",
+            source_commit,
+            head_commit,
+        )
+        if ancestry.returncode == 1:
+            raise derivation_error(
+                "source_commit is not in canonical HEAD history",
+                value={"source_commit": source_commit, "head": head_commit},
+                retry_safe=False,
+            )
+        if ancestry.returncode != 0:
+            raise derivation_error(
+                "Canonical commit ancestry cannot be established",
+                value=ancestry.stderr.decode("utf-8", errors="replace").strip(),
+                retry_safe=False,
+            )
     marker = strict_json_object(
         _git_blob(repository, source_commit, ".mem-profile.json"),
         path=".mem-profile.json",
@@ -365,6 +388,23 @@ def _exact_profile(repository: MemoryRepository, source_commit: str) -> ProfileC
     return profile
 
 
+def _git_probe(
+    repository: MemoryRepository, *arguments: str
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repository.root), *arguments],
+            capture_output=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise derivation_error(
+            "Canonical Git boundary cannot be inspected",
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+
+
 def _git_blob(repository: MemoryRepository, commit: str, relative: str) -> bytes:
     try:
         result = subprocess.run(
@@ -412,64 +452,130 @@ def _parse_jsonl(data: bytes, relative: str) -> list[dict[str, Any]]:
 
 
 def _write_new_tree(target: Path, files: dict[str, bytes]) -> None:
-    target = target.absolute()
+    target = Path(target)
+    name = target.name
     try:
-        observed = os.lstat(target)
-    except FileNotFoundError:
-        observed = None
-    except OSError as exc:
+        name.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
         raise derivation_error(
-            "Projection target cannot be inspected safely",
+            "Projection target name must be valid UTF-8",
             path=target,
+            retry_safe=False,
+        ) from exc
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or any(ord(character) < 32 for character in name)
+    ):
+        raise derivation_error(
+            "Projection target must have one safe final path component",
+            path=target,
+            retry_safe=False,
+        )
+    target = target.absolute()
+    parent_path = target.parent
+    try:
+        parent_observed = os.lstat(parent_path)
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Projection target parent cannot be inspected safely",
+            path=parent_path,
             value=str(exc),
             retry_safe=False,
         ) from exc
-    if observed is None:
-        try:
-            os.mkdir(target, mode=0o700)
-        except OSError as exc:
-            raise derivation_error(
-                "Projection target cannot be created safely",
-                path=target,
-                value=str(exc),
-                retry_safe=False,
-            ) from exc
-        try:
-            observed = os.lstat(target)
-        except OSError as exc:
-            raise derivation_error(
-                "Projection target changed after creation",
-                path=target,
-                value=str(exc),
-                retry_safe=False,
-            ) from exc
-    elif not stat.S_ISDIR(observed.st_mode):
+    if not stat.S_ISDIR(parent_observed.st_mode):
         raise derivation_error(
-            "Projection target must be absent or an empty real directory",
-            path=target,
+            "Projection target parent must be a real directory",
+            path=parent_path,
             retry_safe=False,
         )
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        root_fd = os.open(target, flags)
-    except OSError as exc:
+        parent_fd = os.open(parent_path, flags)
+    except (OSError, TypeError, ValueError) as exc:
         raise derivation_error(
-            "Projection target changed while it was opened",
-            path=target,
+            "Projection target parent cannot be opened without following links",
+            path=parent_path,
             value=str(exc),
             retry_safe=False,
         ) from exc
+    root_fd: int | None = None
     try:
-        assert observed is not None
-        target_identity = (observed.st_dev, observed.st_ino)
-        opened = os.fstat(root_fd)
-        if (opened.st_dev, opened.st_ino) != target_identity:
+        parent_identity = (parent_observed.st_dev, parent_observed.st_ino)
+        if _stat_identity(os.fstat(parent_fd)) != parent_identity:
+            raise derivation_error(
+                "Projection target parent identity changed while it was opened",
+                path=parent_path,
+                retry_safe=False,
+            )
+        _require_path_identity(parent_path, parent_identity)
+        try:
+            observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _require_path_identity(parent_path, parent_identity)
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            except (OSError, TypeError, ValueError) as exc:
+                raise derivation_error(
+                    "Projection target cannot be created safely",
+                    path=target,
+                    value=str(exc),
+                    retry_safe=False,
+                ) from exc
+            try:
+                observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except (OSError, TypeError, ValueError) as exc:
+                raise derivation_error(
+                    "Projection target changed after creation",
+                    path=target,
+                    value=str(exc),
+                    retry_safe=False,
+                ) from exc
+        except (OSError, TypeError, ValueError) as exc:
+            raise derivation_error(
+                "Projection target cannot be inspected without following links",
+                path=target,
+                value=str(exc),
+                retry_safe=False,
+            ) from exc
+        if not stat.S_ISDIR(observed.st_mode):
+            raise derivation_error(
+                "Projection target must be absent or an empty real directory",
+                path=target,
+                retry_safe=False,
+            )
+        target_identity = _stat_identity(observed)
+        _require_named_identity(parent_fd, name, target_identity, target)
+        _require_path_identity(parent_path, parent_identity)
+        try:
+            root_fd = os.open(name, flags, dir_fd=parent_fd)
+        except (OSError, TypeError, ValueError) as exc:
+            raise derivation_error(
+                "Projection target changed while it was opened",
+                path=target,
+                value=str(exc),
+                retry_safe=False,
+            ) from exc
+        if _stat_identity(os.fstat(root_fd)) != target_identity:
             raise derivation_error(
                 "Projection target identity changed while it was opened",
                 path=target,
                 retry_safe=False,
             )
-        if os.listdir(root_fd):
+        _require_named_identity(parent_fd, name, target_identity, target)
+        _require_path_identity(parent_path, parent_identity)
+        try:
+            entries = os.listdir(root_fd)
+        except OSError as exc:
+            raise derivation_error(
+                "Projection target cannot be enumerated safely",
+                path=target,
+                value=str(exc),
+                retry_safe=False,
+            ) from exc
+        if entries:
             raise derivation_error(
                 "Projection target must be empty", path=target, retry_safe=False
             )
@@ -477,30 +583,57 @@ def _write_new_tree(target: Path, files: dict[str, bytes]) -> None:
             files.items(), key=lambda item: item[0].encode("utf-8")
         ):
             _write_exclusive(root_fd, relative, content)
-        try:
-            current = os.lstat(target)
-        except OSError as exc:
-            raise derivation_error(
-                "Projection target changed during construction",
-                path=target,
-                value=str(exc),
-                retry_safe=False,
-            ) from exc
-        if (
-            not stat.S_ISDIR(current.st_mode)
-            or (
-                current.st_dev,
-                current.st_ino,
-            )
-            != target_identity
-        ):
-            raise derivation_error(
-                "Projection target identity changed during construction",
-                path=target,
-                retry_safe=False,
-            )
+        _require_named_identity(parent_fd, name, target_identity, target)
+        _require_path_identity(parent_path, parent_identity)
     finally:
-        os.close(root_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _stat_identity(observed: os.stat_result) -> tuple[int, int]:
+    return observed.st_dev, observed.st_ino
+
+
+def _require_path_identity(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        observed = os.lstat(path)
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Projection target parent changed during construction",
+            path=path,
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+    if not stat.S_ISDIR(observed.st_mode) or _stat_identity(observed) != identity:
+        raise derivation_error(
+            "Projection target parent identity changed during construction",
+            path=path,
+            retry_safe=False,
+        )
+
+
+def _require_named_identity(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int],
+    display_path: Path,
+) -> None:
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Projection target name changed during construction",
+            path=display_path,
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+    if not stat.S_ISDIR(observed.st_mode) or _stat_identity(observed) != identity:
+        raise derivation_error(
+            "Projection target identity changed during construction",
+            path=display_path,
+            retry_safe=False,
+        )
 
 
 def _write_exclusive(root_fd: int, relative: str, content: bytes) -> None:

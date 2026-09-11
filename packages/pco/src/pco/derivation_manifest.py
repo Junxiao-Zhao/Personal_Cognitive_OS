@@ -70,7 +70,7 @@ class DerivationManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     kind: Literal["pco_memory", "retrieval_index"]
-    source_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    source_commit: str = Field(pattern=r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
     profile_version: str = Field(min_length=1)
     files: dict[str, str]
 
