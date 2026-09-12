@@ -1080,3 +1080,92 @@ def test_private_query_cleanup_is_fd_bound_and_preserves_parent_replacement(
     assert replacement_survived == b"replacement must survive"
     assert retained_payloads == {}
     assert dict(os.environ) == environment_before
+
+
+@pytest.mark.parametrize("special_kind", ["symlink", "fifo"])
+@pytest.mark.parametrize("backend_raises", [False, True])
+def test_private_query_cleanup_continues_after_special_entry_first(
+    committed_workspace,
+    tmp_path: Path,
+    stub_backends,
+    monkeypatch,
+    special_kind: str,
+    backend_raises: bool,
+) -> None:
+    generation = tmp_path / f"generation-{special_kind}-first-{backend_raises}"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    generation_before = _tree(generation)
+    external = tmp_path / f"external-{special_kind}-{backend_raises}.txt"
+    external.write_bytes(b"external must not be followed")
+    real_listdir = os.listdir
+    descriptors_before = len(real_listdir("/proc/self/fd"))
+    observed: dict[str, object] = {}
+
+    def inject_special_first(query_root: Path, *_args, **_kwargs):
+        real_root = query_root.resolve()
+        parent = real_root.parent
+        retained = parent.with_name(parent.name + "-retained")
+        parent.rename(retained)
+        parent.mkdir()
+        sentinel = parent / "replacement.txt"
+        sentinel.write_bytes(b"replacement must survive")
+        special = query_root / "tantivy/0-special"
+        if special_kind == "symlink":
+            special.symlink_to(external)
+        else:
+            os.mkfifo(special)
+
+        def special_first(path):
+            names = real_listdir(path)
+            if "0-special" in names:
+                names.remove("0-special")
+                names.insert(0, "0-special")
+            return names
+
+        monkeypatch.setattr(retrieval.os, "listdir", special_first)
+        observed.update(
+            parent=parent,
+            retained=retained,
+            sentinel=sentinel,
+            special=retained / "generation/tantivy/0-special",
+            payload=retained / "generation/tantivy/meta.json",
+        )
+        if backend_raises:
+            raise RuntimeError("backend failed after injecting special entry")
+        return {}, {}
+
+    monkeypatch.setattr(retrieval, "query_backends", inject_special_first)
+    try:
+        result = search(
+            repo_root=committed_workspace.paths.canonical,
+            indexes_root=generation,
+            query="reviewed",
+        )
+        descriptors_after = len(real_listdir("/proc/self/fd"))
+        parent = Path(observed["parent"])
+        retained = Path(observed["retained"])
+        sentinel = Path(observed["sentinel"])
+        special = Path(observed["special"])
+        payload = Path(observed["payload"])
+        replacement = sentinel.read_bytes()
+        retained_entries = real_listdir(retained)
+        special_survived = os.path.lexists(special)
+        payload_survived = payload.exists()
+    finally:
+        for key in ("parent", "retained"):
+            path = observed.get(key)
+            if path is not None:
+                shutil.rmtree(Path(path), ignore_errors=True)
+
+    assert result["derivation_status"] == "fallback"
+    assert external.read_bytes() == b"external must not be followed"
+    assert replacement == b"replacement must survive"
+    assert special_survived is False
+    assert payload_survived is False
+    assert retained_entries == []
+    assert descriptors_after == descriptors_before
+    assert _tree(generation) == generation_before

@@ -50,6 +50,7 @@ _SYSTEM_TEMP_PARENT = Path("/tmp")
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
+_CLEANUP_MAX_PASSES = 16
 
 
 @dataclass(frozen=True)
@@ -753,25 +754,72 @@ def _named_directory_matches(
 
 
 def _erase_open_directory(directory_fd: int) -> None:
-    for name in os.listdir(directory_fd):
-        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        identity = _stat_identity(observed)
-        if stat.S_ISDIR(observed.st_mode):
-            child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+    errors: list[str] = []
+    for _ in range(_CLEANUP_MAX_PASSES):
+        try:
+            names = os.listdir(directory_fd)
+        except OSError as exc:
+            errors.append(str(exc))
+            break
+        if not names:
+            return
+        progress = False
+        for name in names:
             try:
-                if _stat_identity(os.fstat(child_fd)) != identity:
-                    raise OSError("private query directory identity changed")
-                _erase_open_directory(child_fd)
-            finally:
-                os.close(child_fd)
-            if _named_directory_matches(directory_fd, name, identity):
-                os.rmdir(name, dir_fd=directory_fd)
-        elif stat.S_ISREG(observed.st_mode):
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if stat.S_ISREG(current.st_mode) and _stat_identity(current) == identity:
+                observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                progress = True
+                continue
+            except OSError as exc:
+                errors.append(str(exc))
+                continue
+            identity = _stat_identity(observed)
+            entry_type = stat.S_IFMT(observed.st_mode)
+            if stat.S_ISDIR(observed.st_mode):
+                child_fd: int | None = None
+                try:
+                    child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+                    if _stat_identity(os.fstat(child_fd)) != identity:
+                        raise OSError("private query directory identity changed")
+                    _erase_open_directory(child_fd)
+                except OSError as exc:
+                    errors.append(str(exc))
+                finally:
+                    if child_fd is not None:
+                        os.close(child_fd)
+                try:
+                    if _named_directory_matches(directory_fd, name, identity):
+                        os.rmdir(name, dir_fd=directory_fd)
+                        progress = True
+                except FileNotFoundError:
+                    progress = True
+                except OSError as exc:
+                    errors.append(str(exc))
+                continue
+            try:
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    _stat_identity(current) != identity
+                    or stat.S_IFMT(current.st_mode) != entry_type
+                ):
+                    errors.append("private query entry identity changed")
+                    continue
                 os.unlink(name, dir_fd=directory_fd)
-        else:
-            raise OSError("private query tree contains a non-owned entry")
+                progress = True
+            except FileNotFoundError:
+                progress = True
+            except OSError as exc:
+                errors.append(str(exc))
+        try:
+            if not os.listdir(directory_fd):
+                return
+        except OSError as exc:
+            errors.append(str(exc))
+            break
+        if not progress:
+            break
+    detail = "; ".join(errors[-4:]) or "cleanup made no progress"
+    raise OSError(f"private query directory could not be emptied: {detail}")
 
 
 def _workspace_root(canonical_root: Path) -> Path:
