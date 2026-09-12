@@ -12,8 +12,8 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import stat
-from tempfile import TemporaryDirectory
 from typing import Any, Iterable, Iterator, Mapping
 
 from mem_core.errors import MemError
@@ -46,6 +46,10 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]")
 SEARCH_MODES = frozenset({"current", "historical", "change", "pattern", "continuity"})
 CANONICAL_FALLBACK_CANDIDATES = 200
 BACKEND_CANDIDATES = 200
+_SYSTEM_TEMP_PARENT = Path("/tmp")
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
 
 
 @dataclass(frozen=True)
@@ -726,8 +730,61 @@ def _key(document: Mapping[str, Any]) -> str:
     return f"{document['stream']}:{document['id']}@{document['revision']}"
 
 
+def _snapshot_directory_fd(root_fd: int) -> _TreeSnapshot:
+    files: dict[str, bytes] = {}
+    directories: set[str] = set()
+    identities: dict[str, tuple[int, int, int]] = {}
+    root_before = os.fstat(root_fd)
+    _scan_open_directory(root_fd, PurePosixPath("."), files, directories, identities)
+    root_after = os.fstat(root_fd)
+    if _file_version(root_before) != _file_version(root_after):
+        raise derivation_error("Private Tantivy snapshot changed during capture")
+    return _TreeSnapshot(files, frozenset(directories), identities)
+
+
+def _named_directory_matches(
+    parent_fd: int, name: str, identity: tuple[int, int]
+) -> bool:
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISDIR(observed.st_mode) and _stat_identity(observed) == identity
+
+
+def _erase_open_directory(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        identity = _stat_identity(observed)
+        if stat.S_ISDIR(observed.st_mode):
+            child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+            try:
+                if _stat_identity(os.fstat(child_fd)) != identity:
+                    raise OSError("private query directory identity changed")
+                _erase_open_directory(child_fd)
+            finally:
+                os.close(child_fd)
+            if _named_directory_matches(directory_fd, name, identity):
+                os.rmdir(name, dir_fd=directory_fd)
+        elif stat.S_ISREG(observed.st_mode):
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISREG(current.st_mode) and _stat_identity(current) == identity:
+                os.unlink(name, dir_fd=directory_fd)
+        else:
+            raise OSError("private query tree contains a non-owned entry")
+
+
+def _workspace_root(canonical_root: Path) -> Path:
+    canonical = Path(canonical_root).resolve(strict=True)
+    if canonical.parent.name == ".pco":
+        return canonical.parent.parent
+    return canonical.parent
+
+
 @contextmanager
-def _private_tantivy_snapshot(snapshot: _TreeSnapshot) -> Iterator[Path]:
+def _private_tantivy_snapshot(
+    snapshot: _TreeSnapshot, *, forbidden_roots: Iterable[Path]
+) -> Iterator[Path]:
     payloads = {
         relative: content
         for relative, content in snapshot.files.items()
@@ -735,21 +792,118 @@ def _private_tantivy_snapshot(snapshot: _TreeSnapshot) -> Iterator[Path]:
     }
     if not payloads:
         raise derivation_error("Retrieval snapshot has no Tantivy payload")
-    with TemporaryDirectory(prefix="pco-query-") as parent_name:
-        root = Path(parent_name) / "generation"
-        written = _write_new_tree(root, payloads)
-        with _open_tree(root, expected=written) as tree:
-            before = _snapshot_open_tree(tree)
-            if before.files != payloads:
-                raise derivation_error(
-                    "Private Tantivy snapshot does not match verified payload"
-                )
-            yield root
-            after = _snapshot_open_tree(tree)
-            if after != before:
-                raise derivation_error(
-                    "Private Tantivy snapshot changed during query", path=root
-                )
+    system_fd: int | None = None
+    parent_fd: int | None = None
+    root_fd: int | None = None
+    parent_name: str | None = None
+    parent_identity: tuple[int, int] | None = None
+    root_identity: tuple[int, int] | None = None
+    try:
+        system_parent = Path(_SYSTEM_TEMP_PARENT).absolute()
+        observed = os.lstat(system_parent)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise derivation_error(
+                "System temporary parent is not a real directory",
+                path=system_parent,
+            )
+        system_identity = _stat_identity(observed)
+        resolved_parent = system_parent.resolve(strict=True)
+        resolved_forbidden = [
+            Path(path).resolve(strict=True) for path in forbidden_roots
+        ]
+        if any(resolved_parent.is_relative_to(path) for path in resolved_forbidden):
+            raise derivation_error(
+                "System temporary parent is inside protected workspace state",
+                path=system_parent,
+            )
+        system_fd = os.open(system_parent, _DIRECTORY_OPEN_FLAGS)
+        if _stat_identity(os.fstat(system_fd)) != system_identity:
+            raise derivation_error(
+                "System temporary parent identity changed", path=system_parent
+            )
+        _require_path_identity(system_parent, system_identity)
+
+        for _ in range(128):
+            candidate = f"pco-query-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate, mode=0o700, dir_fd=system_fd)
+            except FileExistsError:
+                continue
+            parent_name = candidate
+            break
+        if parent_name is None:
+            raise derivation_error(
+                "Private query parent name could not be allocated",
+                path=system_parent,
+            )
+        parent_observed = os.stat(parent_name, dir_fd=system_fd, follow_symlinks=False)
+        parent_identity = _stat_identity(parent_observed)
+        parent_fd = os.open(parent_name, _DIRECTORY_OPEN_FLAGS, dir_fd=system_fd)
+        if _stat_identity(os.fstat(parent_fd)) != parent_identity:
+            raise derivation_error("Private query parent identity changed")
+
+        os.mkdir("generation", mode=0o700, dir_fd=parent_fd)
+        root_observed = os.stat("generation", dir_fd=parent_fd, follow_symlinks=False)
+        root_identity = _stat_identity(root_observed)
+        root_fd = os.open("generation", _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        if _stat_identity(os.fstat(root_fd)) != root_identity:
+            raise derivation_error("Private query root identity changed")
+        for relative, content in sorted(
+            payloads.items(), key=lambda item: item[0].encode("utf-8")
+        ):
+            _write_exclusive(root_fd, relative, content)
+        before = _snapshot_directory_fd(root_fd)
+        if before.files != payloads:
+            raise derivation_error(
+                "Private Tantivy snapshot does not match verified payload"
+            )
+        yield Path(f"/proc/self/fd/{root_fd}")
+        after = _snapshot_directory_fd(root_fd)
+        if after != before:
+            raise derivation_error("Private Tantivy snapshot changed during query")
+    except MemError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Private Tantivy snapshot could not be managed safely", value=str(exc)
+        ) from exc
+    finally:
+        cleanup_error: Exception | None = None
+        if root_fd is not None:
+            try:
+                _erase_open_directory(root_fd)
+            except (OSError, TypeError, ValueError) as exc:
+                cleanup_error = exc
+            finally:
+                os.close(root_fd)
+        if (
+            parent_fd is not None
+            and root_identity is not None
+            and _named_directory_matches(parent_fd, "generation", root_identity)
+        ):
+            try:
+                os.rmdir("generation", dir_fd=parent_fd)
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+        if parent_fd is not None:
+            os.close(parent_fd)
+        if (
+            system_fd is not None
+            and parent_name is not None
+            and parent_identity is not None
+            and _named_directory_matches(system_fd, parent_name, parent_identity)
+        ):
+            try:
+                os.rmdir(parent_name, dir_fd=system_fd)
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
+        if system_fd is not None:
+            os.close(system_fd)
+        if cleanup_error is not None:
+            raise derivation_error(
+                "Private Tantivy snapshot could not be cleaned safely",
+                value=str(cleanup_error),
+            ) from cleanup_error
 
 
 def query_backends(
@@ -826,7 +980,14 @@ def search(
             documents = _read_json_list_bytes(initial.files["documents.json"])
             reverse_refs = _read_reverse_refs_bytes(initial.files["reverse_refs.json"])
             selected = _select_mode(documents, mode, start_at, end_at)
-            with _private_tantivy_snapshot(initial) as query_root:
+            with _private_tantivy_snapshot(
+                initial,
+                forbidden_roots=(
+                    _workspace_root(Path(repo_root)),
+                    Path(repo_root),
+                    generation,
+                ),
+            ) as query_root:
                 backend_scores = query_backends(
                     query_root,
                     query,

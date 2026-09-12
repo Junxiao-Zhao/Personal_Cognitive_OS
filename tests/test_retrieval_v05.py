@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import tempfile
 
 import pytest
 
@@ -964,4 +965,118 @@ def test_backend_query_consumes_private_snapshot_during_replace_and_restore(
     assert _layout(committed_workspace.paths.canonical) == canonical_layout_before
     assert _tree(committed_workspace.paths.tmp) == workspace_tmp_before
     assert _layout(committed_workspace.paths.tmp) == workspace_tmp_layout_before
+    assert dict(os.environ) == environment_before
+
+
+def test_private_query_copy_ignores_workspace_tmpdir_and_unsafe_parent_falls_back(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation-external-query-copy"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    workspace = committed_workspace.paths.root.resolve()
+    hostile_tmp = committed_workspace.paths.tmp.resolve()
+    before = _tree(workspace)
+    layout_before = _layout(workspace)
+    observed: list[Path] = []
+
+    def observe_root(query_root: Path, *_args, **_kwargs):
+        observed.append(query_root.resolve())
+        assert (query_root / "tantivy/meta.json").read_bytes() == b'{"count": 9}'
+        return {}, {}
+
+    previous_tempdir = tempfile.tempdir
+    try:
+        monkeypatch.setenv("TMPDIR", str(hostile_tmp))
+        tempfile.tempdir = None
+        monkeypatch.setattr(retrieval, "query_backends", observe_root)
+
+        result = search(
+            repo_root=committed_workspace.paths.canonical,
+            indexes_root=generation,
+            query="reviewed",
+        )
+    finally:
+        tempfile.tempdir = previous_tempdir
+
+    assert result["derivation_status"] == "current"
+    assert len(observed) == 1
+    assert not observed[0].is_relative_to(workspace)
+    assert not observed[0].is_relative_to(committed_workspace.paths.canonical.resolve())
+    assert not observed[0].is_relative_to(generation.resolve())
+    assert _tree(workspace) == before
+    assert _layout(workspace) == layout_before
+
+    monkeypatch.setattr(retrieval, "_SYSTEM_TEMP_PARENT", hostile_tmp, raising=False)
+    observed.clear()
+    fallback = search(
+        repo_root=committed_workspace.paths.canonical,
+        indexes_root=generation,
+        query="reviewed",
+    )
+
+    assert fallback["derivation_status"] == "fallback"
+    assert observed == []
+    assert _tree(workspace) == before
+    assert _layout(workspace) == layout_before
+
+
+@pytest.mark.parametrize("backend_raises", [False, True])
+def test_private_query_cleanup_is_fd_bound_and_preserves_parent_replacement(
+    committed_workspace,
+    tmp_path: Path,
+    stub_backends,
+    monkeypatch,
+    backend_raises: bool,
+) -> None:
+    generation = tmp_path / f"generation-parent-rebind-{backend_raises}"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    original_payload = (generation / "tantivy/meta.json").read_bytes()
+    environment_before = dict(os.environ)
+    observed: dict[str, object] = {}
+
+    def rebind_parent(query_root: Path, *_args, **_kwargs):
+        real_root = query_root.resolve()
+        parent = real_root.parent
+        retained = parent.with_name(parent.name + "-retained")
+        parent.rename(retained)
+        parent.mkdir()
+        sentinel = parent / "replacement.txt"
+        sentinel.write_bytes(b"replacement must survive")
+        observed.update(parent=parent, retained=retained, sentinel=sentinel)
+        observed["consumed"] = (query_root / "tantivy/meta.json").read_bytes()
+        if backend_raises:
+            raise RuntimeError("backend failed after parent rebind")
+        return {}, {}
+
+    monkeypatch.setattr(retrieval, "query_backends", rebind_parent)
+    try:
+        result = search(
+            repo_root=committed_workspace.paths.canonical,
+            indexes_root=generation,
+            query="reviewed",
+        )
+        parent = Path(observed["parent"])
+        retained = Path(observed["retained"])
+        sentinel = Path(observed["sentinel"])
+        replacement_survived = sentinel.read_bytes()
+        retained_payloads = _tree(retained)
+    finally:
+        for key in ("parent", "retained"):
+            path = observed.get(key)
+            if path is not None:
+                shutil.rmtree(Path(path), ignore_errors=True)
+
+    expected_status = "fallback" if backend_raises else "current"
+    assert result["derivation_status"] == expected_status
+    assert observed["consumed"] == original_payload
+    assert replacement_survived == b"replacement must survive"
+    assert retained_payloads == {}
     assert dict(os.environ) == environment_before
