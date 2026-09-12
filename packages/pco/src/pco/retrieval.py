@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -22,13 +23,21 @@ from mem_core.repository import MemoryRepository
 from .backlinks import build_reverse_references
 from .derivation_manifest import (
     DerivationManifest,
-    _read_tree_no_follow,
     canonical_manifest_bytes,
     derivation_error,
+    hash_bytes,
     manifest_for_files,
-    verify_derivation_tree,
+    strict_json_object,
 )
-from .projections import _write_new_tree, exact_canonical_records
+from .projections import (
+    _WrittenTreeIdentity,
+    _require_named_identity,
+    _require_path_identity,
+    _stat_identity,
+    _write_exclusive,
+    _write_new_tree,
+    exact_canonical_records,
+)
 from .paths import bundled_profile
 from .validation import latest_effective
 
@@ -38,10 +47,343 @@ CANONICAL_FALLBACK_CANDIDATES = 200
 BACKEND_CANDIDATES = 200
 
 
+@dataclass(frozen=True)
+class _TreeSnapshot:
+    files: dict[str, bytes]
+    directories: frozenset[str]
+    identities: dict[str, tuple[int, int, int]]
+
+
+@dataclass
+class _OpenedTree:
+    identity: _WrittenTreeIdentity
+    parent_fd: int
+    root_fd: int
+
+    @property
+    def anchored_path(self) -> Path:
+        return Path(f"/proc/self/fd/{self.root_fd}")
+
+    def require_bound(self) -> None:
+        if _stat_identity(os.fstat(self.parent_fd)) != self.identity.parent_identity:
+            raise derivation_error(
+                "Derivation target parent descriptor identity changed",
+                path=self.identity.parent,
+            )
+        if _stat_identity(os.fstat(self.root_fd)) != self.identity.target_identity:
+            raise derivation_error(
+                "Derivation target descriptor identity changed",
+                path=self.identity.target,
+            )
+        _require_path_identity(self.identity.parent, self.identity.parent_identity)
+        _require_named_identity(
+            self.parent_fd,
+            self.identity.name,
+            self.identity.target_identity,
+            self.identity.target,
+        )
+
+
+@contextmanager
+def _open_tree(
+    target: Path, *, expected: _WrittenTreeIdentity | None = None
+) -> Iterator[_OpenedTree]:
+    target = Path(target).absolute()
+    name = target.name
+    parent = target.parent
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise derivation_error("Derivation target name is unsafe", path=target)
+    try:
+        parent_observed = os.lstat(parent)
+        if not stat.S_ISDIR(parent_observed.st_mode):
+            raise derivation_error(
+                "Derivation target parent is not a real directory", path=parent
+            )
+        parent_identity = _stat_identity(parent_observed)
+        flags = (
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        )
+        parent_fd = os.open(parent, flags)
+    except MemError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Derivation target parent cannot be opened safely",
+            path=parent,
+            value=str(exc),
+        ) from exc
+    root_fd: int | None = None
+    try:
+        if expected is not None:
+            if (
+                expected.target != target
+                or expected.parent != parent
+                or expected.name != name
+            ):
+                raise derivation_error(
+                    "Derivation target identity token does not match its path",
+                    path=target,
+                )
+            parent_identity = expected.parent_identity
+        if _stat_identity(os.fstat(parent_fd)) != parent_identity:
+            raise derivation_error(
+                "Derivation target parent identity changed", path=parent
+            )
+        _require_path_identity(parent, parent_identity)
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise derivation_error(
+                "Derivation target is not a real directory", path=target
+            )
+        target_identity = _stat_identity(observed)
+        if expected is not None and target_identity != expected.target_identity:
+            raise derivation_error(
+                "Derivation target identity changed between construction phases",
+                path=target,
+            )
+        identity = expected or _WrittenTreeIdentity(
+            target=target,
+            parent=parent,
+            name=name,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+        )
+        root_fd = os.open(name, flags, dir_fd=parent_fd)
+        opened = _OpenedTree(identity, parent_fd, root_fd)
+        opened.require_bound()
+        yield opened
+        opened.require_bound()
+    except MemError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Derivation target changed while it was open",
+            path=target,
+            value=str(exc),
+        ) from exc
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+
+
 def tokenize(text: str) -> list[str]:
     base = [token.lower() for token in TOKEN_RE.findall(text)]
     cjk = [token for token in base if len(token) == 1 and "\u3400" <= token <= "\u9fff"]
     return base + [cjk[index] + cjk[index + 1] for index in range(len(cjk) - 1)]
+
+
+def _snapshot_open_tree(tree: _OpenedTree) -> _TreeSnapshot:
+    tree.require_bound()
+    files: dict[str, bytes] = {}
+    directories: set[str] = set()
+    identities: dict[str, tuple[int, int, int]] = {}
+    root_before = os.fstat(tree.root_fd)
+    _scan_open_directory(
+        tree.root_fd, PurePosixPath("."), files, directories, identities
+    )
+    root_after = os.fstat(tree.root_fd)
+    if _file_version(root_before) != _file_version(root_after):
+        raise derivation_error(
+            "Derivation target changed while it was captured",
+            path=tree.identity.target,
+        )
+    tree.require_bound()
+    return _TreeSnapshot(files, frozenset(directories), identities)
+
+
+def _scan_open_directory(
+    directory_fd: int,
+    prefix: PurePosixPath,
+    files: dict[str, bytes],
+    directories: set[str],
+    identities: dict[str, tuple[int, int, int]],
+) -> None:
+    try:
+        names = os.listdir(directory_fd)
+    except OSError as exc:
+        raise derivation_error(
+            "Derivation directory cannot be enumerated", path=prefix.as_posix()
+        ) from exc
+    normalized: list[str] = []
+    for name in names:
+        try:
+            name.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise derivation_error(
+                "Derivation entry name is not valid UTF-8", path=prefix.as_posix()
+            ) from exc
+        if name in {".", ".."} or "/" in name or "\\" in name:
+            raise derivation_error("Derivation entry name is unsafe", path=name)
+        normalized.append(name)
+    for name in sorted(normalized, key=str.encode):
+        relative = (prefix / name).as_posix().removeprefix("./")
+        try:
+            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise derivation_error(
+                "Derivation entry changed during capture", path=relative
+            ) from exc
+        identity = _stat_identity(observed)
+        identities[relative] = (*identity, stat.S_IFMT(observed.st_mode))
+        if stat.S_ISDIR(observed.st_mode):
+            try:
+                child_fd = os.open(
+                    name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                raise derivation_error(
+                    "Derivation directory changed during capture", path=relative
+                ) from exc
+            try:
+                if _stat_identity(os.fstat(child_fd)) != identity:
+                    raise derivation_error(
+                        "Derivation directory identity changed", path=relative
+                    )
+                directories.add(relative)
+                _scan_open_directory(
+                    child_fd,
+                    PurePosixPath(relative),
+                    files,
+                    directories,
+                    identities,
+                )
+                _require_open_entry(directory_fd, name, identity, relative)
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(observed.st_mode):
+            files[relative] = _read_open_file(directory_fd, name, identity, relative)
+        else:
+            raise derivation_error(
+                "Derivation tree contains a symlink or non-regular entry",
+                path=relative,
+            )
+    try:
+        final_names = os.listdir(directory_fd)
+    except OSError as exc:
+        raise derivation_error(
+            "Derivation directory changed during capture", path=prefix.as_posix()
+        ) from exc
+    if set(final_names) != set(names):
+        raise derivation_error(
+            "Derivation directory contents changed during capture",
+            path=prefix.as_posix(),
+        )
+
+
+def _read_open_file(
+    parent_fd: int, name: str, identity: tuple[int, int], relative: str
+) -> bytes:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise derivation_error(
+            "Derivation file changed during capture", path=relative
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or _stat_identity(before) != identity:
+            raise derivation_error("Derivation file identity changed", path=relative)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if _file_version(before) != _file_version(after):
+            raise derivation_error(
+                "Derivation file changed while it was read", path=relative
+            )
+        _require_open_entry(parent_fd, name, identity, relative)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _require_open_entry(
+    parent_fd: int, name: str, identity: tuple[int, int], relative: str
+) -> None:
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise derivation_error(
+            "Derivation entry changed during capture", path=relative
+        ) from exc
+    if _stat_identity(observed) != identity:
+        raise derivation_error(
+            "Derivation entry identity changed during capture", path=relative
+        )
+
+
+def _file_version(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _validate_generation_snapshot(
+    snapshot: _TreeSnapshot,
+    *,
+    expected_commit: str,
+    expected_profile_version: str,
+) -> DerivationManifest:
+    raw_manifest = snapshot.files.get("manifest.json")
+    if raw_manifest is None:
+        raise derivation_error("Retrieval generation has no manifest")
+    parsed = strict_json_object(raw_manifest, path="manifest.json")
+    try:
+        manifest = DerivationManifest.model_validate(parsed, strict=True)
+    except Exception as exc:
+        raise derivation_error(
+            "Retrieval generation manifest is invalid", value=str(exc)
+        ) from exc
+    if raw_manifest != canonical_manifest_bytes(manifest):
+        raise derivation_error("Retrieval generation manifest is not canonical")
+    if (
+        manifest.kind != "retrieval_index"
+        or manifest.source_commit != expected_commit
+        or manifest.profile_version != expected_profile_version
+    ):
+        raise derivation_error(
+            "Retrieval generation controls do not match canonical state",
+            value={
+                "kind": manifest.kind,
+                "source_commit": manifest.source_commit,
+                "profile_version": manifest.profile_version,
+            },
+        )
+    payloads = {
+        name: data for name, data in snapshot.files.items() if name != "manifest.json"
+    }
+    if set(payloads) != set(manifest.files):
+        raise derivation_error("Retrieval generation payload set is not closed")
+    if any(
+        hash_bytes(payloads[name]) != digest for name, digest in manifest.files.items()
+    ):
+        raise derivation_error("Retrieval generation payload hash is invalid")
+    expected_directories: set[str] = set()
+    for relative in manifest.files:
+        parent = PurePosixPath(relative).parent
+        while parent.as_posix() != ".":
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
+    if set(snapshot.directories) != expected_directories:
+        raise derivation_error("Retrieval generation directory set is not closed")
+    return manifest
 
 
 def _vector(tokens: Iterable[str], dimensions: int = 256) -> list[float]:
@@ -257,83 +599,58 @@ def build_retrieval_generation(
 
     documents, profile_version = canonical_documents(repository, source_commit)
     target = Path(target).absolute()
-    _write_new_tree(
+    base_payloads = {
+        "documents.json": _canonical_json(documents),
+        "reverse_refs.json": _canonical_json(build_reverse_references(documents)),
+    }
+    written = _write_new_tree(
         target,
-        {
-            "documents.json": _canonical_json(documents),
-            "reverse_refs.json": _canonical_json(build_reverse_references(documents)),
-        },
+        base_payloads,
     )
-    root_fd: int | None = None
     try:
-        observed = os.lstat(target)
-        if not stat.S_ISDIR(observed.st_mode):
-            raise derivation_error(
-                "Retrieval target is not a real directory", path=target
+        with _open_tree(target, expected=written) as tree:
+            try:
+                build_tantivy(tree.anchored_path / "tantivy", documents)
+                build_milvus(tree.anchored_path / "milvus.db", documents)
+            except Exception as exc:
+                raise derivation_error(
+                    "Retrieval backend construction failed",
+                    path=target,
+                    value=str(exc),
+                ) from exc
+            built = _snapshot_open_tree(tree)
+            _require_builder_payloads(built.files, base_payloads, target)
+            _materialize_empty_backend_directories(
+                tree.root_fd, built.files, set(built.directories)
             )
-        identity = (observed.st_dev, observed.st_ino)
-        root_fd = os.open(
-            target,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
-        )
-        after_open = os.fstat(root_fd)
-        if (after_open.st_dev, after_open.st_ino) != identity:
-            raise derivation_error("Retrieval target identity changed", path=target)
-        anchored = Path(f"/proc/self/fd/{root_fd}")
-        try:
-            build_tantivy(anchored / "tantivy", documents)
-            build_milvus(anchored / "milvus.db", documents)
-        except Exception as exc:
-            raise derivation_error(
-                "Retrieval backend construction failed", path=target, value=str(exc)
-            ) from exc
-        current = os.lstat(target)
-        if (
-            not stat.S_ISDIR(current.st_mode)
-            or (
-                current.st_dev,
-                current.st_ino,
+            completed = _snapshot_open_tree(tree)
+            _require_builder_payloads(completed.files, base_payloads, target)
+            if "manifest.json" in completed.files:
+                raise derivation_error(
+                    "Retrieval target unexpectedly contains a manifest", path=target
+                )
+            manifest = manifest_for_files(
+                completed.files,
+                kind="retrieval_index",
+                source_commit=source_commit,
+                profile_version=profile_version,
             )
-            != identity
-        ):
-            raise derivation_error("Retrieval target hierarchy changed", path=target)
-        payloads, directories = _read_tree_no_follow(target, identity)
-        _materialize_empty_backend_directories(root_fd, payloads, directories)
-        payloads, _directories = _read_tree_no_follow(target, identity)
-        if "manifest.json" in payloads:
-            raise derivation_error(
-                "Retrieval target unexpectedly contains a manifest", path=target
+            _write_exclusive(
+                tree.root_fd, "manifest.json", canonical_manifest_bytes(manifest)
             )
-        manifest = manifest_for_files(
-            payloads,
-            kind="retrieval_index",
-            source_commit=source_commit,
-            profile_version=profile_version,
-        )
-        descriptor = os.open(
-            "manifest.json",
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-            dir_fd=root_fd,
-        )
-        try:
-            view = memoryview(canonical_manifest_bytes(manifest))
-            while view:
-                written = os.write(descriptor, view)
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        final = verify_derivation_tree(
-            target, kind="retrieval_index", expected_commit=source_commit
-        )
-        if not final["ok"]:
-            raise derivation_error(
-                "Completed retrieval generation failed verification",
-                path=target,
-                value=final,
+            final = _snapshot_open_tree(tree)
+            observed = _validate_generation_snapshot(
+                final,
+                expected_commit=source_commit,
+                expected_profile_version=profile_version,
             )
-        return manifest
+            if observed != manifest:
+                raise derivation_error(
+                    "Completed retrieval manifest changed during construction",
+                    path=target,
+                )
+            _require_builder_payloads(final.files, base_payloads, target)
+            return manifest
     except MemError:
         raise
     except (OSError, TypeError, ValueError) as exc:
@@ -342,9 +659,26 @@ def build_retrieval_generation(
             path=target,
             value=str(exc),
         ) from exc
-    finally:
-        if root_fd is not None:
-            os.close(root_fd)
+
+
+def _require_builder_payloads(
+    payloads: Mapping[str, bytes], base_payloads: Mapping[str, bytes], target: Path
+) -> None:
+    if any(payloads.get(name) != content for name, content in base_payloads.items()):
+        raise derivation_error(
+            "Retrieval generation lost or changed a required canonical payload",
+            path=target,
+        )
+    has_tantivy = any(name.startswith("tantivy/") for name in payloads)
+    has_milvus = any(
+        name == "milvus.db" or name.startswith("milvus.db/") for name in payloads
+    )
+    if not has_tantivy or not has_milvus:
+        raise derivation_error(
+            "Retrieval generation is missing a required backend payload",
+            path=target,
+            value={"tantivy": has_tantivy, "milvus": has_milvus},
+        )
 
 
 def _materialize_empty_backend_directories(
@@ -443,44 +777,57 @@ def search(
         if indexes_root is not None
         else Path(repo_root).parent / "indexes"
     )
-    status = "fallback"
+    canonical, profile_version = canonical_documents(
+        repository, head, canonical_head=head
+    )
+    canonical_payloads = {
+        "documents.json": _canonical_json(canonical),
+        "reverse_refs.json": _canonical_json(build_reverse_references(canonical)),
+    }
+    status = "current"
     diagnostics: dict[str, Any] | None = None
-    backend_scores: tuple[dict[str, float], dict[str, float]] = ({}, {})
+    change_windows: dict[str, Any] | None = None
     try:
-        verified = verify_derivation_tree(
-            generation, kind="retrieval_index", expected_commit=head
-        )
-        if not verified["ok"]:
-            raise ValueError(verified["status"])
-        documents = _read_json_list(generation / "documents.json")
-        reverse_refs = _read_reverse_refs(generation / "reverse_refs.json")
-        selected = _select_mode(documents, mode, start_at, end_at)
-        backend_scores = query_backends(
-            generation,
-            query,
-            {_key(document) for document in selected},
-            min(BACKEND_CANDIDATES, max(limit, 1) * 4),
-        )
-        after = verify_derivation_tree(
-            generation, kind="retrieval_index", expected_commit=head
-        )
-        if not after["ok"]:
-            raise ValueError("generation changed during search")
-        status = "current"
+        with _open_tree(generation) as tree:
+            initial = _snapshot_open_tree(tree)
+            _validate_generation_snapshot(
+                initial,
+                expected_commit=head,
+                expected_profile_version=profile_version,
+            )
+            _require_builder_payloads(initial.files, canonical_payloads, generation)
+            documents = _read_json_list_bytes(initial.files["documents.json"])
+            reverse_refs = _read_reverse_refs_bytes(initial.files["reverse_refs.json"])
+            selected = _select_mode(documents, mode, start_at, end_at)
+            backend_scores = query_backends(
+                tree.anchored_path,
+                query,
+                {_key(document) for document in selected},
+                min(BACKEND_CANDIDATES, max(limit, 1) * 4),
+            )
+            items = _rank(selected, reverse_refs, query, mode, limit, backend_scores)
+            if mode == "change":
+                change_windows = _change_window_summary(selected)
+            final = _snapshot_open_tree(tree)
+            if final != initial:
+                raise derivation_error(
+                    "Retrieval generation changed while search consumed it",
+                    path=generation,
+                )
     except Exception as exc:
+        status = "fallback"
         diagnostics = {
             "code": "DERIVATION_FAILED",
             "message": "retrieval generation unavailable; canonical fallback used",
             "value": str(exc),
         }
-        documents, _profile_version = canonical_documents(
-            repository, head, canonical_head=head
-        )
+        documents = canonical
         reverse_refs = build_reverse_references(documents)
         selected = _select_mode(documents, mode, start_at, end_at)
         selected = _bounded_recent(selected, CANONICAL_FALLBACK_CANDIDATES)
-        backend_scores = ({}, {})
-    items = _rank(selected, reverse_refs, query, mode, limit, backend_scores)
+        items = _rank(selected, reverse_refs, query, mode, limit, ({}, {}))
+        if mode == "change":
+            change_windows = _change_window_summary(selected)
     result: dict[str, Any] = {
         "ok": True,
         "query": query,
@@ -492,8 +839,8 @@ def search(
     }
     if diagnostics is not None:
         result["fallback_diagnostic"] = diagnostics
-    if mode == "change":
-        result["change_windows"] = _change_window_summary(selected)
+    if change_windows is not None:
+        result["change_windows"] = change_windows
     return result
 
 
@@ -650,15 +997,15 @@ def _rank(
     return [item for _sort_key, item in scored[:limit]]
 
 
-def _read_json_list(path: Path) -> list[dict[str, Any]]:
-    value = _read_json(path)
+def _read_json_list_bytes(data: bytes) -> list[dict[str, Any]]:
+    value = _read_json_bytes(data)
     if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
         raise ValueError("documents.json must contain an array of objects")
     return [dict(item) for item in value]
 
 
-def _read_reverse_refs(path: Path) -> dict[str, list[dict[str, Any]]]:
-    value = _read_json(path)
+def _read_reverse_refs_bytes(data: bytes) -> dict[str, list[dict[str, Any]]]:
+    value = _read_json_bytes(data)
     if not isinstance(value, dict):
         raise ValueError("reverse_refs.json must contain an object")
     result: dict[str, list[dict[str, Any]]] = {}
@@ -673,7 +1020,7 @@ def _read_reverse_refs(path: Path) -> dict[str, list[dict[str, Any]]]:
     return result
 
 
-def _read_json(path: Path) -> Any:
+def _read_json_bytes(data: bytes) -> Any:
     class StrictObject(dict):
         pass
 
@@ -688,11 +1035,11 @@ def _read_json(path: Path) -> Any:
     def nonfinite(value: str) -> None:
         raise ValueError(f"non-finite JSON number: {value}")
 
-    return json.loads(
-        path.read_text(encoding="utf-8"),
-        object_pairs_hook=pairs,
-        parse_constant=nonfinite,
-    )
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("retrieval payload must be UTF-8") from exc
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=nonfinite)
 
 
 def _change_window_summary(documents: list[dict[str, Any]]) -> dict[str, Any]:

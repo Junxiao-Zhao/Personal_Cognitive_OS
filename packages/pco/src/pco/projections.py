@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -488,7 +489,16 @@ def _parse_jsonl(data: bytes, relative: str) -> list[dict[str, Any]]:
     return records
 
 
-def _write_new_tree(target: Path, files: dict[str, bytes]) -> None:
+@dataclass(frozen=True)
+class _WrittenTreeIdentity:
+    target: Path
+    parent: Path
+    name: str
+    parent_identity: tuple[int, int]
+    target_identity: tuple[int, int]
+
+
+def _write_new_tree(target: Path, files: dict[str, bytes]) -> _WrittenTreeIdentity:
     target = Path(target)
     name = target.name
     try:
@@ -622,6 +632,13 @@ def _write_new_tree(target: Path, files: dict[str, bytes]) -> None:
             _write_exclusive(root_fd, relative, content)
         _require_named_identity(parent_fd, name, target_identity, target)
         _require_path_identity(parent_path, parent_identity)
+        return _WrittenTreeIdentity(
+            target=target,
+            parent=parent_path,
+            name=name,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+        )
     finally:
         if root_fd is not None:
             os.close(root_fd)

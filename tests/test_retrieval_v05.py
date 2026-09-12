@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 
 import pytest
 
 from mem_core.errors import MemError
 from pco.backlinks import build_reverse_references
-from pco.derivation_manifest import verify_derivation_tree
+from pco.derivation_manifest import (
+    canonical_manifest_bytes,
+    manifest_for_files,
+    verify_derivation_tree,
+)
 from pco import retrieval
 from pco import projections
 from pco.retrieval import build_retrieval_generation, search
@@ -22,6 +27,19 @@ def _tree(root: Path) -> dict[str, bytes]:
         for path in root.rglob("*")
         if path.is_file()
     }
+
+
+def _rehash_generation(root: Path, *, profile_version: str | None = None) -> None:
+    previous = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    payloads = _tree(root)
+    payloads.pop("manifest.json")
+    manifest = manifest_for_files(
+        payloads,
+        kind="retrieval_index",
+        source_commit=previous["source_commit"],
+        profile_version=profile_version or previous["profile_version"],
+    )
+    (root / "manifest.json").write_bytes(canonical_manifest_bytes(manifest))
 
 
 @pytest.fixture
@@ -614,3 +632,264 @@ def test_empty_owned_target_is_accepted(
     )
 
     assert manifest.kind == "retrieval_index"
+
+
+@pytest.mark.parametrize("binding", ["parent", "target"])
+def test_builder_rejects_rebinding_after_base_payloads_without_writing_replacement(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch, binding: str
+) -> None:
+    parent = tmp_path / "caller"
+    parent.mkdir()
+    target = parent / "generation"
+    displaced = tmp_path / f"displaced-{binding}"
+    original = retrieval._write_new_tree
+    swapped = False
+
+    def write_then_rebind(path: Path, files: dict[str, bytes]):
+        nonlocal swapped
+        identity = original(path, files)
+        if binding == "parent":
+            parent.rename(displaced)
+            parent.mkdir()
+            target.mkdir()
+        else:
+            target.rename(displaced)
+            target.mkdir()
+        swapped = True
+        return identity
+
+    monkeypatch.setattr(retrieval, "_write_new_tree", write_then_rebind)
+
+    with pytest.raises(MemError) as caught:
+        build_retrieval_generation(
+            committed_workspace.repository,
+            target,
+            committed_workspace.repository.head(),
+        )
+
+    assert swapped is True
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+    assert _tree(target) == {}
+
+
+@pytest.mark.parametrize("required", ["documents.json", "reverse_refs.json"])
+def test_builder_never_shrinks_manifest_when_required_payload_disappears(
+    committed_workspace, tmp_path: Path, monkeypatch, required: str
+) -> None:
+    def tantivy(path: Path, _documents: list[dict]) -> None:
+        (path.parent / required).unlink()
+        path.mkdir()
+        (path / "meta").write_bytes(b"tantivy")
+
+    monkeypatch.setattr(retrieval, "build_tantivy", tantivy)
+    monkeypatch.setattr(
+        retrieval,
+        "build_milvus",
+        lambda path, _documents: path.write_bytes(b"milvus"),
+    )
+
+    with pytest.raises(MemError) as caught:
+        build_retrieval_generation(
+            committed_workspace.repository,
+            tmp_path / f"missing-{required}",
+            committed_workspace.repository.head(),
+        )
+
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+
+
+def test_builder_requires_both_backend_payloads(
+    committed_workspace, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(retrieval, "build_tantivy", lambda *_args: None)
+    monkeypatch.setattr(retrieval, "build_milvus", lambda *_args: None)
+
+    with pytest.raises(MemError) as caught:
+        build_retrieval_generation(
+            committed_workspace.repository,
+            tmp_path / "missing-backends",
+            committed_workspace.repository.head(),
+        )
+
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+
+
+def test_search_falls_back_when_generation_root_is_rebound_after_query(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation"
+    clone = tmp_path / "clone"
+    displaced = tmp_path / "displaced"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    shutil.copytree(generation, clone)
+
+    def swap_root(*_args, **_kwargs):
+        generation.rename(displaced)
+        clone.rename(generation)
+        return {}, {}
+
+    monkeypatch.setattr(retrieval, "query_backends", swap_root)
+
+    result = search(
+        repo_root=committed_workspace.paths.canonical,
+        indexes_root=generation,
+        query="reviewed",
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["items"]
+
+
+def test_search_falls_back_when_generation_member_is_rebound_with_same_bytes(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+
+    def swap_member(*_args, **_kwargs):
+        member = generation / "documents.json"
+        content = member.read_bytes()
+        member.rename(generation / "documents.old")
+        member.write_bytes(content)
+        (generation / "documents.old").unlink()
+        return {}, {}
+
+    monkeypatch.setattr(retrieval, "query_backends", swap_member)
+
+    result = search(
+        repo_root=committed_workspace.paths.canonical,
+        indexes_root=generation,
+        query="reviewed",
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["items"]
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["bad_text_type", "unknown_stream", "duplicate_key", "wrong_current"],
+)
+def test_manifest_valid_noncanonical_documents_use_fallback(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch, damage: str
+) -> None:
+    generation = tmp_path / f"generation-{damage}"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    documents = json.loads((generation / "documents.json").read_text(encoding="utf-8"))
+    if damage == "bad_text_type":
+        documents[0]["text"] = 7
+    elif damage == "unknown_stream":
+        documents[0]["stream"] = "messages"
+    elif damage == "duplicate_key":
+        documents.append(dict(documents[0]))
+    else:
+        current = next(document for document in documents if document["current"])
+        current["current"] = False
+    (generation / "documents.json").write_text(
+        json.dumps(documents, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    _rehash_generation(generation)
+    monkeypatch.setattr(retrieval, "query_backends", lambda *_args: ({}, {}))
+
+    result = search(
+        repo_root=committed_workspace.paths.canonical,
+        indexes_root=generation,
+        query="reviewed",
+        mode="historical",
+        limit=20,
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["items"]
+
+
+def test_manifest_valid_inconsistent_reverse_refs_use_fallback(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation-bad-refs"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    (generation / "reverse_refs.json").write_text("{}\n", encoding="utf-8")
+    _rehash_generation(generation)
+    monkeypatch.setattr(retrieval, "query_backends", lambda *_args: ({}, {}))
+
+    result = search(
+        repo_root=committed_workspace.paths.canonical,
+        indexes_root=generation,
+        query="reviewed",
+        mode="pattern",
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["items"]
+
+
+def test_manifest_profile_mismatch_uses_fallback(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation-profile-mismatch"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    _rehash_generation(generation, profile_version="0.5.999")
+    monkeypatch.setattr(retrieval, "query_backends", lambda *_args: ({}, {}))
+
+    result = search(
+        repo_root=committed_workspace.paths.canonical,
+        indexes_root=generation,
+        query="reviewed",
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["items"]
+
+
+def test_generation_ranking_failure_stays_inside_fallback_boundary(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation-rank-failure"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    original = retrieval._rank
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TypeError("generation ranking failed")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(retrieval, "query_backends", lambda *_args: ({}, {}))
+    monkeypatch.setattr(retrieval, "_rank", fail_once)
+
+    result = search(
+        repo_root=committed_workspace.paths.canonical,
+        indexes_root=generation,
+        query="reviewed",
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["items"]
