@@ -13,6 +13,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+from tempfile import TemporaryDirectory
 from typing import Any, Iterable, Iterator, Mapping
 
 from mem_core.errors import MemError
@@ -725,6 +726,32 @@ def _key(document: Mapping[str, Any]) -> str:
     return f"{document['stream']}:{document['id']}@{document['revision']}"
 
 
+@contextmanager
+def _private_tantivy_snapshot(snapshot: _TreeSnapshot) -> Iterator[Path]:
+    payloads = {
+        relative: content
+        for relative, content in snapshot.files.items()
+        if relative.startswith("tantivy/")
+    }
+    if not payloads:
+        raise derivation_error("Retrieval snapshot has no Tantivy payload")
+    with TemporaryDirectory(prefix="pco-query-") as parent_name:
+        root = Path(parent_name) / "generation"
+        written = _write_new_tree(root, payloads)
+        with _open_tree(root, expected=written) as tree:
+            before = _snapshot_open_tree(tree)
+            if before.files != payloads:
+                raise derivation_error(
+                    "Private Tantivy snapshot does not match verified payload"
+                )
+            yield root
+            after = _snapshot_open_tree(tree)
+            if after != before:
+                raise derivation_error(
+                    "Private Tantivy snapshot changed during query", path=root
+                )
+
+
 def query_backends(
     generation: Path,
     query: str,
@@ -799,12 +826,13 @@ def search(
             documents = _read_json_list_bytes(initial.files["documents.json"])
             reverse_refs = _read_reverse_refs_bytes(initial.files["reverse_refs.json"])
             selected = _select_mode(documents, mode, start_at, end_at)
-            backend_scores = query_backends(
-                tree.anchored_path,
-                query,
-                {_key(document) for document in selected},
-                min(BACKEND_CANDIDATES, max(limit, 1) * 4),
-            )
+            with _private_tantivy_snapshot(initial) as query_root:
+                backend_scores = query_backends(
+                    query_root,
+                    query,
+                    {_key(document) for document in selected},
+                    min(BACKEND_CANDIDATES, max(limit, 1) * 4),
+                )
             items = _rank(selected, reverse_refs, query, mode, limit, backend_scores)
             if mode == "change":
                 change_windows = _change_window_summary(selected)

@@ -29,6 +29,15 @@ def _tree(root: Path) -> dict[str, bytes]:
     }
 
 
+def _layout(root: Path) -> set[str]:
+    if not root.exists():
+        return set()
+    return {
+        path.relative_to(root).as_posix() + ("/" if path.is_dir() else "")
+        for path in root.rglob("*")
+    }
+
+
 def _rehash_generation(root: Path, *, profile_version: str | None = None) -> None:
     previous = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     payloads = _tree(root)
@@ -255,8 +264,12 @@ def test_backend_query_failure_and_post_read_mutation_fall_back(
     build_retrieval_generation(
         committed_workspace.repository, target, committed_workspace.repository.head()
     )
+    before = _tree(target)
+    layout_before = _layout(target)
+    query_roots: list[Path] = []
 
     def mutate_then_fail(generation, *_args, **_kwargs):
+        query_roots.append(generation)
         (generation / "documents.json").write_text("[]", encoding="utf-8")
         raise RuntimeError("query failed")
 
@@ -269,6 +282,10 @@ def test_backend_query_failure_and_post_read_mutation_fall_back(
 
     assert result["derivation_status"] == "fallback"
     assert result["candidate_count"] > 0
+    assert _tree(target) == before
+    assert _layout(target) == layout_before
+    assert len(query_roots) == 1
+    assert not query_roots[0].exists()
 
 
 def test_reverse_references_are_pure_sorted_and_include_all_reference_fields() -> None:
@@ -893,3 +910,58 @@ def test_generation_ranking_failure_stays_inside_fallback_boundary(
 
     assert result["derivation_status"] == "fallback"
     assert result["items"]
+
+
+def test_backend_query_consumes_private_snapshot_during_replace_and_restore(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation-private-query"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    generation_before = _tree(generation)
+    generation_layout_before = _layout(generation)
+    canonical_before = _tree(committed_workspace.paths.canonical)
+    canonical_layout_before = _layout(committed_workspace.paths.canonical)
+    workspace_tmp_before = _tree(committed_workspace.paths.tmp)
+    workspace_tmp_layout_before = _layout(committed_workspace.paths.tmp)
+    environment_before = dict(os.environ)
+    observed: dict[str, object] = {}
+
+    def replace_query_restore(query_root: Path, *_args, **_kwargs):
+        published = generation / "tantivy/meta.json"
+        retained = generation / "tantivy/meta.retained"
+        published.rename(retained)
+        published.write_bytes(b"transient replacement")
+        try:
+            observed["consumed"] = (query_root / "tantivy/meta.json").read_bytes()
+            observed["same_root"] = os.path.samefile(query_root, generation)
+            observed["query_files"] = sorted(_tree(query_root))
+            observed["query_root"] = query_root
+        finally:
+            published.unlink()
+            retained.rename(published)
+        return {}, {}
+
+    monkeypatch.setattr(retrieval, "query_backends", replace_query_restore)
+
+    result = search(
+        repo_root=committed_workspace.paths.canonical,
+        indexes_root=generation,
+        query="reviewed",
+    )
+
+    assert result["derivation_status"] == "current"
+    assert observed["consumed"] == generation_before["tantivy/meta.json"]
+    assert observed["same_root"] is False
+    assert observed["query_files"] == ["tantivy/meta.json"]
+    assert not Path(observed["query_root"]).exists()
+    assert _tree(generation) == generation_before
+    assert _layout(generation) == generation_layout_before
+    assert _tree(committed_workspace.paths.canonical) == canonical_before
+    assert _layout(committed_workspace.paths.canonical) == canonical_layout_before
+    assert _tree(committed_workspace.paths.tmp) == workspace_tmp_before
+    assert _layout(committed_workspace.paths.tmp) == workspace_tmp_layout_before
+    assert dict(os.environ) == environment_before
