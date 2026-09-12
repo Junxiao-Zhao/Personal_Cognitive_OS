@@ -215,6 +215,25 @@ def _projection_payloads(
     return dict(sorted(files.items())), profile.version
 
 
+def exact_canonical_records(
+    repository: MemoryRepository,
+    source_commit: str,
+    *,
+    canonical_head: str | None = None,
+) -> tuple[ProfileConfig, dict[str, list[dict[str, Any]]]]:
+    """Read every v0.5 business stream from one verified canonical commit."""
+
+    profile = _exact_profile(repository, source_commit, canonical_head=canonical_head)
+    records = {
+        stream: _parse_jsonl(
+            _git_blob(repository, source_commit, profile.streams[stream].path),
+            profile.streams[stream].path,
+        )
+        for stream in sorted(_REQUIRED_STREAMS, key=str.encode)
+    }
+    return profile, records
+
+
 def _render(record: Any, relative: str) -> bytes:
     try:
         return render_business_markdown(dict(record))
@@ -270,7 +289,12 @@ def _handoff_key(record: Any) -> tuple[str, int, bytes]:
     )
 
 
-def _exact_profile(repository: MemoryRepository, source_commit: str) -> ProfileConfig:
+def _exact_profile(
+    repository: MemoryRepository,
+    source_commit: str,
+    *,
+    canonical_head: str | None = None,
+) -> ProfileConfig:
     if not isinstance(source_commit, str) or not _COMMIT.fullmatch(source_commit):
         raise derivation_error(
             "source_commit must be one full lowercase hexadecimal commit ID",
@@ -287,18 +311,31 @@ def _exact_profile(repository: MemoryRepository, source_commit: str) -> ProfileC
             value=source_commit,
             retry_safe=False,
         )
-    head_result = _git_probe(repository, "rev-parse", "--verify", "HEAD^{commit}")
-    head_commit = head_result.stdout.decode("ascii", errors="replace").strip()
-    if (
-        head_result.returncode
-        or not _COMMIT.fullmatch(head_commit)
-        or len(head_commit) != len(source_commit)
-    ):
-        raise derivation_error(
-            "Canonical HEAD cannot be resolved to one full commit ID",
-            value=head_result.stderr.decode("utf-8", errors="replace").strip(),
-            retry_safe=False,
-        )
+    if canonical_head is None:
+        head_result = _git_probe(repository, "rev-parse", "--verify", "HEAD^{commit}")
+        head_commit = head_result.stdout.decode("ascii", errors="replace").strip()
+        if (
+            head_result.returncode
+            or not _COMMIT.fullmatch(head_commit)
+            or len(head_commit) != len(source_commit)
+        ):
+            raise derivation_error(
+                "Canonical HEAD cannot be resolved to one full commit ID",
+                value=head_result.stderr.decode("utf-8", errors="replace").strip(),
+                retry_safe=False,
+            )
+    else:
+        head_commit = canonical_head
+        if (
+            not isinstance(head_commit, str)
+            or not _COMMIT.fullmatch(head_commit)
+            or len(head_commit) != len(source_commit)
+        ):
+            raise derivation_error(
+                "Captured canonical HEAD is not one full commit ID",
+                value=head_commit,
+                retry_safe=False,
+            )
     if source_commit != head_commit:
         ancestry = _git_probe(
             repository,

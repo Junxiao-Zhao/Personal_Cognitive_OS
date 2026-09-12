@@ -1,820 +1,734 @@
+"""Disposable retrieval generation construction and read-only search."""
+
 from __future__ import annotations
 
+from collections import Counter
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
 import os
+from pathlib import Path, PurePosixPath
 import re
-import shutil
-from collections import Counter
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Iterable
+import stat
+from typing import Any, Iterable, Iterator, Mapping
 
-from mem_core.repository import MemoryRepository
 from mem_core.errors import MemError
+from mem_core.profile import Profile
+from mem_core.registry import default_registry
+from mem_core.repository import MemoryRepository
 
-from .backlinks import build as build_backlinks
-from .repo_loader import (
-    profile_for_repo,
-    repository_at,
-    repository_for_repo,
-    resolve_derivation_source_commit,
+from .backlinks import build_reverse_references
+from .derivation_manifest import (
+    DerivationManifest,
+    _read_tree_no_follow,
+    canonical_manifest_bytes,
+    derivation_error,
+    manifest_for_files,
+    verify_derivation_tree,
 )
+from .projections import _write_new_tree, exact_canonical_records
+from .paths import bundled_profile
+from .validation import latest_effective
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]")
-CURRENT_ONLY = {"events", "psychologies", "philosophies", "archetypes", "hypotheses"}
+SEARCH_MODES = frozenset({"current", "historical", "change", "pattern", "continuity"})
+CANONICAL_FALLBACK_CANDIDATES = 200
+BACKEND_CANDIDATES = 200
 
 
 def tokenize(text: str) -> list[str]:
     base = [token.lower() for token in TOKEN_RE.findall(text)]
     cjk = [token for token in base if len(token) == 1 and "\u3400" <= token <= "\u9fff"]
-    bigrams = [cjk[index] + cjk[index + 1] for index in range(len(cjk) - 1)]
-    return base + bigrams
+    return base + [cjk[index] + cjk[index + 1] for index in range(len(cjk) - 1)]
 
 
-def _vector(tokens: Iterable[str], dimensions: int = 256) -> dict[int, float]:
+def _vector(tokens: Iterable[str], dimensions: int = 256) -> list[float]:
     counts: Counter[int] = Counter()
     for token in tokens:
         digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
-        index = int.from_bytes(digest, "big") % dimensions
-        counts[index] += 1
+        counts[int.from_bytes(digest, "big") % dimensions] += 1
     norm = math.sqrt(sum(value * value for value in counts.values())) or 1.0
-    return {index: value / norm for index, value in counts.items()}
+    return [float(counts.get(index, 0) / norm) for index in range(dimensions)]
 
 
-def _text(record: dict[str, Any]) -> str:
-    payload = record["payload"]
-    keys = ("description", "name", "statement", "change_summary", "content")
-    parts = [str(payload[key]) for key in keys if payload.get(key)]
-    for key in ("aliases", "evidence_refs", "counter_evidence_refs"):
-        parts.extend(str(value) for value in payload.get(key, []))
-    sections = payload.get("sections", {})
-    for values in sections.values():
-        parts.extend(str(value) for value in values)
+def _canonical_json(value: Any) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+
+
+def _document_text(record: Mapping[str, Any]) -> str:
+    payload = record.get("payload", {})
+    if not isinstance(payload, Mapping):
+        return ""
+    parts: list[str] = []
     for key in (
-        "current_topics",
-        "open_questions",
+        "body_markdown",
+        "name",
+        "title",
+        "locator",
+        "provider_label",
+        "change_summary",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            parts.append(value)
+    for key in (
+        "used_excerpts",
+        "aliases",
+        "topics",
+        "unanswered_questions",
         "active_tensions",
         "recent_decisions",
-        "next_possible_directions",
+        "next_directions",
     ):
-        parts.extend(str(value) for value in payload.get(key, []))
+        values = payload.get(key)
+        if isinstance(values, list):
+            parts.extend(value for value in values if isinstance(value, str))
     return "\n".join(parts)
 
 
-def _created(record: dict[str, Any]) -> str:
-    payload = record["payload"]
-    occurred = payload.get("occurred_at", {})
-    return occurred.get("start") or payload.get("created_at") or record["recorded_at"]
+def _occurred_at(record: Mapping[str, Any]) -> str:
+    payload = record.get("payload", {})
+    if isinstance(payload, Mapping):
+        occurred = payload.get("occurred_at")
+        if isinstance(occurred, Mapping) and isinstance(occurred.get("start"), str):
+            return occurred["start"]
+        for key in ("retrieved_at", "created_at"):
+            if isinstance(payload.get(key), str):
+                return payload[key]
+    recorded_at = record.get("recorded_at")
+    return recorded_at if isinstance(recorded_at, str) else ""
 
 
-def _split_message_text(text: str, token_budget: int) -> list[str]:
-    paragraphs = text.splitlines() or [text]
-    fragments: list[str] = []
-    current: list[str] = []
-    current_cost = 0
-    for paragraph in paragraphs:
-        cost = max(1, len(tokenize(paragraph)))
-        if cost > token_budget:
-            if current:
-                fragments.append("\n".join(current))
-                current, current_cost = [], 0
-            start = 0
-            while start < len(paragraph):
-                low, high = 1, len(paragraph) - start
-                while low < high:
-                    middle = (low + high + 1) // 2
-                    if len(tokenize(paragraph[start : start + middle])) <= token_budget:
-                        low = middle
-                    else:
-                        high = middle - 1
-                width = max(1, low)
-                fragments.append(paragraph[start : start + width])
-                start += width
-            continue
-        if current and current_cost + cost > token_budget:
-            fragments.append("\n".join(current))
-            current, current_cost = [], 0
-        current.append(paragraph)
-        current_cost += cost
-    if current:
-        fragments.append("\n".join(current))
-    return fragments or [""]
+def canonical_documents(
+    repository: MemoryRepository,
+    source_commit: str,
+    *,
+    canonical_head: str | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Build deterministic retrieval documents from exact Git-object bytes."""
 
-
-def _turn_units(
-    turns: list[list[dict[str, Any]]], token_budget: int
-) -> list[list[tuple[dict[str, Any], str]]]:
-    units: list[list[tuple[dict[str, Any], str]]] = []
-    for turn in turns:
-        unit: list[tuple[dict[str, Any], str]] = []
-        cost = 0
-        for message in turn:
-            for fragment in _split_message_text(
-                message["payload"]["content"], token_budget
-            ):
-                fragment_cost = max(1, len(tokenize(fragment)))
-                if unit and cost + fragment_cost > token_budget:
-                    units.append(unit)
-                    unit, cost = [], 0
-                unit.append((message, fragment))
-                cost += fragment_cost
-        if unit:
-            units.append(unit)
-    return units
-
-
-def _chunks(
-    messages: list[dict[str, Any]],
-    turns_per_chunk: int = 2,
-    overlap: int = 1,
-    token_budget: int = 800,
-) -> list[dict[str, Any]]:
-    turns: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    for message in messages:
-        if message["payload"]["kind"] != "conversation":
-            continue
-        if message["payload"]["role"] == "user" and current:
-            turns.append(current)
-            current = []
-        current.append(message)
-    if current:
-        turns.append(current)
-    units = _turn_units(turns, token_budget)
-    chunks: list[dict[str, Any]] = []
-    start = 0
-    while start < len(units):
-        selected: list[list[tuple[dict[str, Any], str]]] = []
-        selected_cost = 0
-        for unit in units[start : start + turns_per_chunk]:
-            unit_cost = sum(
-                max(1, len(tokenize(fragment))) for _message, fragment in unit
-            )
-            if selected and selected_cost + unit_cost > token_budget:
-                break
-            selected.append(unit)
-            selected_cost += unit_cost
-        if not selected:
-            break
-        flattened = [pair for unit in selected for pair in unit]
-        messages_in_chunk = [message for message, _fragment in flattened]
-        unique_messages = list(
-            dict.fromkeys(message["id"] for message in messages_in_chunk)
-        )
-        text = "\n".join(
-            f"{message['payload']['role']}: {fragment}"
-            for message, fragment in flattened
-        )
-        digest = hashlib.sha256(
-            (
-                "|".join(unique_messages) + f"|unit:{start}|" + text + "|chunker@2"
-            ).encode()
-        ).hexdigest()[:20]
-        chunks.append(
-            {
-                "stream": "conversation_chunks",
-                "id": f"chunk_{digest}",
-                "revision": 1,
-                "text": text,
-                "recorded_at": messages_in_chunk[-1]["recorded_at"],
-                "occurred_at": messages_in_chunk[0]["payload"]["created_at"],
-                "evidence_refs": list(
-                    dict.fromkeys(
-                        f"message:{item['id']}"
-                        for item in messages_in_chunk
-                        if item["payload"]["role"] == "user"
-                    )
-                ),
-                "links": {"message_ids": unique_messages},
-                "current": True,
-                "assistant_context": any(
-                    item["payload"]["role"] == "assistant" for item in messages_in_chunk
-                ),
-                "user_evidence_eligible": any(
-                    item["payload"]["role"] == "user" for item in messages_in_chunk
-                ),
-                "prev_id": None,
-                "next_id": None,
-            }
-        )
-        if start + len(selected) >= len(units):
-            break
-        start += max(1, len(selected) - overlap)
-    for index, chunk in enumerate(chunks):
-        chunk["prev_id"] = chunks[index - 1]["id"] if index else None
-        chunk["next_id"] = chunks[index + 1]["id"] if index + 1 < len(chunks) else None
-    return chunks
-
-
-def _documents(repository: MemoryRepository) -> list[dict[str, Any]]:
-    records = repository.records_by_stream()
-    current_ids = {
+    profile, records = exact_canonical_records(
+        repository, source_commit, canonical_head=canonical_head
+    )
+    effective = {
         stream: {
             record_id: item["revision"]
-            for record_id, item in repository.current_records(stream).items()
+            for record_id, item in latest_effective(items).items()
         }
-        for stream in records
+        for stream, items in records.items()
     }
-    docs: list[dict[str, Any]] = []
-    for stream, items in records.items():
-        if stream in {"messages", "checkpoints", "sources"}:
-            continue
-        for record in items:
-            payload = record["payload"]
-            current = current_ids[stream].get(record["id"]) == record["revision"]
-            docs.append(
+    documents: list[dict[str, Any]] = []
+    for stream in sorted(records, key=str.encode):
+        for record in records[stream]:
+            payload = record.get("payload", {})
+            if not isinstance(payload, Mapping):
+                payload = {}
+            revision = record.get("revision")
+            record_id = record.get("id")
+            documents.append(
                 {
                     "stream": stream,
-                    "id": record["id"],
-                    "revision": record["revision"],
-                    "text": _text(record),
-                    "recorded_at": record["recorded_at"],
-                    "occurred_at": _created(record),
-                    "evidence_refs": payload.get("evidence_refs", []),
-                    "links": payload.get("links", {}),
+                    "id": record_id,
+                    "revision": revision,
+                    "text": _document_text(record),
+                    "recorded_at": record.get("recorded_at"),
+                    "occurred_at": _occurred_at(record),
                     "status": payload.get("status"),
-                    "policy_version": payload.get("policy_version"),
-                    "revision_reason": payload.get("revision_reason")
-                    or payload.get("change_summary"),
+                    "current": effective.get(stream, {}).get(record_id) == revision,
                     "previous_revision": payload.get("previous_revision"),
-                    "current": current,
-                    "assistant_context": False,
-                    "user_evidence_eligible": bool(payload.get("evidence_refs")),
+                    "change_summary": payload.get("change_summary"),
+                    "evidence_refs": list(payload.get("evidence_refs", [])),
+                    "counter_evidence_refs": list(
+                        payload.get("counter_evidence_refs", [])
+                    ),
+                    "promotion_refs": list(payload.get("promotion_refs", [])),
+                    "links": dict(payload.get("links", {})),
                 }
             )
-    retrieval_config = repository.profile.raw.get("retrieval", {})
-    docs.extend(
-        _chunks(
-            records.get("messages", []),
-            turns_per_chunk=int(retrieval_config.get("chunk_turns", 2)),
-            overlap=int(retrieval_config.get("overlap_turns", 1)),
-            token_budget=int(retrieval_config.get("chunk_token_budget", 800)),
-        )
+    return sorted(documents, key=_document_key), profile.version
+
+
+def _document_key(document: Mapping[str, Any]) -> tuple[bytes, bytes, int]:
+    return (
+        str(document.get("stream", "")).encode("utf-8"),
+        str(document.get("id", "")).encode("utf-8"),
+        int(document.get("revision", 0)),
     )
-    return docs
 
 
-def _build_tantivy(path: Path, docs: list[dict[str, Any]]) -> None:
+def build_tantivy(path: Path, documents: list[dict[str, Any]]) -> None:
     import tantivy
 
-    path.mkdir(parents=True, exist_ok=True)
-    schema_builder = tantivy.SchemaBuilder()
-    schema_builder.add_text_field("key", stored=True, tokenizer_name="raw")
-    schema_builder.add_text_field("text", stored=True)
-    schema_builder.add_text_field("stream", stored=True, tokenizer_name="raw")
-    schema = schema_builder.build()
+    path.mkdir()
+    builder = tantivy.SchemaBuilder()
+    builder.add_text_field("key", stored=True, tokenizer_name="raw")
+    builder.add_text_field("text", stored=True)
+    builder.add_text_field("stream", stored=True, tokenizer_name="raw")
+    schema = builder.build()
     index = tantivy.Index(schema, path=str(path))
     writer = index.writer()
-    for doc in docs:
-        key = f"{doc['stream']}:{doc['id']}@{doc['revision']}"
+    for document in documents:
         writer.add_document(
             tantivy.Document(
-                key=key,
-                text=" ".join(tokenize(doc["text"])),
-                stream=doc["stream"],
+                key=_key(document),
+                text=" ".join(tokenize(document["text"])),
+                stream=document["stream"],
             )
         )
     writer.commit()
+    del writer
     index.reload()
 
 
-def _build_milvus(path: Path, docs: list[dict[str, Any]]) -> None:
-    os.environ["NO_PROXY"] = _merge_no_proxy(os.environ.get("NO_PROXY"))
-    os.environ["no_proxy"] = _merge_no_proxy(os.environ.get("no_proxy"))
-    from pymilvus import MilvusClient
-
-    client = MilvusClient(str(path))
+@contextmanager
+def _local_backend_environment() -> Iterator[None]:
+    previous = {name: os.environ.get(name) for name in ("NO_PROXY", "no_proxy")}
     try:
-        client.create_collection(
-            "memory",
-            dimension=256,
-            primary_field_name="key",
-            id_type="string",
-            max_length=512,
-            vector_field_name="vector",
-            metric_type="COSINE",
-        )
-        if docs:
-            data = []
-            for doc in docs:
-                vector = _vector(tokenize(doc["text"]))
-                data.append(
-                    {
-                        "key": f"{doc['stream']}:{doc['id']}@{doc['revision']}",
-                        "vector": [
-                            float(vector.get(index, 0.0)) for index in range(256)
-                        ],
-                    }
-                )
-            client.insert("memory", data)
+        for name, value in previous.items():
+            entries = [
+                item.strip() for item in (value or "").split(",") if item.strip()
+            ]
+            for item in ("127.0.0.1", "localhost"):
+                if item not in entries:
+                    entries.append(item)
+            os.environ[name] = ",".join(entries)
+        yield
     finally:
-        client.close()
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
-def _merge_no_proxy(value: str | None) -> str:
-    entries = [item.strip() for item in (value or "").split(",") if item.strip()]
-    for item in ("127.0.0.1", "localhost"):
-        if item not in entries:
-            entries.append(item)
-    return ",".join(entries)
+def build_milvus(path: Path, documents: list[dict[str, Any]]) -> None:
+    with _local_backend_environment():
+        from pymilvus import MilvusClient
+
+        client = None
+        try:
+            client = MilvusClient(str(path), dedicated=True)
+            client.create_collection(
+                "memory",
+                dimension=256,
+                primary_field_name="key",
+                id_type="string",
+                max_length=512,
+                vector_field_name="vector",
+                metric_type="COSINE",
+            )
+            if documents:
+                client.insert(
+                    "memory",
+                    [
+                        {
+                            "key": _key(document),
+                            "vector": _vector(tokenize(document["text"])),
+                        }
+                        for document in documents
+                    ],
+                )
+                client.flush("memory")
+        finally:
+            _close_milvus(client, path)
 
 
-def build_index(
-    *,
-    repo_root: Path,
-    indexes_root: str | Path,
-    force: bool = False,
-    source_commit: str | None = None,
-    **_: Any,
-) -> dict[str, Any]:
-    repo_root = Path(repo_root)
-    source_commit = resolve_derivation_source_commit(
-        repo_root,
-        state_root=Path(indexes_root).parent / "state",
-        source_commit=source_commit,
+def _close_milvus(client: Any, path: Path) -> None:
+    """Close both the pymilvus channel and its path-keyed Lite server."""
+
+    try:
+        if client is not None:
+            client.close()
+    finally:
+        from milvus_lite import server_manager_instance
+
+        server_manager_instance.release_server(str(path))
+
+
+def build_retrieval_generation(
+    repository: MemoryRepository, target: Path, source_commit: str
+) -> DerivationManifest:
+    """Build one complete caller-owned generation without publishing it."""
+
+    documents, profile_version = canonical_documents(repository, source_commit)
+    target = Path(target).absolute()
+    _write_new_tree(
+        target,
+        {
+            "documents.json": _canonical_json(documents),
+            "reverse_refs.json": _canonical_json(build_reverse_references(documents)),
+        },
     )
-    with repository_at(repo_root, source_commit) as repository:
-        return _build_index_repository(
-            repository, repo_root, Path(indexes_root), force, source_commit
+    root_fd: int | None = None
+    try:
+        observed = os.lstat(target)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise derivation_error(
+                "Retrieval target is not a real directory", path=target
+            )
+        identity = (observed.st_dev, observed.st_ino)
+        root_fd = os.open(
+            target,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
         )
-
-
-def _build_index_repository(
-    repository: Any, repo_root: Path, indexes_root: Path, force: bool, commit: str
-) -> dict[str, Any]:
-    profile = repository.profile
-    generation = indexes_root / "generations" / commit
-    manifest_path = generation / "manifest.json"
-    if manifest_path.exists() and not force:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return {
-            "ok": True,
-            "idempotent": True,
-            **manifest,
-            "generation_path": str(generation),
-        }
-    if generation.exists():
-        shutil.rmtree(generation)
-    generation.mkdir(parents=True, exist_ok=True)
-    docs = _documents(repository)
-    (generation / "documents.json").write_text(
-        json.dumps(docs, ensure_ascii=False, sort_keys=True), encoding="utf-8"
-    )
-    backlink_result = build_backlinks(
-        repo_root=repo_root,
-        output_path=generation / "backlinks.json",
-        memory_commit=commit,
-    )
-    try:
-        _build_tantivy(generation / "tantivy", docs)
+        after_open = os.fstat(root_fd)
+        if (after_open.st_dev, after_open.st_ino) != identity:
+            raise derivation_error("Retrieval target identity changed", path=target)
+        anchored = Path(f"/proc/self/fd/{root_fd}")
+        try:
+            build_tantivy(anchored / "tantivy", documents)
+            build_milvus(anchored / "milvus.db", documents)
+        except Exception as exc:
+            raise derivation_error(
+                "Retrieval backend construction failed", path=target, value=str(exc)
+            ) from exc
+        current = os.lstat(target)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (
+                current.st_dev,
+                current.st_ino,
+            )
+            != identity
+        ):
+            raise derivation_error("Retrieval target hierarchy changed", path=target)
+        payloads, directories = _read_tree_no_follow(target, identity)
+        _materialize_empty_backend_directories(root_fd, payloads, directories)
+        payloads, _directories = _read_tree_no_follow(target, identity)
+        if "manifest.json" in payloads:
+            raise derivation_error(
+                "Retrieval target unexpectedly contains a manifest", path=target
+            )
+        manifest = manifest_for_files(
+            payloads,
+            kind="retrieval_index",
+            source_commit=source_commit,
+            profile_version=profile_version,
+        )
+        descriptor = os.open(
+            "manifest.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=root_fd,
+        )
+        try:
+            view = memoryview(canonical_manifest_bytes(manifest))
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        final = verify_derivation_tree(
+            target, kind="retrieval_index", expected_commit=source_commit
+        )
+        if not final["ok"]:
+            raise derivation_error(
+                "Completed retrieval generation failed verification",
+                path=target,
+                value=final,
+            )
+        return manifest
     except MemError:
         raise
-    except Exception as exc:
-        raise MemError(
-            "INDEX_BACKEND_FAILED",
-            "index",
-            f"Tantivy index build failed: {exc}",
-            canonical_changed=False,
-            retry_safe=True,
-            recovery=[
-                "Verify the local backend installation and retry",
-                "Run `pco derive index --force`",
-            ],
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Retrieval generation could not be built safely",
+            path=target,
+            value=str(exc),
         ) from exc
-    try:
-        _build_milvus(generation / "milvus.db", docs)
-    except MemError:
-        raise
-    except Exception as exc:
-        raise MemError(
-            "INDEX_BACKEND_FAILED",
-            "index",
-            f"Milvus index build failed: {exc}",
-            canonical_changed=False,
-            retry_safe=True,
-            recovery=[
-                "Verify the local backend installation and retry",
-                "Run `pco derive index --force`",
-            ],
-        ) from exc
-    manifest = {
-        "memory_commit": commit,
-        "profile": f"{profile.name}@{profile.version}",
-        "documents": len(docs),
-        "dense_backend": "milvus-lite",
-        "lexical_backend": "tantivy",
-        "backlinks": len(backlink_result["backlinks"]),
-    }
-    (generation / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    active = indexes_root / "active.json"
-    active.parent.mkdir(parents=True, exist_ok=True)
-    temporary = active.with_suffix(".tmp")
-    temporary.write_text(
-        json.dumps(
-            {"generation": commit, "manifest": str(generation / "manifest.json")},
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-    temporary.replace(active)
-    return {
-        "ok": True,
-        "idempotent": False,
-        **manifest,
-        "generation_path": str(generation),
-    }
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
 
 
-def _index_scores(
-    *,
+def _materialize_empty_backend_directories(
+    root_fd: int, payloads: Mapping[str, bytes], directories: set[str]
+) -> None:
+    """Make backend-created empty directories expressible by the file manifest."""
+
+    implied: set[str] = set()
+    for relative in payloads:
+        parent = PurePosixPath(relative).parent
+        while parent.as_posix() != ".":
+            implied.add(parent.as_posix())
+            parent = parent.parent
+    for relative in sorted(directories - implied, key=str.encode):
+        descriptor = os.dup(root_fd)
+        try:
+            for component in PurePosixPath(relative).parts:
+                child = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = child
+            marker = os.open(
+                ".pco-empty",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=descriptor,
+            )
+            try:
+                os.write(marker, b"pco retrieval backend directory\n")
+                os.fsync(marker)
+            finally:
+                os.close(marker)
+        finally:
+            os.close(descriptor)
+
+
+def _key(document: Mapping[str, Any]) -> str:
+    return f"{document['stream']}:{document['id']}@{document['revision']}"
+
+
+def query_backends(
     generation: Path,
-    manifest: dict[str, Any],
     query: str,
     eligible_keys: set[str],
     candidate_limit: int,
 ) -> tuple[dict[str, float], dict[str, float]]:
+    """Query only backends whose open path is demonstrably read-only.
+
+    The supported Milvus Lite release recreates operational staging state when
+    a local database is opened, invalidating the generation it is meant to
+    query.  Its deterministic artifact remains part of the rebuildable output,
+    while read paths use Tantivy and the in-memory deterministic reranker.
+    """
+
     dense: dict[str, float] = {}
     lexical: dict[str, float] = {}
-    if manifest.get("lexical_backend") == "tantivy" and query.strip():
-        try:
-            import tantivy
+    if query.strip():
+        import tantivy
 
-            index = tantivy.Index.open(str(generation / "tantivy"))
-            terms = tokenize(query)
-            parsed = index.parse_query(" OR ".join(terms), ["text"])
-            searcher = index.searcher()
-            for score, address in searcher.search(parsed, limit=candidate_limit).hits:
-                key = searcher.doc(address).get_first("key")
-                if str(key) in eligible_keys:
-                    lexical[str(key)] = float(score)
-        except MemError:
-            raise
-        except Exception as exc:
-            raise MemError(
-                "INDEX_BACKEND_FAILED",
-                "retrieval",
-                f"Tantivy search failed: {exc}",
-                canonical_changed=False,
-                retry_safe=True,
-                recovery=[
-                    "Verify the local backend installation and retry",
-                    "Run `pco derive index --force`",
-                ],
-            ) from exc
-    if manifest.get("dense_backend") == "milvus-lite" and eligible_keys:
-        try:
-            os.environ["NO_PROXY"] = _merge_no_proxy(os.environ.get("NO_PROXY"))
-            os.environ["no_proxy"] = _merge_no_proxy(os.environ.get("no_proxy"))
-            from pymilvus import MilvusClient
-
-            client = MilvusClient(str(generation / "milvus.db"))
-            try:
-                vector = _vector(tokenize(query))
-                response = client.search(
-                    "memory",
-                    data=[[float(vector.get(index, 0.0)) for index in range(256)]],
-                    limit=candidate_limit,
-                    output_fields=["key"],
-                )
-                for hit in response[0]:
-                    key = (
-                        hit.get("entity", {}).get("key")
-                        or hit.get("key")
-                        or hit.get("id")
-                    )
-                    if str(key) in eligible_keys:
-                        dense[str(key)] = float(hit.get("distance", 0.0))
-            finally:
-                client.close()
-        except MemError:
-            raise
-        except Exception as exc:
-            raise MemError(
-                "INDEX_BACKEND_FAILED",
-                "retrieval",
-                f"Milvus search failed: {exc}",
-                canonical_changed=False,
-                retry_safe=True,
-                recovery=[
-                    "Verify the local backend installation and retry",
-                    "Run `pco derive index --force`",
-                ],
-            ) from exc
+        index = tantivy.Index.open(str(generation / "tantivy"))
+        parsed = index.parse_query(" OR ".join(tokenize(query)), ["text"])
+        searcher = index.searcher()
+        for score, address in searcher.search(parsed, limit=candidate_limit).hits:
+            key = str(searcher.doc(address).get_first("key"))
+            if key in eligible_keys:
+                lexical[key] = float(score)
     return dense, lexical
-
-
-def _parse_time(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
-    except ValueError:
-        try:
-            return datetime.fromisoformat(value[:10]).replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
-
-
-def _linked_ids(value: Any) -> set[str]:
-    if isinstance(value, str):
-        return {value}
-    if isinstance(value, list):
-        result: set[str] = set()
-        for item in value:
-            result.update(_linked_ids(item))
-        return result
-    if isinstance(value, dict):
-        result = set()
-        for item in value.values():
-            result.update(_linked_ids(item))
-        return result
-    return set()
-
-
-def _graph_neighbors(
-    doc: dict[str, Any], backlinks: dict[str, list[dict[str, Any]]]
-) -> set[str]:
-    result = _linked_ids(doc.get("links", {}))
-    result.update(doc.get("evidence_refs", []))
-    for key in (doc["id"], *doc.get("evidence_refs", [])):
-        for item in backlinks.get(key, []):
-            result.add(item["source_id"])
-    return result
-
-
-def _matches_neighbor(doc: dict[str, Any], neighbor: str) -> bool:
-    if doc["id"] == neighbor:
-        return True
-    if neighbor.startswith("message:"):
-        return neighbor.split(":", 1)[1] in doc.get("links", {}).get("message_ids", [])
-    return neighbor in doc.get("links", {}).get("message_ids", [])
-
-
-def _change_window_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
-    timed = [
-        (when, item)
-        for item in items
-        if (when := _parse_time(item.get("occurred_at") or item.get("recorded_at")))
-        is not None
-    ]
-    timed.sort(key=lambda pair: pair[0])
-    if not timed:
-        return {
-            "split_at": None,
-            "earlier": {},
-            "later": {},
-            "caution": "No comparable timestamps are available.",
-        }
-    split = timed[len(timed) // 2][0]
-    earlier: Counter[str] = Counter()
-    later: Counter[str] = Counter()
-    for when, item in timed:
-        (earlier if when <= split else later)[item["stream"]] += 1
-    return {
-        "split_at": split.isoformat(),
-        "earlier": dict(earlier),
-        "later": dict(later),
-        "caution": "Missing records are not evidence that a pattern or event did not exist.",
-    }
 
 
 def search(
     *,
     repo_root: Path,
-    query: str,
+    query: str = "",
     mode: str = "current",
     limit: int = 10,
+    indexes_root: Path | None = None,
     start: str | None = None,
     end: str | None = None,
-    indexes_root: str | Path | None = None,
-    source_commit: str | None = None,
     **_: Any,
 ) -> dict[str, Any]:
-    if mode not in {"continuity", "current", "pattern", "historical", "change"}:
-        raise ValueError(f"Unknown retrieval mode: {mode}")
-    repo_root = Path(repo_root)
-    repository = repository_for_repo(repo_root)
-    profile = repository.profile
-    retrieval_config = profile.raw.get("retrieval", {})
-    candidate_limit = max(limit, int(retrieval_config.get("candidate_count", 200)))
-    candidate_overfetch_factor = max(
-        1, int(retrieval_config.get("candidate_overfetch_factor", 4))
-    )
-    max_fetch_limit = candidate_limit * candidate_overfetch_factor
-    rrf_k = float(retrieval_config.get("rrf_k", 60))
-    recency_half_life_days = max(
-        0.000001, float(retrieval_config.get("recency_half_life_days", 180))
-    )
-    indexes_root = (
-        Path(indexes_root) if indexes_root is not None else repo_root.parent / "indexes"
-    )
-    source_commit = resolve_derivation_source_commit(
-        repo_root,
-        state_root=Path(indexes_root).parent / "state",
-        source_commit=source_commit,
-    )
-    index_result = build_index(
-        repo_root=repo_root, indexes_root=indexes_root, source_commit=source_commit
-    )
-    generation = Path(index_result["generation_path"])
-    docs_path = generation / "documents.json"
-    if docs_path.is_file():
-        docs = json.loads(docs_path.read_text(encoding="utf-8"))
-    else:
-        docs = _documents(repository)
-    start_at, end_at = _parse_time(start), _parse_time(end)
-    filtered: list[dict[str, Any]] = []
-    for doc in docs:
-        when = _parse_time(doc.get("occurred_at") or doc.get("recorded_at"))
-        if start_at and when and when < start_at:
-            continue
-        if end_at and when and when > end_at:
-            continue
-        if (
-            mode in {"current", "continuity", "pattern"}
-            and doc["stream"] in CURRENT_ONLY
-            and not doc["current"]
-        ):
-            continue
-        if (
-            mode in {"current", "continuity"}
-            and doc["stream"] in {"meta_revisions", "continuations"}
-            and not doc["current"]
-        ):
-            continue
-        if mode == "current" and doc.get("status") in {
-            "disputed",
-            "rejected",
-            "superseded",
-            "tombstone",
-        }:
-            continue
-        if mode == "continuity" and doc["stream"] not in {
-            "continuations",
-            "conversation_chunks",
-        }:
-            continue
-        if mode == "pattern" and doc["stream"] not in {
-            "events",
-            "hypotheses",
-            "conversation_chunks",
-            "psychologies",
-            "philosophies",
-            "archetypes",
-        }:
-            continue
-        if mode == "change" and doc["stream"] not in {
-            "events",
-            "hypotheses",
-            "meta_revisions",
-            "conversation_chunks",
-        }:
-            continue
-        filtered.append(doc)
+    """Search a verified generation or a bounded exact-commit canonical snapshot."""
 
-    eligible_keys = {
-        f"{doc['stream']}:{doc['id']}@{doc['revision']}" for doc in filtered
-    }
-    backend_dense, backend_lexical = _index_scores(
-        generation=generation,
-        manifest=index_result,
-        query=query,
-        eligible_keys=eligible_keys,
-        candidate_limit=candidate_limit,
+    start_at, end_at = _validate_search(query, mode, limit, start, end)
+    repository = MemoryRepository(
+        Path(repo_root), Profile.load(bundled_profile(), default_registry())
     )
-    backend_candidates = set(backend_dense) | set(backend_lexical)
-    if backend_candidates:
-        backend_filtered = [
-            doc
-            for doc in filtered
-            if f"{doc['stream']}:{doc['id']}@{doc['revision']}" in backend_candidates
-        ]
-        if backend_filtered:
-            remaining = [
-                doc
-                for doc in filtered
-                if f"{doc['stream']}:{doc['id']}@{doc['revision']}"
-                not in backend_candidates
-            ]
-            remaining = sorted(
-                remaining,
-                key=lambda doc: doc.get("occurred_at") or doc.get("recorded_at") or "",
-                reverse=True,
-            )
-            filtered = [
-                *backend_filtered,
-                *remaining[: max(0, candidate_limit - len(backend_filtered))],
-            ]
-        else:
-            backend_candidates = set()
-    if not backend_candidates and len(filtered) > candidate_limit:
-        # Replaceable local indexes may be unavailable. Keep a bounded,
-        # deterministic recent pool so Python reranking never expands to the
-        # entire canonical corpus.
-        filtered = sorted(
-            filtered,
-            key=lambda doc: doc.get("occurred_at") or doc.get("recorded_at") or "",
-            reverse=True,
-        )[:candidate_limit]
-
-    dense = {}
-    for index, doc in enumerate(filtered):
-        key = f"{doc['stream']}:{doc['id']}@{doc['revision']}"
-        dense[index] = backend_dense.get(key, 0.0)
-    lexical: dict[int, float] = {}
-    for index, doc in enumerate(filtered):
-        key = f"{doc['stream']}:{doc['id']}@{doc['revision']}"
-        lexical[index] = backend_lexical.get(key, 0.0)
-    dense_rank = {
-        index: rank
-        for rank, (index, _) in enumerate(
-            sorted(dense.items(), key=lambda item: item[1], reverse=True), 1
+    head = repository.head()
+    generation = (
+        Path(indexes_root)
+        if indexes_root is not None
+        else Path(repo_root).parent / "indexes"
+    )
+    status = "fallback"
+    diagnostics: dict[str, Any] | None = None
+    backend_scores: tuple[dict[str, float], dict[str, float]] = ({}, {})
+    try:
+        verified = verify_derivation_tree(
+            generation, kind="retrieval_index", expected_commit=head
         )
-    }
-    lexical_rank = {
-        index: rank
-        for rank, (index, _) in enumerate(
-            sorted(lexical.items(), key=lambda item: item[1], reverse=True), 1
+        if not verified["ok"]:
+            raise ValueError(verified["status"])
+        documents = _read_json_list(generation / "documents.json")
+        reverse_refs = _read_reverse_refs(generation / "reverse_refs.json")
+        selected = _select_mode(documents, mode, start_at, end_at)
+        backend_scores = query_backends(
+            generation,
+            query,
+            {_key(document) for document in selected},
+            min(BACKEND_CANDIDATES, max(limit, 1) * 4),
         )
-    }
-    now = datetime.now(timezone.utc)
-    scored: list[dict[str, Any]] = []
-    for index, doc in enumerate(filtered):
-        when = _parse_time(doc.get("occurred_at") or doc.get("recorded_at"))
-        age_days = max(0.0, (now - when).total_seconds() / 86400) if when else 3650.0
-        time_score = math.exp(-math.log(2) * age_days / recency_half_life_days)
-        rrf = 1 / (rrf_k + dense_rank[index]) + 1 / (rrf_k + lexical_rank[index])
-        if mode == "continuity":
-            rrf += time_score * 0.02
-        if mode == "pattern" and doc["stream"] in {"events", "hypotheses"}:
-            rrf += 0.005
-        item = dict(doc)
-        item.update(
-            {
-                "dense_score": round(dense[index], 8),
-                "lexical_score": round(lexical[index], 8),
-                "rrf_score": round(rrf, 8),
-                "time_score": round(time_score, 8),
-                "graph_score": 0.0,
-                "retrieval_mode": mode,
-            }
+        after = verify_derivation_tree(
+            generation, kind="retrieval_index", expected_commit=head
         )
-        scored.append(item)
-    if mode in {"pattern", "historical", "change"} and scored:
-        backlink_path = generation / "backlinks.json"
-        if backlink_path.is_file():
-            backlink_map = json.loads(backlink_path.read_text(encoding="utf-8"))[
-                "backlinks"
-            ]
-        else:
-            backlink_map = build_backlinks(
-                repo_root=repo_root,
-                source_commit=source_commit,
-                state_root=Path(indexes_root).parent / "state",
-            )["backlinks"]
-        seeds = sorted(
-            scored,
-            key=lambda item: (item["rrf_score"], item["time_score"]),
-            reverse=True,
-        )[:5]
-        neighbors: set[str] = set()
-        for seed in seeds:
-            neighbors.update(_graph_neighbors(seed, backlink_map))
-        for item in scored:
-            matches = sum(
-                1 for neighbor in neighbors if _matches_neighbor(item, neighbor)
-            )
-            if matches:
-                item["graph_score"] = round(min(0.02, matches * 0.004), 8)
-                item["rrf_score"] = round(item["rrf_score"] + item["graph_score"], 8)
-    scored.sort(key=lambda item: (item["rrf_score"], item["time_score"]), reverse=True)
-    response = {
+        if not after["ok"]:
+            raise ValueError("generation changed during search")
+        status = "current"
+    except Exception as exc:
+        diagnostics = {
+            "code": "DERIVATION_FAILED",
+            "message": "retrieval generation unavailable; canonical fallback used",
+            "value": str(exc),
+        }
+        documents, _profile_version = canonical_documents(
+            repository, head, canonical_head=head
+        )
+        reverse_refs = build_reverse_references(documents)
+        selected = _select_mode(documents, mode, start_at, end_at)
+        selected = _bounded_recent(selected, CANONICAL_FALLBACK_CANDIDATES)
+        backend_scores = ({}, {})
+    items = _rank(selected, reverse_refs, query, mode, limit, backend_scores)
+    result: dict[str, Any] = {
         "ok": True,
         "query": query,
         "mode": mode,
-        "memory_commit": index_result.get("memory_commit", source_commit),
-        "derivation_source_commit": index_result.get("memory_commit", source_commit),
-        "backends": {
-            "dense": index_result["dense_backend"],
-            "lexical": index_result["lexical_backend"],
-        },
-        "retrieval_policy": {
-            "candidate_count": candidate_limit,
-            "candidate_overfetch_factor": candidate_overfetch_factor,
-            "max_backend_candidates": max_fetch_limit,
-            "rrf_k": rrf_k,
-            "recency_half_life_days": recency_half_life_days,
-        },
-        "results": scored[:limit],
+        "source_commit": head,
+        "derivation_status": status,
+        "candidate_count": len(selected),
+        "items": items,
     }
+    if diagnostics is not None:
+        result["fallback_diagnostic"] = diagnostics
     if mode == "change":
-        response["change_windows"] = _change_window_summary(scored)
-    return response
+        result["change_windows"] = _change_window_summary(selected)
+    return result
+
+
+def _validate_search(
+    query: Any, mode: Any, limit: Any, start: Any, end: Any
+) -> tuple[datetime | None, datetime | None]:
+    if not isinstance(query, str):
+        raise ValueError("query must be a string")
+    if mode not in SEARCH_MODES:
+        raise ValueError(f"unknown retrieval mode: {mode}")
+    if (
+        not isinstance(limit, int)
+        or isinstance(limit, bool)
+        or limit < 1
+        or limit > 1000
+    ):
+        raise ValueError("limit must be an integer from 1 through 1000")
+    start_at = _parse_time_bound(start, "start")
+    end_at = _parse_time_bound(end, "end")
+    if start_at is not None and end_at is not None and start_at > end_at:
+        raise ValueError("start must not be later than end")
+    return start_at, end_at
+
+
+def _parse_time_bound(value: Any, name: str) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be an ISO-8601 string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an ISO-8601 string") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _record_time(document: Mapping[str, Any]) -> datetime | None:
+    value = document.get("occurred_at") or document.get("recorded_at")
+    try:
+        return _parse_time_bound(value, "record time") if value else None
+    except ValueError:
+        return None
+
+
+def _select_mode(
+    documents: list[dict[str, Any]],
+    mode: str,
+    start: datetime | None,
+    end: datetime | None,
+) -> list[dict[str, Any]]:
+    if mode in {"historical", "change"}:
+        selected = list(documents)
+    else:
+        selected = [document for document in documents if document.get("current")]
+    if mode == "continuity":
+        handoffs = [
+            document
+            for document in selected
+            if document["stream"] == "session_handoffs"
+        ]
+        selected = [max(handoffs, key=_recent_key)] if handoffs else []
+    elif mode == "pattern":
+        selected = [
+            document
+            for document in selected
+            if document["stream"]
+            in {
+                "events",
+                "psychologies",
+                "philosophies",
+                "archetypes",
+                "hypotheses",
+            }
+        ]
+    if mode == "current":
+        selected = [
+            document for document in selected if document.get("status") != "tombstone"
+        ]
+    result = []
+    for document in selected:
+        when = _record_time(document)
+        if start is not None and (when is None or when < start):
+            continue
+        if end is not None and (when is None or when > end):
+            continue
+        result.append(dict(document))
+    return sorted(result, key=_document_key)
+
+
+def _recent_key(document: Mapping[str, Any]) -> tuple[str, int, bytes]:
+    return (
+        str(document.get("recorded_at") or ""),
+        int(document.get("revision") or 0),
+        str(document.get("id") or "").encode("utf-8"),
+    )
+
+
+def _bounded_recent(
+    documents: list[dict[str, Any]], maximum: int
+) -> list[dict[str, Any]]:
+    return sorted(
+        documents,
+        key=lambda item: (_recent_key(item), _document_key(item)),
+        reverse=True,
+    )[:maximum]
+
+
+def _rank(
+    documents: list[dict[str, Any]],
+    reverse_refs: dict[str, list[dict[str, Any]]],
+    query: str,
+    mode: str,
+    limit: int,
+    backend_scores: tuple[dict[str, float], dict[str, float]],
+) -> list[dict[str, Any]]:
+    dense, backend_lexical = backend_scores
+    terms = tokenize(query)
+    seeds: set[str] = set()
+    scored: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    for document in documents:
+        tokens = tokenize(document.get("text", ""))
+        lexical_score = sum(tokens.count(term) for term in terms)
+        key = _key(document)
+        score = (
+            float(lexical_score) + dense.get(key, 0.0) + backend_lexical.get(key, 0.0)
+        )
+        if query and lexical_score:
+            seeds.add(str(document["id"]))
+        item = dict(document)
+        item["score"] = round(score, 8)
+        scored.append(
+            (
+                (
+                    score,
+                    float(lexical_score),
+                    str(document.get("recorded_at") or ""),
+                    int(document.get("revision") or 0),
+                ),
+                item,
+            )
+        )
+    if mode == "pattern" and seeds:
+        linked = {
+            edge["source_id"] for seed in seeds for edge in reverse_refs.get(seed, [])
+        }
+        for index, (sort_key, item) in enumerate(scored):
+            if item["id"] in linked:
+                item["score"] = round(item["score"] + 0.25, 8)
+                scored[index] = ((sort_key[0] + 0.25, *sort_key[1:]), item)
+    scored.sort(key=lambda pair: _document_key(pair[1]))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _sort_key, item in scored[:limit]]
+
+
+def _read_json_list(path: Path) -> list[dict[str, Any]]:
+    value = _read_json(path)
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise ValueError("documents.json must contain an array of objects")
+    return [dict(item) for item in value]
+
+
+def _read_reverse_refs(path: Path) -> dict[str, list[dict[str, Any]]]:
+    value = _read_json(path)
+    if not isinstance(value, dict):
+        raise ValueError("reverse_refs.json must contain an object")
+    result: dict[str, list[dict[str, Any]]] = {}
+    for target, edges in value.items():
+        if (
+            not isinstance(target, str)
+            or not isinstance(edges, list)
+            or not all(isinstance(edge, dict) for edge in edges)
+        ):
+            raise ValueError("reverse_refs.json is malformed")
+        result[target] = [dict(edge) for edge in edges]
+    return result
+
+
+def _read_json(path: Path) -> Any:
+    class StrictObject(dict):
+        pass
+
+    def pairs(values):
+        result = StrictObject()
+        for key, value in values:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def nonfinite(value: str) -> None:
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    return json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=pairs,
+        parse_constant=nonfinite,
+    )
+
+
+def _change_window_summary(documents: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(
+        (
+            (when, item)
+            for item in documents
+            if (when := _record_time(item)) is not None
+        ),
+        key=lambda pair: (pair[0], _document_key(pair[1])),
+    )
+    if not ordered:
+        return {"split_at": None, "earlier": {}, "later": {}}
+    split = ordered[len(ordered) // 2][0]
+    earlier: Counter[str] = Counter()
+    later: Counter[str] = Counter()
+    for when, document in ordered:
+        (earlier if when <= split else later)[document["stream"]] += 1
+    return {
+        "split_at": split.isoformat(),
+        "earlier": dict(sorted(earlier.items())),
+        "later": dict(sorted(later.items())),
+    }
+
+
+# Transitional entry point retained until Task 5 removes the package inventory.
+def build_index(
+    *,
+    repo_root: Path,
+    indexes_root: str | Path,
+    source_commit: str | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    repository = MemoryRepository(
+        Path(repo_root), Profile.load(bundled_profile(), default_registry())
+    )
+    commit = source_commit or repository.head()
+    manifest = build_retrieval_generation(repository, Path(indexes_root), commit)
+    return {"ok": True, **manifest.model_dump(mode="json")}

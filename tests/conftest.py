@@ -364,3 +364,131 @@ def committed_workspace(
     result = ProposalService(workspace).commit(root.name)
     assert result["canonical_status"] == "committed"
     return workspace
+
+
+def _commit_business_documents(
+    workspace: Workspace,
+    business_markdown_factory,
+    *,
+    review_id: str,
+    documents: list[dict[str, Any]],
+) -> None:
+    """Append fixture revisions through the same public proposal boundary."""
+
+    root = workspace.paths.proposals / review_id
+    root.mkdir()
+    files: list[BusinessFile] = []
+    for document in documents:
+        relative = document["path"]
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        operation = document.get("operation", "create")
+        destination.write_bytes(
+            business_markdown_factory(
+                object_type=document["type"],
+                record_id=document["id"],
+                operation=operation,
+                base_revision=document.get("base_revision"),
+                fields=document["fields"],
+                body=document["body"],
+            )
+        )
+        files.append(BusinessFile(path=relative, operation=operation))
+    manifest = ProposalManifest(
+        review_id=review_id,
+        base_commit=workspace.repository.head(),
+        workspace_version=workspace.identity["workspace_format_version"],
+        profile_version=workspace.profile.version,
+        files=files,
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(manifest.model_dump(mode="json"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    result = ProposalService(workspace).commit(review_id)
+    assert result["canonical_status"] == "committed"
+
+
+@pytest.fixture
+def workspace_with_tombstone(
+    committed_workspace: Workspace, business_markdown_factory
+) -> Workspace:
+    _commit_business_documents(
+        committed_workspace,
+        business_markdown_factory,
+        review_id="review_retrieval_tombstone",
+        documents=[
+            {
+                "path": "hypotheses/hyp_1.md",
+                "type": "hypothesis",
+                "id": "hyp_1",
+                "operation": "retire",
+                "base_revision": 1,
+                "fields": {
+                    "change_summary": "Retire the hypothesis",
+                    "confidence": 0.45,
+                    "evidence_refs": ["evidence:ev_1"],
+                    "counter_evidence_refs": [],
+                    "status": "tombstone",
+                },
+                "body": "This hypothesis is retired.",
+            }
+        ],
+    )
+    return committed_workspace
+
+
+@pytest.fixture
+def workspace_with_handoffs(
+    committed_workspace: Workspace, business_markdown_factory
+) -> Workspace:
+    _commit_business_documents(
+        committed_workspace,
+        business_markdown_factory,
+        review_id="review_retrieval_handoff",
+        documents=[
+            {
+                "path": "SESSION_HANDOFF.md",
+                "type": "session_handoff",
+                "id": "handoff_2",
+                "fields": {
+                    "change_summary": "Record the latest handoff",
+                    "topics": ["Latest topic"],
+                    "unanswered_questions": [],
+                    "active_tensions": [],
+                    "recent_decisions": [],
+                    "next_directions": ["Continue from here"],
+                    "status": "active",
+                },
+                "body": "Latest continuity context.",
+            }
+        ],
+    )
+    return committed_workspace
+
+
+@pytest.fixture
+def workspace_many_records(
+    committed_workspace: Workspace, business_markdown_factory
+) -> Workspace:
+    _commit_business_documents(
+        committed_workspace,
+        business_markdown_factory,
+        review_id="review_retrieval_many",
+        documents=[
+            {
+                "path": f"hypotheses/hyp_many_{index:03d}.md",
+                "type": "hypothesis",
+                "id": f"hyp_many_{index:03d}",
+                "fields": {
+                    "confidence": 0.4,
+                    "evidence_refs": ["evidence:ev_1"],
+                    "counter_evidence_refs": [],
+                    "status": "hypothesis",
+                },
+                "body": f"Repeated retrieval pattern {index:03d}.",
+            }
+            for index in range(25)
+        ],
+    )
+    return committed_workspace
