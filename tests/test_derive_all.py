@@ -663,3 +663,111 @@ def test_process_root_detach_never_deletes_public_name_replacement(
     finally:
         if replacement_fd is not None:
             os.close(replacement_fd)
+
+
+def test_derive_cleanup_preserves_a_nested_post_capture_name(
+    workspace, monkeypatch
+) -> None:
+    derivation = _derivation_module()
+    real_rename = derivation.atomic_noreplace_rename
+    real_open = derivation.os.open
+    cleanup_remnant: Path | None = None
+    inserted = False
+    descriptors_before = len(os.listdir("/proc/self/fd"))
+
+    def fail_publication_then_observe_cleanup(
+        source_parent_fd, source_name, target_parent_fd, target_name
+    ):
+        nonlocal cleanup_remnant
+        if source_name == target_name == "PCO_MEMORY":
+            raise OSError("injected publication failure")
+        result = real_rename(
+            source_parent_fd, source_name, target_parent_fd, target_name
+        )
+        source_parent = Path(f"/proc/self/fd/{source_parent_fd}").resolve()
+        if source_parent == workspace.paths.tmp.resolve() and source_name.startswith(
+            "derive-"
+        ):
+            cleanup_remnant = workspace.paths.tmp / target_name
+        return result
+
+    def insert_after_projection_open(path, flags, *args, **kwargs):
+        nonlocal inserted
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if path == "PCO_MEMORY" and cleanup_remnant is not None and not inserted:
+            inserted = True
+            nested_fd = real_open(
+                "post-capture.txt",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=descriptor,
+            )
+            try:
+                os.write(nested_fd, b"preserve post-capture payload\n")
+            finally:
+                os.close(nested_fd)
+        return descriptor
+
+    monkeypatch.setattr(
+        derivation, "atomic_noreplace_rename", fail_publication_then_observe_cleanup
+    )
+    monkeypatch.setattr(derivation.os, "open", insert_after_projection_open)
+
+    with pytest.raises(MemError) as caught:
+        derivation.derive_all(workspace)
+
+    assert caught.value.detail.code == "DERIVATION_FAILED"
+    assert inserted is True
+    assert cleanup_remnant is not None
+    assert (cleanup_remnant / "PCO_MEMORY/post-capture.txt").read_bytes() == (
+        b"preserve post-capture payload\n"
+    )
+    assert not (cleanup_remnant / "indexes").exists()
+    assert len(os.listdir("/proc/self/fd")) == descriptors_before
+
+
+def test_recursive_cleanup_never_authorizes_a_nested_post_capture_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    derivation = _derivation_module()
+    root = tmp_path / "cleanup-root"
+    root.mkdir()
+    child = root / "a-child"
+    child.mkdir()
+    owned_sibling = root / "z-owned.txt"
+    owned_sibling.write_text("erase owned sibling\n", encoding="utf-8")
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    real_open = derivation.os.open
+    inserted = False
+    descriptors_before = len(os.listdir("/proc/self/fd"))
+
+    def insert_after_child_open(path, flags, *args, **kwargs):
+        nonlocal inserted
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if path == "a-child" and kwargs.get("dir_fd") == root_fd and not inserted:
+            inserted = True
+            nested_fd = real_open(
+                "post-capture.txt",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=descriptor,
+            )
+            try:
+                os.write(nested_fd, b"preserve post-capture payload\n")
+            finally:
+                os.close(nested_fd)
+        return descriptor
+
+    monkeypatch.setattr(derivation.os, "open", insert_after_child_open)
+    try:
+        with pytest.raises(OSError, match="could not be emptied"):
+            derivation._erase_owned_directory(root_fd)
+    finally:
+        os.close(root_fd)
+
+    assert inserted is True
+    assert (child / "post-capture.txt").read_bytes() == (
+        b"preserve post-capture payload\n"
+    )
+    assert not owned_sibling.exists()
+    assert len(os.listdir("/proc/self/fd")) == descriptors_before - 1

@@ -27,13 +27,32 @@ if TYPE_CHECKING:
 _DIRECTORY_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
-_CLEANUP_MAX_PASSES = 16
 _RENAME_NOREPLACE = 1
 
 
 @dataclass(frozen=True)
 class _TargetState:
     identity: tuple[int, int] | None
+
+
+@dataclass
+class _CleanupEntrySnapshot:
+    name: str
+    identity: tuple[int, int]
+    entry_type: int
+    child: _CleanupDirectorySnapshot | None = None
+    rejected: bool = False
+
+
+@dataclass
+class _CleanupDirectorySnapshot:
+    directory_fd: int
+    identity: tuple[int, int]
+    version: tuple[int, int]
+    initial_names: frozenset[str]
+    entries: list[_CleanupEntrySnapshot]
+    errors: list[str]
+    blocked: bool = False
 
 
 @dataclass
@@ -588,82 +607,293 @@ def _detach_directory_noreplace(
 
 
 def _erase_owned_directory(directory_fd: int) -> None:
-    """Erase one retained directory tree without following or reauthorizing names."""
+    """Erase one retained directory tree from one closed authorization snapshot."""
 
+    snapshot = _capture_owned_tree(directory_fd)
+    try:
+        _validate_owned_tree_snapshot(snapshot)
+        _execute_owned_cleanup(snapshot)
+    finally:
+        _close_owned_tree_snapshot(snapshot)
+
+
+def _capture_owned_tree(directory_fd: int) -> _CleanupDirectorySnapshot:
+    """Capture a complete retained tree before the first destructive operation."""
+
+    before = os.fstat(directory_fd)
     try:
         initial_names = os.listdir(directory_fd)
     except OSError as exc:
         raise OSError(f"owned directory cannot be enumerated: {exc}") from exc
-    authorizations: dict[str, tuple[tuple[int, int], int]] = {}
-    rejected: set[str] = set()
-    removed: set[str] = set()
-    errors: list[str] = []
-    for name in initial_names:
-        if not _safe_name(name):
-            rejected.add(name)
-            errors.append("unsafe owned entry name")
-            continue
-        try:
-            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except OSError as exc:
-            rejected.add(name)
-            errors.append(str(exc))
-            continue
-        authorizations[name] = (_identity(observed), stat.S_IFMT(observed.st_mode))
-
-    for _ in range(_CLEANUP_MAX_PASSES):
-        progress = False
-        for name, (identity, entry_type) in authorizations.items():
-            if name in rejected or name in removed:
+    snapshot = _CleanupDirectorySnapshot(
+        directory_fd=directory_fd,
+        identity=_identity(before),
+        version=_directory_version(before),
+        initial_names=frozenset(initial_names),
+        entries=[],
+        errors=[],
+    )
+    try:
+        for name in initial_names:
+            if not _safe_name(name):
+                snapshot.errors.append("unsafe owned entry name")
                 continue
             try:
-                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as exc:
-                rejected.add(name)
-                errors.append(str(exc))
+                snapshot.errors.append(str(exc))
                 continue
-            if (
-                _identity(current) != identity
-                or stat.S_IFMT(current.st_mode) != entry_type
-            ):
-                rejected.add(name)
-                errors.append("owned entry identity changed")
+            entry = _CleanupEntrySnapshot(
+                name=name,
+                identity=_identity(observed),
+                entry_type=stat.S_IFMT(observed.st_mode),
+            )
+            snapshot.entries.append(entry)
+            if not stat.S_ISDIR(observed.st_mode):
                 continue
-            if stat.S_ISDIR(current.st_mode):
-                child_fd: int | None = None
-                try:
-                    child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
-                    if _identity(os.fstat(child_fd)) != identity:
-                        raise OSError("owned directory identity changed while opening")
-                    _erase_owned_directory(child_fd)
-                    _require_named_directory_fd(directory_fd, name, identity)
-                    os.rmdir(name, dir_fd=directory_fd)
-                    removed.add(name)
-                    progress = True
-                except OSError as exc:
-                    rejected.add(name)
-                    errors.append(str(exc))
-                finally:
-                    if child_fd is not None:
-                        os.close(child_fd)
-            else:
-                try:
-                    os.unlink(name, dir_fd=directory_fd)
-                    removed.add(name)
-                    progress = True
-                except OSError as exc:
-                    rejected.add(name)
-                    errors.append(str(exc))
+            child_fd: int | None = None
+            try:
+                child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                opened = os.fstat(child_fd)
+                if _entry_token(opened) != (
+                    entry.identity,
+                    entry.entry_type,
+                ) or _directory_version(opened) != _directory_version(observed):
+                    raise OSError("owned directory changed while opening")
+                entry.child = _capture_owned_tree(child_fd)
+                child_fd = None
+                if entry.child.blocked:
+                    entry.rejected = True
+                    snapshot.errors.append("owned child capture was unstable")
+            except OSError as exc:
+                entry.rejected = True
+                snapshot.errors.append(str(exc))
+            finally:
+                if child_fd is not None:
+                    os.close(child_fd)
+
+        _check_capture_poststate(snapshot)
+        return snapshot
+    except BaseException:
+        _close_owned_tree_snapshot(snapshot)
+        raise
+
+
+def _check_capture_poststate(snapshot: _CleanupDirectorySnapshot) -> None:
+    """Finish one directory capture and reject ambiguous authorization races."""
+
+    try:
+        final_names = frozenset(os.listdir(snapshot.directory_fd))
+        after = os.fstat(snapshot.directory_fd)
+    except OSError as exc:
+        snapshot.blocked = True
+        snapshot.errors.append(str(exc))
+        return
+    explained_change = final_names != snapshot.initial_names
+    additional = final_names - snapshot.initial_names
+    if additional:
+        snapshot.errors.append("owned directory gained a post-capture entry")
+    missing = snapshot.initial_names - final_names
+    if missing:
+        snapshot.errors.append("owned directory entry disappeared during capture")
+    for entry in snapshot.entries:
+        if entry.name in missing:
+            entry.rejected = True
+            continue
         try:
-            if not os.listdir(directory_fd):
-                return
+            current = os.stat(
+                entry.name,
+                dir_fd=snapshot.directory_fd,
+                follow_symlinks=False,
+            )
         except OSError as exc:
-            errors.append(str(exc))
-            break
-        if not progress:
-            break
-    detail = "; ".join(errors[-4:]) or "cleanup made no progress"
-    raise OSError(f"owned directory could not be emptied: {detail}")
+            entry.rejected = True
+            explained_change = True
+            snapshot.errors.append(str(exc))
+            continue
+        if _entry_token(current) != (entry.identity, entry.entry_type):
+            entry.rejected = True
+            explained_change = True
+            snapshot.errors.append("owned entry identity changed during capture")
+    if _identity(after) != snapshot.identity:
+        snapshot.blocked = True
+        snapshot.errors.append("owned directory descriptor identity changed")
+    elif _directory_version(after) != snapshot.version and not explained_change:
+        snapshot.blocked = True
+        snapshot.errors.append("owned directory capture was unstable")
+    else:
+        snapshot.version = _directory_version(after)
+
+
+def _validate_owned_tree_snapshot(snapshot: _CleanupDirectorySnapshot) -> None:
+    """Validate the whole captured tree before allowing its first removal."""
+
+    if snapshot.blocked:
+        return
+    try:
+        current_names = frozenset(os.listdir(snapshot.directory_fd))
+        current_root = os.fstat(snapshot.directory_fd)
+    except OSError as exc:
+        snapshot.blocked = True
+        snapshot.errors.append(str(exc))
+        return
+    explained_change = current_names != snapshot.initial_names
+    if current_names - snapshot.initial_names:
+        snapshot.errors.append("owned directory has additional residue")
+    missing = snapshot.initial_names - current_names
+    if missing:
+        snapshot.errors.append("owned directory entry disappeared")
+    for entry in snapshot.entries:
+        if entry.rejected:
+            continue
+        if entry.name in missing:
+            entry.rejected = True
+            continue
+        try:
+            current = os.stat(
+                entry.name,
+                dir_fd=snapshot.directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            entry.rejected = True
+            explained_change = True
+            snapshot.errors.append(str(exc))
+            continue
+        if _entry_token(current) != (entry.identity, entry.entry_type):
+            entry.rejected = True
+            explained_change = True
+            snapshot.errors.append("owned entry identity changed")
+            continue
+        if entry.child is not None:
+            _validate_owned_tree_snapshot(entry.child)
+            if entry.child.blocked:
+                entry.rejected = True
+                snapshot.errors.append("owned child snapshot validation failed")
+    if _identity(current_root) != snapshot.identity:
+        snapshot.blocked = True
+        snapshot.errors.append("owned directory descriptor identity changed")
+    elif _directory_version(current_root) != snapshot.version and not explained_change:
+        snapshot.blocked = True
+        snapshot.errors.append("owned directory changed after capture")
+
+
+def _execute_owned_cleanup(snapshot: _CleanupDirectorySnapshot) -> None:
+    """Execute cleanup without creating any authorization absent from the snapshot."""
+
+    if not snapshot.blocked:
+        for entry in snapshot.entries:
+            if entry.rejected:
+                continue
+            try:
+                detached_name = _detach_cleanup_entry(
+                    snapshot.directory_fd,
+                    entry.name,
+                    entry.identity,
+                    entry.entry_type,
+                )
+                if entry.child is None:
+                    _require_named_entry_fd(
+                        snapshot.directory_fd,
+                        detached_name,
+                        entry.identity,
+                        entry.entry_type,
+                    )
+                    os.unlink(detached_name, dir_fd=snapshot.directory_fd)
+                    continue
+                _execute_owned_cleanup(entry.child)
+                _require_named_entry_fd(
+                    snapshot.directory_fd,
+                    detached_name,
+                    entry.identity,
+                    entry.entry_type,
+                )
+                os.rmdir(detached_name, dir_fd=snapshot.directory_fd)
+            except OSError as exc:
+                entry.rejected = True
+                snapshot.errors.append(str(exc))
+    try:
+        residue = os.listdir(snapshot.directory_fd)
+    except OSError as exc:
+        snapshot.errors.append(str(exc))
+        residue = ["unreadable residue"]
+    if residue:
+        snapshot.errors.append("owned directory contains preserved residue")
+    if snapshot.errors:
+        detail = "; ".join(snapshot.errors[-4:])
+        raise OSError(f"owned directory could not be emptied: {detail}")
+
+
+def _detach_cleanup_entry(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int],
+    entry_type: int,
+) -> str:
+    """Atomically isolate one captured entry without removing a name replacement."""
+
+    _require_named_entry_fd(parent_fd, name, identity, entry_type)
+    detached_name = f".cleanup-{uuid.uuid4().hex}"
+    try:
+        os.stat(detached_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError(errno.EEXIST, "cleanup detach name already exists")
+    failure: BaseException | None = None
+    try:
+        atomic_noreplace_rename(parent_fd, name, parent_fd, detached_name)
+    except Exception as exc:
+        failure = exc
+    source_token = _named_entry_token(parent_fd, name)
+    detached_token = _named_entry_token(parent_fd, detached_name)
+    if source_token is None and detached_token == (identity, entry_type):
+        return detached_name
+    if failure is not None:
+        raise failure
+    raise OSError(
+        errno.ESTALE,
+        "owned entry identity changed during atomic detach; detached entry preserved",
+        detached_name,
+    )
+
+
+def _close_owned_tree_snapshot(snapshot: _CleanupDirectorySnapshot) -> None:
+    for entry in snapshot.entries:
+        if entry.child is None:
+            continue
+        _close_owned_tree_snapshot(entry.child)
+        os.close(entry.child.directory_fd)
+
+
+def _entry_token(observed: os.stat_result) -> tuple[tuple[int, int], int]:
+    return _identity(observed), stat.S_IFMT(observed.st_mode)
+
+
+def _directory_version(observed: os.stat_result) -> tuple[int, int]:
+    return observed.st_mtime_ns, observed.st_ctime_ns
+
+
+def _named_entry_token(parent_fd: int, name: str) -> tuple[tuple[int, int], int] | None:
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return _entry_token(observed)
+
+
+def _require_named_entry_fd(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int],
+    entry_type: int,
+) -> None:
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise OSError(f"owned entry name changed: {exc}") from exc
+    if _entry_token(observed) != (identity, entry_type):
+        raise OSError("owned entry identity changed")
 
 
 def _require_named_directory_fd(
