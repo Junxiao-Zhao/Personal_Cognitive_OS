@@ -755,58 +755,115 @@ def _named_directory_matches(
 
 def _erase_open_directory(directory_fd: int) -> None:
     errors: list[str] = []
-    for _ in range(_CLEANUP_MAX_PASSES):
+    try:
+        initial_names = os.listdir(directory_fd)
+    except OSError as exc:
+        raise OSError(f"private query directory could not be emptied: {exc}") from exc
+    if not initial_names:
+        return
+
+    authorizations: dict[str, tuple[tuple[int, int], int]] = {}
+    rejected: set[str] = set()
+    removed: set[str] = set()
+    for name in initial_names:
         try:
-            names = os.listdir(directory_fd)
+            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            errors.append("private query entry disappeared")
+            rejected.add(name)
         except OSError as exc:
             errors.append(str(exc))
-            break
-        if not names:
-            return
+            rejected.add(name)
+        else:
+            authorizations[name] = (
+                _stat_identity(observed),
+                stat.S_IFMT(observed.st_mode),
+            )
+
+    for _ in range(_CLEANUP_MAX_PASSES):
         progress = False
-        for name in names:
+        for name, (identity, entry_type) in authorizations.items():
+            if name in rejected or name in removed:
+                continue
             try:
-                observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except FileNotFoundError:
+                errors.append("private query entry disappeared")
+                rejected.add(name)
                 progress = True
                 continue
             except OSError as exc:
                 errors.append(str(exc))
                 continue
-            identity = _stat_identity(observed)
-            entry_type = stat.S_IFMT(observed.st_mode)
-            if stat.S_ISDIR(observed.st_mode):
+            if (
+                _stat_identity(current) != identity
+                or stat.S_IFMT(current.st_mode) != entry_type
+            ):
+                errors.append("private query entry identity changed")
+                rejected.add(name)
+                continue
+            if stat.S_ISDIR(current.st_mode):
                 child_fd: int | None = None
                 try:
                     child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
-                    if _stat_identity(os.fstat(child_fd)) != identity:
-                        raise OSError("private query directory identity changed")
+                    opened = os.fstat(child_fd)
+                    if (
+                        _stat_identity(opened) != identity
+                        or stat.S_IFMT(opened.st_mode) != entry_type
+                    ):
+                        errors.append("private query directory identity changed")
+                        rejected.add(name)
+                        continue
                     _erase_open_directory(child_fd)
+                except FileNotFoundError:
+                    errors.append("private query directory disappeared")
+                    rejected.add(name)
+                    progress = True
+                    continue
                 except OSError as exc:
                     errors.append(str(exc))
+                    rejected.add(name)
+                    continue
                 finally:
                     if child_fd is not None:
                         os.close(child_fd)
                 try:
-                    if _named_directory_matches(directory_fd, name, identity):
-                        os.rmdir(name, dir_fd=directory_fd)
-                        progress = True
+                    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 except FileNotFoundError:
+                    errors.append("private query directory disappeared")
+                    rejected.add(name)
                     progress = True
+                    continue
                 except OSError as exc:
                     errors.append(str(exc))
-                continue
-            try:
-                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    rejected.add(name)
+                    continue
                 if (
                     _stat_identity(current) != identity
                     or stat.S_IFMT(current.st_mode) != entry_type
                 ):
-                    errors.append("private query entry identity changed")
+                    errors.append("private query directory identity changed")
+                    rejected.add(name)
                     continue
+                try:
+                    os.rmdir(name, dir_fd=directory_fd)
+                    removed.add(name)
+                    progress = True
+                except FileNotFoundError:
+                    errors.append("private query directory disappeared")
+                    rejected.add(name)
+                    progress = True
+                except OSError as exc:
+                    errors.append(str(exc))
+                    rejected.add(name)
+                continue
+            try:
                 os.unlink(name, dir_fd=directory_fd)
+                removed.add(name)
                 progress = True
             except FileNotFoundError:
+                errors.append("private query entry disappeared")
+                rejected.add(name)
                 progress = True
             except OSError as exc:
                 errors.append(str(exc))

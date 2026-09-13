@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 
 import pytest
@@ -1169,3 +1170,240 @@ def test_private_query_cleanup_continues_after_special_entry_first(
     assert retained_entries == []
     assert descriptors_after == descriptors_before
     assert _tree(generation) == generation_before
+
+
+def test_erase_open_directory_never_reauthorizes_replaced_regular_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "cleanup-file-swap"
+    root.mkdir()
+    victim = root / "victim"
+    victim.write_bytes(b"owned-original")
+    sibling = root / "progress"
+    sibling.write_bytes(b"owned-progress")
+    real_listdir = os.listdir
+    real_stat = os.stat
+    root_fd = os.open(root, retrieval._DIRECTORY_OPEN_FLAGS)
+    original_fd = os.open(victim, os.O_RDONLY)
+    calls = 0
+    identities: dict[str, tuple[int, int, int]] = {}
+
+    def victim_first(path):
+        names = real_listdir(path)
+        if "victim" in names:
+            names.remove("victim")
+            names.insert(0, "victim")
+        return names
+
+    def replace_after_first_stat(path, *args, **kwargs):
+        nonlocal calls
+        observed = real_stat(path, *args, **kwargs)
+        if path == "victim" and kwargs.get("dir_fd") == root_fd:
+            calls += 1
+            if calls == 1:
+                identities["original"] = retrieval._stat_identity(observed) + (
+                    stat.S_IFMT(observed.st_mode),
+                )
+                victim.unlink()
+                victim.write_bytes(b"unowned-replacement")
+                replacement = real_stat("victim", dir_fd=root_fd, follow_symlinks=False)
+                identities["replacement"] = retrieval._stat_identity(replacement) + (
+                    stat.S_IFMT(replacement.st_mode),
+                )
+        return observed
+
+    monkeypatch.setattr(retrieval.os, "listdir", victim_first)
+    monkeypatch.setattr(retrieval.os, "stat", replace_after_first_stat)
+    try:
+        with pytest.raises(OSError, match="could not be emptied"):
+            retrieval._erase_open_directory(root_fd)
+    finally:
+        original_bytes = os.pread(original_fd, 64, 0)
+        os.close(original_fd)
+        os.close(root_fd)
+
+    assert identities["replacement"] != identities["original"]
+    assert original_bytes == b"owned-original"
+    assert victim.read_bytes() == b"unowned-replacement"
+    assert not sibling.exists()
+
+
+def test_erase_open_directory_never_reauthorizes_replaced_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root = tmp_path / "cleanup-directory-swap"
+    root.mkdir()
+    victim = root / "victim-dir"
+    victim.mkdir()
+    sibling = root / "progress"
+    sibling.write_bytes(b"owned-progress")
+    external = tmp_path / "external.txt"
+    external.write_bytes(b"external-must-survive")
+    real_listdir = os.listdir
+    real_stat = os.stat
+    root_fd = os.open(root, retrieval._DIRECTORY_OPEN_FLAGS)
+    original_fd = os.open(victim, retrieval._DIRECTORY_OPEN_FLAGS)
+    calls = 0
+    identities: dict[str, tuple[int, int, int]] = {}
+
+    def victim_first(path):
+        names = real_listdir(path)
+        if "victim-dir" in names:
+            names.remove("victim-dir")
+            names.insert(0, "victim-dir")
+        return names
+
+    def replace_after_first_stat(path, *args, **kwargs):
+        nonlocal calls
+        observed = real_stat(path, *args, **kwargs)
+        if path == "victim-dir" and kwargs.get("dir_fd") == root_fd:
+            calls += 1
+            if calls == 1:
+                identities["original"] = retrieval._stat_identity(observed) + (
+                    stat.S_IFMT(observed.st_mode),
+                )
+                victim.rmdir()
+                victim.mkdir()
+                (victim / "keep.txt").write_bytes(b"unowned-subtree")
+                (victim / "external-link").symlink_to(external)
+                replacement = real_stat(
+                    "victim-dir", dir_fd=root_fd, follow_symlinks=False
+                )
+                identities["replacement"] = retrieval._stat_identity(replacement) + (
+                    stat.S_IFMT(replacement.st_mode),
+                )
+        return observed
+
+    monkeypatch.setattr(retrieval.os, "listdir", victim_first)
+    monkeypatch.setattr(retrieval.os, "stat", replace_after_first_stat)
+    try:
+        with pytest.raises(OSError, match="could not be emptied"):
+            retrieval._erase_open_directory(root_fd)
+    finally:
+        os.close(original_fd)
+        os.close(root_fd)
+
+    assert identities["replacement"] != identities["original"]
+    assert (victim / "keep.txt").read_bytes() == b"unowned-subtree"
+    assert (victim / "external-link").is_symlink()
+    assert external.read_bytes() == b"external-must-survive"
+    assert not sibling.exists()
+
+
+def test_search_cleanup_never_reauthorizes_replaced_private_payload(
+    committed_workspace, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation-cleanup-replacement"
+    build_retrieval_generation(
+        committed_workspace.repository,
+        generation,
+        committed_workspace.repository.head(),
+    )
+    generation_before = _tree(generation)
+    generation_layout_before = _layout(generation)
+    canonical_before = _tree(committed_workspace.paths.canonical)
+    canonical_layout_before = _layout(committed_workspace.paths.canonical)
+    workspace_tmp_before = _tree(committed_workspace.paths.tmp)
+    workspace_tmp_layout_before = _layout(committed_workspace.paths.tmp)
+    environment_before = dict(os.environ)
+    real_erase = retrieval._erase_open_directory
+    real_listdir = os.listdir
+    real_stat = os.stat
+    descriptors_before = len(real_listdir("/proc/self/fd"))
+    retained_original = tmp_path / "retained-original-payload"
+    observed: dict[str, object] = {}
+    stat_calls = 0
+
+    def adversarial_erase(directory_fd: int) -> None:
+        nonlocal stat_calls
+        names = real_listdir(directory_fd)
+        if "0-victim" not in names or observed.get("attacked"):
+            real_erase(directory_fd)
+            return
+        observed["attacked"] = True
+
+        def replace_after_first_stat(path, *args, **kwargs):
+            nonlocal stat_calls
+            entry = real_stat(path, *args, **kwargs)
+            if path == "0-victim" and kwargs.get("dir_fd") == directory_fd:
+                stat_calls += 1
+                if stat_calls == 1:
+                    observed["original_identity"] = retrieval._stat_identity(entry)
+                    os.rename("0-victim", retained_original, src_dir_fd=directory_fd)
+                    replacement_fd = os.open(
+                        "0-victim",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        os.write(replacement_fd, b"unowned-replacement")
+                    finally:
+                        os.close(replacement_fd)
+                    replacement = real_stat(
+                        "0-victim", dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    observed["replacement_identity"] = retrieval._stat_identity(
+                        replacement
+                    )
+            return entry
+
+        with monkeypatch.context() as cleanup_patch:
+            cleanup_patch.setattr(retrieval.os, "stat", replace_after_first_stat)
+            real_erase(directory_fd)
+
+    def add_owned_victim(query_root: Path, *_args, **_kwargs):
+        victim = query_root / "tantivy/0-victim"
+        victim.write_bytes(b"owned-original")
+        observed["original_fd"] = os.open(victim, os.O_RDONLY)
+        observed["query_root"] = query_root.resolve()
+        monkeypatch.setattr(retrieval, "_erase_open_directory", adversarial_erase)
+        return {}, {}
+
+    monkeypatch.setattr(retrieval, "query_backends", add_owned_victim)
+    try:
+        result = search(
+            repo_root=committed_workspace.paths.canonical,
+            indexes_root=generation,
+            query="reviewed",
+        )
+        original_fd = int(observed["original_fd"])
+        observed["original_bytes"] = os.pread(original_fd, 64, 0)
+        os.close(original_fd)
+        observed["original_fd"] = None
+        query_root = Path(observed["query_root"])
+        replacement_path = query_root / "tantivy/0-victim"
+        replacement_bytes = (
+            replacement_path.read_bytes() if replacement_path.exists() else None
+        )
+        private_tree = _tree(query_root)
+        descriptors_after = len(real_listdir("/proc/self/fd"))
+    finally:
+        original_fd = observed.get("original_fd")
+        if original_fd is not None:
+            os.close(int(original_fd))
+        query_root_value = observed.get("query_root")
+        if query_root_value is not None:
+            shutil.rmtree(Path(query_root_value).parent, ignore_errors=True)
+
+    assert result["derivation_status"] == "fallback"
+    assert result["candidate_count"] <= retrieval.CANONICAL_FALLBACK_CANDIDATES
+    assert result["items"]
+    assert result["fallback_diagnostic"]["code"] == "DERIVATION_FAILED"
+    assert result["fallback_diagnostic"]["message"] == (
+        "retrieval generation unavailable; canonical fallback used"
+    )
+    assert "could not be cleaned safely" in result["fallback_diagnostic"]["value"]
+    assert observed["replacement_identity"] != observed["original_identity"]
+    assert observed["original_bytes"] == b"owned-original"
+    assert retained_original.read_bytes() == b"owned-original"
+    assert replacement_bytes == b"unowned-replacement"
+    assert private_tree == {"tantivy/0-victim": b"unowned-replacement"}
+    assert descriptors_after == descriptors_before
+    assert _tree(generation) == generation_before
+    assert _layout(generation) == generation_layout_before
+    assert _tree(committed_workspace.paths.canonical) == canonical_before
+    assert _layout(committed_workspace.paths.canonical) == canonical_layout_before
+    assert _tree(committed_workspace.paths.tmp) == workspace_tmp_before
+    assert _layout(committed_workspace.paths.tmp) == workspace_tmp_layout_before
+    assert dict(os.environ) == environment_before
