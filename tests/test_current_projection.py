@@ -674,11 +674,6 @@ def test_verify_workspace_delegates_requested_projection_without_writes(
     committed_workspace,
 ) -> None:
     target = committed_workspace.paths.projection
-    build_projection(
-        committed_workspace.repository,
-        target,
-        committed_workspace.repository.head(),
-    )
     before = _tree_bytes(committed_workspace.root)
 
     result = verify_workspace(committed_workspace, target)

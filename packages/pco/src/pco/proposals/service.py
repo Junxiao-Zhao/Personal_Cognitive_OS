@@ -182,14 +182,12 @@ class ProposalService:
             ) from exc
 
 
-def derive_after_commit(_workspace: "Workspace") -> dict[str, Any]:
-    """Narrow integration point supplied by the later derivation plan."""
+def derive_after_commit(workspace: "Workspace") -> dict[str, Any]:
+    """Invoke derivation lazily after the canonical transaction lock is released."""
 
-    return {
-        "ok": False,
-        "status": "unavailable",
-        "reason": "Derivation is deferred until pco derive all is available",
-    }
+    from ..derivation import derive_all
+
+    return derive_all(workspace)
 
 
 def _run_derivation(workspace: "Workspace") -> dict[str, Any]:
@@ -204,8 +202,21 @@ def _run_derivation(workspace: "Workspace") -> dict[str, Any]:
                 "error": "invalid derivation result",
             }
         )
+    except MemError as exc:
+        return exc.as_dict()
     except Exception as exc:  # canonical success is never rolled back by derivation
-        return {"ok": False, "status": "failed", "error": str(exc)}
+        return {
+            "ok": False,
+            "error": {
+                "code": "DERIVATION_FAILED",
+                "phase": "derivation",
+                "message": "Post-commit derivation failed independently",
+                "canonical_changed": False,
+                "retry_safe": True,
+                "recovery": ["Run pco derive all again"],
+            },
+            "diagnostic": {"value": str(exc)},
+        }
 
 
 def _run_archive(workspace: "Workspace", receipt: dict[str, Any]) -> ArchiveResult:

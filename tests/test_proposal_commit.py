@@ -12,6 +12,9 @@ from pco.proposals.models import BusinessFile, LocalFileMaterial, ProposalManife
 from pco.proposals.service import ProposalService
 from pco.proposals import archive as archive_module
 from pco.proposals import service as service_module
+from pco import retrieval
+from pco.derivation_manifest import verify_derivation_tree
+from pco.verify import verify_projection
 
 
 def _write_evidence_proposal(
@@ -120,6 +123,49 @@ def test_derivation_runs_after_lock_release(
     assert result["derivation"] == {"status": "test-derived"}
 
 
+def test_commit_uses_real_derive_all_after_lock_release_and_only_one_transaction(
+    workspace, proposal_factory, business_markdown_factory, monkeypatch
+) -> None:
+    _write_evidence_proposal(workspace, proposal_factory, business_markdown_factory)
+
+    def tantivy(path: Path, documents: list[dict]) -> None:
+        path.mkdir()
+        (path / "meta.json").write_text(
+            json.dumps({"count": len(documents)}, sort_keys=True), encoding="utf-8"
+        )
+
+    def milvus(path: Path, documents: list[dict]) -> None:
+        path.write_text(
+            json.dumps({"count": len(documents)}, sort_keys=True), encoding="utf-8"
+        )
+
+    monkeypatch.setattr(retrieval, "build_tantivy", tantivy)
+    monkeypatch.setattr(retrieval, "build_milvus", milvus)
+
+    result = ProposalService(workspace).commit("review_commit")
+
+    assert result["canonical_status"] == "committed"
+    assert result["derivation"]["ok"] is True
+    assert result["derivation"]["source_commit"] == workspace.repository.head()
+    assert _transaction_count(workspace, result["receipt_id"]) == 1
+    assert (
+        verify_projection(
+            workspace.paths.projection, expected_commit=workspace.repository.head()
+        )["ok"]
+        is True
+    )
+    assert (
+        verify_derivation_tree(
+            workspace.paths.indexes,
+            kind="retrieval_index",
+            expected_commit=workspace.repository.head(),
+        )["ok"]
+        is True
+    )
+    with workspace.repository.lock(blocking=False):
+        pass
+
+
 def test_archive_failure_does_not_block_derivation_or_canonical_success(
     workspace, proposal_factory, business_markdown_factory, monkeypatch
 ) -> None:
@@ -167,6 +213,27 @@ def test_unexpected_archive_exception_is_warning_and_derivation_still_runs(
     assert result["archive_status"] == "pending"
     assert result["archive_warning"]["code"] == "PROPOSAL_ARCHIVE_PENDING"
     assert result["derivation"]["status"] == "test-derived"
+
+
+def test_real_derivation_memerror_is_structured_and_never_repeats_commit(
+    workspace, proposal_factory, business_markdown_factory, monkeypatch
+) -> None:
+    _write_evidence_proposal(workspace, proposal_factory, business_markdown_factory)
+    from pco import derivation
+
+    monkeypatch.setattr(
+        derivation, "read_head_before_publish", lambda _workspace: "f" * 40
+    )
+
+    first = ProposalService(workspace).commit("review_commit")
+    second = ProposalService(workspace).commit("review_commit")
+
+    assert first["canonical_status"] == second["canonical_status"] == "committed"
+    assert first["derivation"] == second["derivation"]
+    assert first["derivation"]["error"]["code"] == "CANONICAL_HEAD_CHANGED"
+    assert first["derivation"]["error"]["canonical_changed"] is False
+    assert first["derivation"]["error"]["retry_safe"] is True
+    assert _transaction_count(workspace, first["receipt_id"]) == 1
 
 
 def test_receipt_retry_precedes_active_discovery_and_never_reads_external_input(
