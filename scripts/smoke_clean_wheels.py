@@ -17,9 +17,33 @@ from packaging.version import Version
 
 RESOURCE_AND_VERSION_PROBE = r"""
 from importlib.resources import files
+import os
+from pathlib import Path
+import sysconfig
 
 import mem_core
 import pco
+from mem_core.profile import Profile
+from mem_core.registry import default_registry
+from pco.paths import bundled_profile
+
+
+def require_installed_origin(module):
+    origin = Path(module.__file__).resolve(strict=True)
+    install_roots = {
+        Path(path).resolve(strict=True)
+        for key, path in sysconfig.get_paths().items()
+        if key in {"purelib", "platlib"}
+    }
+    normalized_origin = os.path.normcase(str(origin))
+    for root in install_roots:
+        normalized_root = os.path.normcase(str(root))
+        try:
+            if os.path.commonpath((normalized_origin, normalized_root)) == normalized_root:
+                return
+        except ValueError:
+            continue
+    raise AssertionError(f"{module.__name__} origin outside fresh environment: {origin}")
 
 
 def regular_files(root, prefix=""):
@@ -34,16 +58,57 @@ def regular_files(root, prefix=""):
 
 
 assert mem_core.__version__ == pco.__version__ == "0.5.0"
+require_installed_origin(mem_core)
+require_installed_origin(pco)
 resources = files("pco.resources")
 profile_files = regular_files(resources.joinpath("profiles", "pco"))
 assert "profile.yaml" in profile_files
 assert any(path.startswith("schemas/") for path in profile_files)
+
+profile = Profile.load(bundled_profile(), default_registry())
+assert profile.name == "pco"
+assert profile.version == "0.5.0"
+assert set(profile.config.streams) == {
+    "evidence",
+    "sources",
+    "events",
+    "psychologies",
+    "philosophies",
+    "archetypes",
+    "hypotheses",
+    "meta_revisions",
+    "session_handoffs",
+}
 
 skills = resources.joinpath("skills")
 for name in ("pco-memory", "pco-consolidate"):
     members = regular_files(skills.joinpath(name))
     assert {"SKILL.md", "PERMISSIONS.md", "manifest.json"} <= members
 """
+
+
+_UNSAFE_CHILD_ENVIRONMENT = {
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
+    "PYTHONSTARTUP",
+    "PYTHONINSPECT",
+    "PYTHONEXECUTABLE",
+    "__PYVENV_LAUNCHER__",
+    "VIRTUAL_ENV",
+}
+
+
+def sanitized_environment() -> dict[str, str]:
+    """Copy the caller environment without Python/venv source injection."""
+
+    result = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in _UNSAFE_CHILD_ENVIRONMENT
+    }
+    result["PYTHONNOUSERSITE"] = "1"
+    return result
 
 
 def executable_name(name: str) -> str:
@@ -102,7 +167,14 @@ def smoke(
     with TemporaryDirectory(prefix="pco-wheelhouse-") as wheel_dir, TemporaryDirectory(
         prefix="pco-venv-"
     ) as env_dir:
-        wheelhouse = Path(wheel_dir)
+        wheelhouse = Path(wheel_dir).resolve()
+        environment = Path(env_dir).resolve()
+        if wheelhouse.is_relative_to(repo_root) or environment.is_relative_to(
+            repo_root
+        ):
+            raise RuntimeError("smoke temporary directories must be outside repository")
+        child_env = sanitized_environment()
+        child_cwd = str(wheelhouse)
         run(
             [
                 sys.executable,
@@ -114,6 +186,8 @@ def smoke(
                 str(wheelhouse),
             ],
             check=True,
+            env=child_env,
+            cwd=child_cwd,
         )
         run(
             [
@@ -126,17 +200,36 @@ def smoke(
                 str(wheelhouse),
             ],
             check=True,
+            env=child_env,
+            cwd=child_cwd,
         )
         venv.EnvBuilder(with_pip=True).create(env_dir)
-        python, scripts = environment_commands(Path(env_dir))
+        python, scripts = environment_commands(environment)
         wheels = exact_wheels(wheelhouse, names=("mem_core", "pco"), version="0.5.0")
         run(
             [str(python), "-m", "pip", "install", *map(str, wheels)],
             check=True,
+            env=child_env,
+            cwd=child_cwd,
         )
-        run([str(python), "-c", RESOURCE_AND_VERSION_PROBE], check=True)
-        run([str(scripts / executable_name("pco")), "--help"], check=True)
-        run([str(scripts / executable_name("mem")), "--help"], check=True)
+        run(
+            [str(python), "-c", RESOURCE_AND_VERSION_PROBE],
+            check=True,
+            env=child_env,
+            cwd=child_cwd,
+        )
+        run(
+            [str(scripts / executable_name("pco")), "--help"],
+            check=True,
+            env=child_env,
+            cwd=child_cwd,
+        )
+        run(
+            [str(scripts / executable_name("mem")), "--help"],
+            check=True,
+            env=child_env,
+            cwd=child_cwd,
+        )
 
 
 def main() -> int:
