@@ -82,7 +82,13 @@ proposal 输入材料保存。
 pytest -q
 PCO_RUN_MILVUS=1 pytest -q
 git diff --check
+python scripts/smoke_clean_wheels.py
 ```
+
+自动门之外，发布还必须在新初始化的专用工作区中分别完成 Codex 与 OpenCode
+的 [v0.5 TUI permission smoke protocol](docs/verification/pco-v0.5-tui-smoke.md)。
+这是唯一的跨 Host Agent 行为门；仓库不包含非交互 Host runner 或自动授权
+profile，Host 版本、提示次数和结果必须由人工如实记录。
 
 ## 权威设计与实施记录
 
