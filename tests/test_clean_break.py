@@ -183,6 +183,19 @@ def test_repository_contains_no_host_eval_runner() -> None:
     assert not (ROOT / "tests/opencode_question_loopback.ts").exists()
 
 
+def test_repository_contains_no_remaining_v04_executables() -> None:
+    removed = (
+        "scripts/benchmark_corpus.py",
+        "tests/fixtures/affine_bridge.py",
+    )
+    assert not [relative for relative in removed if (ROOT / relative).exists()]
+
+
+def test_repository_contains_no_removed_host_ignore_rule() -> None:
+    ignore_lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert ".opencode/node_modules/" not in ignore_lines
+
+
 def test_shared_v05_fixture_module_has_no_legacy_runtime_imports() -> None:
     conftest = (ROOT / "tests/conftest.py").read_text(encoding="utf-8")
     forbidden = (
