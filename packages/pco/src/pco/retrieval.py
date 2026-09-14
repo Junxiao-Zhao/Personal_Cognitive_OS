@@ -1357,19 +1357,3 @@ def _change_window_summary(documents: list[dict[str, Any]]) -> dict[str, Any]:
         "earlier": dict(sorted(earlier.items())),
         "later": dict(sorted(later.items())),
     }
-
-
-# Transitional entry point retained until Task 5 removes the package inventory.
-def build_index(
-    *,
-    repo_root: Path,
-    indexes_root: str | Path,
-    source_commit: str | None = None,
-    **_: Any,
-) -> dict[str, Any]:
-    repository = MemoryRepository(
-        Path(repo_root), Profile.load(bundled_profile(), default_registry())
-    )
-    commit = source_commit or repository.head()
-    manifest = build_retrieval_generation(repository, Path(indexes_root), commit)
-    return {"ok": True, **manifest.model_dump(mode="json")}

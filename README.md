@@ -1,76 +1,97 @@
 # PCO
 
-PCO（Personal Cognitive OS）是一个本地优先、证据可追溯的单用户长期记忆系统。它以 OpenCode 作为 MVP Agent Harness，将公开对话、用户授权的来源快照、结构化认识、Meta-memory 和 continuation 保存到本地 append-only JSONL + Git canonical memory。
+PCO（Personal Cognitive OS）是本地优先、证据可追溯的单用户长期记忆系统。
+v0.5 以 Agent 无关的专用工作区为边界：任何支持项目本地
+`.agents/skills`、shell 命令和一次性写权限升级的 Agent Host 都可以使用它，
+PCO 本身不包含 Host adapter、checkpoint、compact 或后台自动整理运行时。
 
-代码分为两层：
+代码分为两个 Python 分发包：
 
-- `mem-core`：领域无关的 Profile、JSON Schema、append-only stream、写策略、approval receipt、Git worktree 原子事务和 pre-commit 最终校验。
-- `pco`：Thread/epoch、OpenCode Adapter、checkpoint 状态机、PCO Profile、来源 diff、混合检索、上下文发布和可替换投影。
+- `mem-core`：Profile 驱动、领域无关的 append-only JSONL、校验、Git
+  worktree 原子事务与 canonical receipt；
+- `pco`：专用工作区、Markdown proposal、来源 diff、当前状态投影、检索与
+  Agent 可调用的 `pco` CLI。
 
-## 安装与启动
+## 安装
 
-要求 Python 3.11+、Git 和 OpenCode。Milvus Lite 与 Tantivy 已作为 Python 依赖安装。
-
-项目拆分为两个 Python 分发包：
-
-- `packages/mem-core`：领域无关的 `mem-core`，提供 `mem` CLI；
-- `packages/pco`：PCO 应用层，依赖 `mem-core`，提供 `pco` CLI。
+要求 Python 3.11+ 和 Git。Milvus Lite 与 Tantivy 是派生索引依赖。
 
 ```bash
-# 开发安装（mem-core 需先以 editable 安装，pco 才能解析本地依赖）
 python -m pip install -e packages/mem-core
 python -m pip install -e 'packages/pco[dev]'
-
-# 默认使用 AFFiNE 投影；未配置 bridge 时 canonical commit 仍会成功，投影标记 pending。
-pco --workspace .pco init --projection affine
-
-# 或使用完全本地、开箱即用的 Markdown 投影。
-pco --workspace .pco init --projection markdown
-
-pco --workspace .pco doctor
-pco --workspace .pco run --project .
 ```
 
-`pco run` 会把 plugin、隐藏的 `pco-consolidator` subagent、`pco-memory` skill 和命令安装到项目的 `.opencode/`，然后进入唯一的 OpenCode 主 session。第一次 session 会自动绑定当前 PCO epoch。
+## 创建专用工作区
 
-日常入口：
+`pco init` 只接受不存在或为空的目标目录，不会嵌入或覆盖已有项目。初始化会
+创建 canonical Git repository、proposal 与 projection 目录，并安装两个项目本地
+SKILL。初始化后，从该目录重新打开 Agent Host，以便发现 `.agents/skills`。
 
-- 正常对话：完整 turn 在 session idle 时独立归档。
-- `/consolidate`：执行 memory checkpoint，提交并发布最新认知上下文；不压缩原始对话上下文。
-- `/compact`：先完成或复用 `/consolidate` 的 memory checkpoint；context publication 成功后再执行一次 Harness native compact。若出现 Meta 提案，会在主会话打开固定的原生 question 表单，批准或用 Tab/Other 输入非空拒绝理由。
-- `/pco-status`：只读展示同一 durable checkpoint 的 `trigger`、`intent`、consolidation、publication、derivation、compaction 和恢复状态。
-- `/pco-retry`：从最近持久化失败边界恢复；native compact 失败只重试 compact，不重复记忆提交或 context publication。
-- `/pco-abort`：仅能中止尚未 canonical commit 的 checkpoint；commit 后不能回滚，即使 compact 仍失败。
-- `pco --workspace .pco source add /path/to/journal.md`：注册只读本地来源。
-- 非本地 locator 由外部 reader/Skill 扩展提供；默认安装只包含本地文件 reader，不会注册 `affine-cli`。
-- `pco --workspace .pco search '为什么我总在公开前拖延' --mode pattern`：调用五种 Profile 检索模式之一。
+```bash
+pco init ~/my-pco
+cd ~/my-pco
+pco doctor
+pco verify
+```
 
-## Checkpoint 保证
+工作区的权威数据位于 `.pco/canonical`。`PCO_MEMORY` 与 `.pco/indexes`
+都是可丢弃派生物；canonical 数据不依赖它们恢复。
 
-一次 checkpoint 会锁定普通输入，冻结精确消息边界与来源哈希，在隔离的原生 OpenCode child session 中生成 proposal，并先经 Profile 校验。`/consolidate` 只完成 memory checkpoint；`/compact` 复用同一流程，并以 context publication 成功作为 native compact 的硬门禁。Meta-memory 属于 `user_approval` stream：approval receipt 同时绑定用户审阅的受保护 diff hash、完整 operation-set hash 和 transaction fingerprint。
+## Proposal 工作流
 
-通过后，结构化 memory 先以 `content_commit` 提交并发布 `currentContext`；派生能力基于该 commit 构建，只有 `intent=compact` 才在 publication 成功后调用一次 Harness native compact，随后以独立 `audit_commit` 记录 checkpoint outcome 和恢复状态。Milvus/Tantivy、backlinks 和投影属于可重建派生状态，失败只产生 pending receipt，不回滚 canonical commit。拒绝理由来自原生 question 的用户回答，作为 `question:<requestID>` 的 decision evidence 归档；Yes 不生成虚构的 user conversation message。
+Agent 先生成 proposal 控制信息，再通过 Host 的 Edit 能力一次性写入完整的
+`PCO_PROPOSALS/<review_id>/`。用户检查可读的 Markdown diff 后，Agent 只把
+review ID 传给 commit 命令：
 
-## AFFiNE
+```bash
+pco proposal status
+pco proposal scaffold
+pco proposal validate <review_id>
+pco proposal commit <review_id>
+```
 
-AFFiNE 内容使用其前端内部的 BlockSuite/Yjs 文档模型，目前没有稳定的公共“按 Markdown upsert 文档”服务端 API。因此 PCO 把 provider-specific 逻辑隔离成一个严格的 JSON stdin/stdout bridge，而没有把 AFFiNE 私有 CRDT 协议写进 `mem-core`。配置方式、幂等合同和失败恢复见 [AFFiNE bridge](docs/AFFINE_BRIDGE.md)。
+也可以在 canonical commit 前运行 `pco proposal abort <review_id>`。唯一需要
+强原子性与崩溃恢复保证的是 mem-core canonical transaction 及其 Git commit。
+Proposal 归档和 derivation 属于非 canonical 阶段；它们失败时，已经成功的
+canonical commit 不会回滚。
 
-没有设置 `PCO_AFFINE_COMMAND` 时，每个 commit 的完整 page batch 会写入 `.pco/state/affine/outbox/<commit>.json`，receipt 明确标记 pending；可随时设置 bridge 后执行 `/pco-retry`。Markdown 投影无需外部服务。
+## 读取、来源与派生
 
-AFFiNE 作为 source 的读取同样属于外部扩展点。只有在安装并注册 provider reader、且 Profile 的 `source_readers` allowlist 明确包含该 reader 后，才可注册 `affine://...` locator；默认 PCO 安装不会提供或发现 `affine-cli`，未注册时会返回结构化 `SOURCE_READER_REQUIRED`。
+```bash
+pco search '为什么我总在公开前拖延' --mode pattern
+pco history hypotheses hyp_example
+pco source diff [source_id]
+pco verify --path PCO_MEMORY
+pco derive all
+```
+
+`doctor`、`verify`、`search`、`history`、`source diff`、`proposal status`、
+`proposal scaffold` 和 `proposal validate` 都是只读命令。Search 只使用与当前
+canonical HEAD 匹配且校验通过的索引；索引缺失、过期或损坏时，自动使用有界
+canonical fallback。`pco derive all` 从同一个 canonical HEAD 同时重建
+`PCO_MEMORY` 与检索索引。若 projection 被手工修改，先把希望保留的内容写入
+proposal；确定丢弃时才使用 `pco derive all --discard-modified-projection`。
+
+新增来源也是普通 proposal 文件；v0.5 没有 `source add`。本地来源的
+`pco source diff` 会比较完整快照，远程内容由 Agent Host 的原生工具读取后作为
+proposal 输入材料保存。
 
 ## 验证
 
 ```bash
-pytest
-
-# 检索功能测试需要本机 loopback；验证真实 Milvus Lite 与 Tantivy 后端。
-PCO_RUN_MILVUS=1 pytest -m milvus
+pytest -q
+PCO_RUN_MILVUS=1 pytest -q
+git diff --check
 ```
 
-Tantivy 与 Milvus Lite 是硬依赖。后端不可用时 `pco derive index` 与 `pco search`
-会返回带稳定 code 与 recovery 提示的明确错误（`INDEX_BACKEND_FAILED`），不会静默
-降级到本地简化索引。PRD 规模（10 万消息）的性能基准与当前差距见
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md)。
+## 权威设计与实施记录
 
-产品与验收基线见 [MRD](docs/PCO_MRD_v0.3.md) 与 [PRD v0.4.0](docs/PCO_PRD_v0.4.0.md)；v0.3.1 保留为历史基线。实现验收矩阵见 [MVP verification](docs/MVP_VERIFICATION.md)。
+- [PCO v0.5 approved design](docs/superpowers/specs/2026-08-30-pco-v0.5-agent-agnostic-design.md)
+- [ADR 0001: v0.5 clean break](docs/adr/0001-pco-v0.5-clean-break.md)
+- [Canonical core plan](docs/superpowers/plans/2026-08-30-pco-v0.5-canonical-core.md)
+- [Workspace and skills plan](docs/superpowers/plans/2026-08-30-pco-v0.5-workspace-and-skills.md)
+- [Proposal and sources plan](docs/superpowers/plans/2026-08-30-pco-v0.5-proposal-and-sources.md)
+- [Derivation, CLI, and clean-break plan](docs/superpowers/plans/2026-08-30-pco-v0.5-derivation-cli-clean-break.md)
+
+v0.3/v0.4 没有原地 migration 或 schema compatibility 路径。被替代设计仅保留在
+Git 历史中；以上 approved design 与 ADR 是当前架构权威。

@@ -15,7 +15,7 @@ import pytest
 
 from pco.derivation_manifest import DerivationManifest
 from pco import projections as projections_module
-from pco.projections import build_projection, project_markdown, projection_path
+from pco.projections import build_projection, projection_path
 from pco.proposals.markdown import render_business_markdown
 from pco.proposals.models import BusinessFile, ProposalManifest
 from pco.proposals.service import ProposalService
@@ -100,25 +100,6 @@ def test_projection_contains_every_current_effective_stream(
     assert manifest.kind == "pco_memory"
     assert manifest.profile_version == "0.5.0"
     assert verify_projection(target)["ok"] is True
-
-
-def test_staged_markdown_capability_delegates_to_current_projection_only(
-    committed_workspace, tmp_path: Path
-) -> None:
-    target = tmp_path / "projection"
-
-    result = project_markdown(
-        repo_root=committed_workspace.repository.root,
-        output_root=target,
-        source_commit=committed_workspace.repository.head(),
-    )
-
-    assert result["target"] == "pco_memory"
-    assert set(_tree_bytes(target)) == EXPECTED_FILES | {"manifest.json"}
-    assert not any(
-        name in _tree_bytes(target)
-        for name in (".pco-projection.json", "mapping.json", "backlinks.json")
-    )
 
 
 def test_projection_payload_is_the_canonical_business_markdown(

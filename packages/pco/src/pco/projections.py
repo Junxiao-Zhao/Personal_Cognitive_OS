@@ -106,33 +106,6 @@ def build_projection(
     return manifest
 
 
-def project_markdown(
-    *,
-    repo_root: Path,
-    output_root: str | Path,
-    source_commit: str | None = None,
-    **_: Any,
-) -> dict[str, Any]:
-    """Bridge the staged capability entry point to the v0.5 pure builder.
-
-    The clean-break task removes this capability name.  Until then it renders
-    exactly the current v0.5 projection and carries no page, backlink, AFFiNE,
-    or persistent mapping behavior.
-    """
-
-    from .repo_loader import repository_for_repo
-
-    repository = repository_for_repo(Path(repo_root))
-    commit = source_commit or repository.head()
-    manifest = build_projection(repository, Path(output_root), commit)
-    return {
-        "ok": True,
-        "target": "pco_memory",
-        "source_commit": manifest.source_commit,
-        "files": len(manifest.files),
-    }
-
-
 def projection_path(stream: str, record_id: str) -> str:
     """Map a Profile-valid record ID to one deterministic portable path."""
 

@@ -9,9 +9,7 @@ from mem_core import Profile, TransactionManager
 from mem_core import hook as mem_hook
 from mem_core.delta import is_fast_path, is_messages_only
 from mem_core.models import Operation
-from mem_core.profile import ProfileRegistry
 from mem_core.repository import MemoryRepository
-from pco.paths import bundled_profile
 
 NOW = "2026-08-16T10:00:00+00:00"
 
@@ -105,22 +103,13 @@ def _stage_transaction(repository: MemoryRepository, state) -> None:
 def test_generic_profiles_declare_independent_validation_policies(
     tmp_path: Path,
 ) -> None:
-    public_logs = Profile.load(_logs_profile(tmp_path / "logs"))
-    research_registry = ProfileRegistry()
-    research_registry.register_lazy(
-        "research.validate", "pco.research_profile:validate_profile"
+    delta_profile = Profile.load(_logs_profile(tmp_path / "delta"))
+    structured_profile = Profile.load(
+        _logs_profile(tmp_path / "structured", mode="structured")
     )
-    research_registry.register_lazy(
-        "research.retrieval.search", "pco.research_profile:search"
-    )
-    research_registry.register_lazy(
-        "research.projection.markdown", "pco.research_profile:project_markdown"
-    )
-    research = Profile.load(bundled_profile("research"), research_registry)
 
-    assert public_logs.uses_delta_fast_path("logs")
-    assert research.uses_delta_fast_path("observations")
-    assert not research.uses_delta_fast_path("claims")
+    assert delta_profile.uses_delta_fast_path("logs")
+    assert not structured_profile.uses_delta_fast_path("logs")
 
 
 def test_logs_stream_uses_profile_fast_path_for_transaction_and_hook(

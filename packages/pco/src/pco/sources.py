@@ -373,9 +373,9 @@ def read_local_file(locator: str) -> SourceRead:
 class ReaderRegistry:
     """Allowlisted source readers owned by the PCO wrapper.
 
-    A registry is intentionally injectable: integrations can register an
-    AFFiNE/Feishu/fixture reader without making SourceManager know about the
-    remote platform or making a network call itself.
+    A registry is intentionally injectable: integrations can register a
+    provider-specific or fixture reader without making SourceManager know
+    about the remote platform or making a network call itself.
     """
 
     def __init__(self, readers: Mapping[str, SourceReader] | None = None) -> None:

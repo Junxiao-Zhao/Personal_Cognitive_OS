@@ -17,10 +17,10 @@ def test_default_registry_discovers_only_retained_v05_capabilities():
     retained = (
         "pco.validate",
         "pco.retrieval.search",
-        "pco.index.build",
-        "pco.projection.markdown",
     )
     removed = (
+        "pco.index.build",
+        "pco.projection.markdown",
         "pco.projection.affine",
         "pco.backlinks.build",
         "pco.context.render",
