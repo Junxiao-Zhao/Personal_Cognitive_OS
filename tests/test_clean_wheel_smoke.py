@@ -1,14 +1,30 @@
 from __future__ import annotations
 
+import importlib.resources
 import os
 from pathlib import Path
 from subprocess import CompletedProcess
 import subprocess
 import sys
+import sysconfig
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from scripts import smoke_clean_wheels as smoke_module
+
+APPROVED_STREAMS = {
+    "evidence",
+    "sources",
+    "events",
+    "psychologies",
+    "philosophies",
+    "archetypes",
+    "hypotheses",
+    "meta_revisions",
+    "session_handoffs",
+}
+REQUIRED_SKILL_FILES = {"SKILL.md", "PERMISSIONS.md", "manifest.json"}
 
 
 class RecordingRunner:
@@ -48,6 +64,96 @@ class RecordingEnvBuilder:
             smoke_module.executable_name("mem"),
         ):
             (scripts / name).touch()
+
+
+def _execute_controlled_probe(
+    probe: str,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    invalid: str | None = None,
+) -> None:
+    """Execute the embedded probe against an independently specified install."""
+    purelib = root / "fresh-venv/lib/site-packages"
+    resources = root / "installed-resources"
+    profile_root = resources / "profiles/pco"
+    (profile_root / "schemas").mkdir(parents=True)
+    (profile_root / "profile.yaml").write_text("name: controlled\n", encoding="utf-8")
+    (profile_root / "schemas/hypothesis.schema.json").write_text("{}", encoding="utf-8")
+    for skill in ("pco-memory", "pco-consolidate"):
+        skill_root = resources / "skills" / skill
+        skill_root.mkdir(parents=True)
+        for member in REQUIRED_SKILL_FILES:
+            (skill_root / member).write_text(member, encoding="utf-8")
+    if invalid is not None and invalid.startswith("skill:"):
+        _prefix, skill, member = invalid.split(":", 2)
+        (resources / "skills" / skill / member).unlink()
+
+    outside = root / "source-checkout"
+    mem_origin_root = outside if invalid == "mem_core_origin" else purelib
+    pco_origin_root = outside if invalid == "pco_origin" else purelib
+    mem_origin = mem_origin_root / "mem_core/__init__.py"
+    pco_origin = pco_origin_root / "pco/__init__.py"
+    mem_origin.parent.mkdir(parents=True, exist_ok=True)
+    pco_origin.parent.mkdir(parents=True, exist_ok=True)
+    mem_origin.touch()
+    pco_origin.touch()
+
+    streams = set(APPROVED_STREAMS)
+    if invalid == "streams_missing":
+        streams.remove("hypotheses")
+    elif invalid == "streams_additional":
+        streams.add("legacy_stream")
+    profile = SimpleNamespace(
+        name="wrong-profile" if invalid == "profile_name" else "pco",
+        version="0.4.0" if invalid == "profile_version" else "0.5.0",
+        config=SimpleNamespace(streams={name: object() for name in streams}),
+    )
+    registry_token = object()
+
+    class ControlledProfile:
+        @classmethod
+        def load(cls, loaded_root, registry):
+            assert Path(loaded_root) == profile_root
+            assert registry is registry_token
+            return profile
+
+    mem_core = ModuleType("mem_core")
+    mem_core.__path__ = []
+    mem_core.__file__ = str(mem_origin)
+    mem_core.__version__ = "0.4.0" if invalid == "mem_core_version" else "0.5.0"
+    pco = ModuleType("pco")
+    pco.__path__ = []
+    pco.__file__ = str(pco_origin)
+    pco.__version__ = "0.4.0" if invalid == "pco_version" else "0.5.0"
+    profile_module = ModuleType("mem_core.profile")
+    profile_module.Profile = ControlledProfile
+    registry_module = ModuleType("mem_core.registry")
+    registry_module.default_registry = lambda: registry_token
+    paths_module = ModuleType("pco.paths")
+    paths_module.bundled_profile = lambda: profile_root
+
+    monkeypatch.setitem(sys.modules, "mem_core", mem_core)
+    monkeypatch.setitem(sys.modules, "pco", pco)
+    monkeypatch.setitem(sys.modules, "mem_core.profile", profile_module)
+    monkeypatch.setitem(sys.modules, "mem_core.registry", registry_module)
+    monkeypatch.setitem(sys.modules, "pco.paths", paths_module)
+    monkeypatch.setattr(
+        importlib.resources,
+        "files",
+        lambda package: (
+            resources
+            if package == "pco.resources"
+            else pytest.fail(f"unexpected resource package: {package}")
+        ),
+    )
+    monkeypatch.setattr(
+        sysconfig,
+        "get_paths",
+        lambda: {"purelib": str(purelib), "platlib": str(purelib)},
+    )
+
+    exec(compile(probe, "<clean-wheel-probe>", "exec"), {"__name__": "__probe__"})
 
 
 def test_smoke_uses_exact_six_commands_with_sanitized_env_and_external_cwd(
@@ -118,6 +224,9 @@ def test_smoke_uses_exact_six_commands_with_sanitized_env_and_external_cwd(
         [str(scripts / smoke_module.executable_name("mem")), "--help"],
     ]
     assert [call["command"] for call in runner.calls] == expected_commands
+    _execute_controlled_probe(
+        runner.calls[3]["command"][2], tmp_path / "captured-probe", monkeypatch
+    )
 
     unsafe = {
         "PYTHONPATH",
@@ -140,6 +249,47 @@ def test_smoke_uses_exact_six_commands_with_sanitized_env_and_external_cwd(
 
     assert not environment.exists()
     assert not wheelhouse.exists()
+
+
+def test_production_probe_accepts_complete_controlled_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A complete independent installed-package scenario must pass the probe."""
+    _execute_controlled_probe(
+        smoke_module.RESOURCE_AND_VERSION_PROBE, tmp_path, monkeypatch
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "mem_core_origin",
+        "pco_origin",
+        "mem_core_version",
+        "pco_version",
+        "profile_name",
+        "profile_version",
+        "streams_missing",
+        "streams_additional",
+        "skill:pco-memory:SKILL.md",
+        "skill:pco-memory:PERMISSIONS.md",
+        "skill:pco-memory:manifest.json",
+        "skill:pco-consolidate:SKILL.md",
+        "skill:pco-consolidate:PERMISSIONS.md",
+        "skill:pco-consolidate:manifest.json",
+    ],
+)
+def test_production_probe_rejects_each_incomplete_install_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    """Removing any required provenance/resource check must make this test fail."""
+    with pytest.raises(AssertionError):
+        _execute_controlled_probe(
+            smoke_module.RESOURCE_AND_VERSION_PROBE,
+            tmp_path,
+            monkeypatch,
+            invalid=invalid,
+        )
 
 
 def test_probe_rejects_packages_imported_from_polluted_source_tree(
@@ -171,14 +321,15 @@ def test_probe_rejects_packages_imported_from_polluted_source_tree(
 
 
 def test_exact_wheels_normalizes_requested_distribution_names(tmp_path: Path) -> None:
-    """PEP 503-equivalent requested names must resolve the built wheels."""
+    """Equivalent names/versions resolve while unrelated valid wheels are ignored."""
     (tmp_path / "mem_core-0.5.0-py3-none-any.whl").touch()
     (tmp_path / "pco-0.5.0-py3-none-any.whl").touch()
+    (tmp_path / "unrelated-9.1.0-py3-none-any.whl").touch()
 
     assert [
         path.name
         for path in smoke_module.exact_wheels(
-            tmp_path, names=("MEM.Core", "PcO"), version="0.5.0"
+            tmp_path, names=("MEM.Core", "PcO"), version="0.5"
         )
     ] == [
         "mem_core-0.5.0-py3-none-any.whl",
