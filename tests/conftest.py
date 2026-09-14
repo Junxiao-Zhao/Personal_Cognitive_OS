@@ -492,3 +492,93 @@ def workspace_many_records(
         ],
     )
     return committed_workspace
+
+
+def _write_cli_hypothesis_proposal(
+    workspace: Workspace,
+    business_markdown_factory,
+    *,
+    review_id: str,
+) -> ProposalManifest:
+    """Write the smallest valid evidence-backed proposal used by CLI tests."""
+
+    root = workspace.paths.proposals / review_id
+    root.mkdir()
+    evidence_path = "evidence/ev_cli.md"
+    hypothesis_path = "hypotheses/hyp_1.md"
+    (root / "evidence").mkdir()
+    (root / evidence_path).write_bytes(
+        business_markdown_factory(
+            object_type="evidence",
+            record_id="ev_cli",
+            fields={
+                "change_summary": "Record CLI fixture evidence",
+                "speaker": "user",
+                "source_kind": "conversation",
+                "user_authored": True,
+                "fidelity": "selected_excerpt",
+                "status": "active",
+            },
+            body="A reviewed observation for the CLI fixture.",
+        )
+    )
+    (root / "hypotheses").mkdir()
+    (root / hypothesis_path).write_bytes(
+        business_markdown_factory(
+            object_type="hypothesis",
+            record_id="hyp_1",
+            fields={
+                "change_summary": "Create the CLI fixture hypothesis",
+                "confidence": 0.6,
+                "evidence_refs": ["evidence:ev_cli"],
+                "counter_evidence_refs": [],
+                "status": "hypothesis",
+            },
+            body="A hypothesis available through the public history command.",
+        )
+    )
+    manifest = ProposalManifest(
+        review_id=review_id,
+        base_commit=workspace.repository.head(),
+        workspace_version=workspace.identity["workspace_format_version"],
+        profile_version=workspace.profile.version,
+        files=[
+            BusinessFile(path=evidence_path, operation="create"),
+            BusinessFile(path=hypothesis_path, operation="create"),
+        ],
+    )
+    (root / "manifest.json").write_text(
+        json.dumps(manifest.model_dump(mode="json"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
+
+
+@pytest.fixture
+def workspace_with_hypothesis(
+    workspace: Workspace, business_markdown_factory
+) -> Workspace:
+    """A fresh workspace containing only history's required business records."""
+
+    manifest = _write_cli_hypothesis_proposal(
+        workspace,
+        business_markdown_factory,
+        review_id="review_cli_history",
+    )
+    result = ProposalService(workspace).commit(manifest.review_id)
+    assert result["canonical_status"] == "committed"
+    return workspace
+
+
+@pytest.fixture
+def workspace_with_proposal(
+    workspace: Workspace, business_markdown_factory
+) -> tuple[Workspace, ProposalManifest]:
+    """A distinct fresh workspace with one matching active valid proposal."""
+
+    manifest = _write_cli_hypothesis_proposal(
+        workspace,
+        business_markdown_factory,
+        review_id="review_cli_active",
+    )
+    return workspace, manifest

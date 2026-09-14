@@ -131,9 +131,7 @@ def test_verify_pco_memory_reports_the_read_only_missing_state(
     before = _snapshot_tree(tmp_path)
     monkeypatch.chdir(tmp_path)
 
-    # Task 4 owns final CLI exit semantics; the current thin dispatcher emits
-    # the exact nested verification result and returns its existing status.
-    assert main(["verify", "--path", "PCO_MEMORY"]) == 0
+    assert main(["verify", "--path", "PCO_MEMORY"]) == 1
 
     result = json.loads(capsys.readouterr().out)
     assert result["ok"] is False
@@ -153,7 +151,7 @@ def test_nested_verify_resolves_relative_path_from_workspace_root(
     before = _snapshot_tree(root)
     monkeypatch.chdir(nested)
 
-    assert main(["verify", "--path", "PCO_MEMORY"]) == 0
+    assert main(["verify", "--path", "PCO_MEMORY"]) == 1
 
     result = json.loads(capsys.readouterr().out)
     assert result["ok"] is False

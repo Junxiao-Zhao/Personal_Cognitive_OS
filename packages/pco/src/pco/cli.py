@@ -10,6 +10,10 @@ from typing import Any
 
 from mem_core.errors import MemError
 
+from .derivation import derive_all
+from .proposals.service import ProposalService
+from .retrieval import SEARCH_MODES, search
+from .sources import source_diff
 from .verify import verify_workspace
 from .workspace import Workspace
 
@@ -23,6 +27,37 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser("doctor")
     verify = commands.add_parser("verify")
     verify.add_argument("--path", type=Path)
+
+    search_parser = commands.add_parser("search")
+    search_parser.add_argument("query", nargs="?", default="")
+    search_parser.add_argument(
+        "--mode", choices=sorted(SEARCH_MODES), default="current"
+    )
+    search_parser.add_argument("--limit", type=int, default=10)
+    search_parser.add_argument("--start")
+    search_parser.add_argument("--end")
+
+    history = commands.add_parser("history")
+    history.add_argument("stream")
+    history.add_argument("record_id")
+
+    source = commands.add_parser("source")
+    source_commands = source.add_subparsers(dest="source_command", required=True)
+    source_diff_parser = source_commands.add_parser("diff")
+    source_diff_parser.add_argument("source_id", nargs="?", default=None)
+
+    proposal = commands.add_parser("proposal")
+    proposal_commands = proposal.add_subparsers(dest="proposal_command", required=True)
+    proposal_commands.add_parser("status")
+    proposal_commands.add_parser("scaffold")
+    for name in ("validate", "commit", "abort"):
+        proposal_command = proposal_commands.add_parser(name)
+        proposal_command.add_argument("review_id")
+
+    derive = commands.add_parser("derive")
+    derive_commands = derive.add_subparsers(dest="derive_command", required=True)
+    derive_all_parser = derive_commands.add_parser("all")
+    derive_all_parser.add_argument("--discard-modified-projection", action="store_true")
     return parser
 
 
@@ -36,9 +71,8 @@ def _is_safe_workspace_marker(root: Path) -> bool:
 
         canonical = pco / "canonical"
         canonical_info = canonical.lstat()
-        if (
-            stat.S_ISLNK(canonical_info.st_mode)
-            or not stat.S_ISDIR(canonical_info.st_mode)
+        if stat.S_ISLNK(canonical_info.st_mode) or not stat.S_ISDIR(
+            canonical_info.st_mode
         ):
             return False
 
@@ -84,6 +118,42 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if path is not None and not path.is_absolute():
             path = workspace.root / path
         return verify_workspace(workspace, path=path)
+    if args.command == "search":
+        return search(
+            repo_root=workspace.paths.canonical,
+            indexes_root=workspace.paths.indexes,
+            query=args.query,
+            mode=args.mode,
+            limit=args.limit,
+            start=args.start,
+            end=args.end,
+        )
+    if args.command == "history":
+        return {
+            "ok": True,
+            "stream": args.stream,
+            "id": args.record_id,
+            "records": workspace.repository.record_history(args.stream, args.record_id),
+        }
+    if args.command == "source" and args.source_command == "diff":
+        return source_diff(workspace, args.source_id)
+    if args.command == "proposal":
+        service = ProposalService(workspace)
+        if args.proposal_command == "status":
+            return service.status()
+        if args.proposal_command == "scaffold":
+            return service.scaffold()
+        if args.proposal_command == "validate":
+            return service.validate(args.review_id)
+        if args.proposal_command == "commit":
+            return service.commit(args.review_id)
+        if args.proposal_command == "abort":
+            return service.abort(args.review_id)
+    if args.command == "derive" and args.derive_command == "all":
+        return derive_all(
+            workspace,
+            discard_modified_projection=args.discard_modified_projection,
+        )
     raise MemError(
         "COMMAND_INVALID",
         "cli",
@@ -127,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     _emit(result)
-    return 0
+    return 0 if result.get("ok") is True else 1
 
 
 if __name__ == "__main__":

@@ -65,6 +65,15 @@ class ProposalService:
         try:
             active = self.paths.active_proposals()
             ensure(
+                bool(active),
+                "PROPOSAL_NOT_FOUND",
+                "proposal_validation",
+                "No active proposal exists for the requested review",
+                path=str(self.paths.root / review_id),
+                canonical_changed=False,
+                retry_safe=False,
+            )
+            ensure(
                 len(active) == 1 and active[0].name == review_id,
                 "PROPOSAL_MANIFEST_MISMATCH",
                 "proposal_validation",

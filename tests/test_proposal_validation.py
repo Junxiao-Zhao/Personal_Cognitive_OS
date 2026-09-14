@@ -676,6 +676,20 @@ def test_service_validate_rejects_a_different_requested_review_without_reads(
     assert result["error"]["code"] == "PROPOSAL_MANIFEST_MISMATCH"
 
 
+def test_service_validate_reports_missing_when_no_active_proposal_without_writes(
+    workspace,
+) -> None:
+    """Conflating absence with an ID mismatch would hide the actionable failure."""
+
+    before = _tree(workspace.root)
+
+    result = ProposalService(workspace).validate("review_missing")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "PROPOSAL_NOT_FOUND"
+    assert _tree(workspace.root) == before
+
+
 @pytest.mark.parametrize("control", ["workspace_version", "profile_version"])
 def test_validation_rejects_workspace_and_profile_control_mismatches(
     workspace, proposal_factory, control
