@@ -106,8 +106,16 @@ def test_validate_reports_observed_hash_and_is_read_only(
 
     observed = "sha256:" + hashlib.sha256(b"entry\n").hexdigest()
     assert result["ok"] is False
+    assert set(result["error"]) == {
+        "code",
+        "phase",
+        "message",
+        "canonical_changed",
+        "retry_safe",
+        "recovery",
+    }
     assert result["error"]["code"] == "INPUT_MATERIAL_HASH_REQUIRED"
-    assert result["error"]["value"]["observed_content_hash"] == observed
+    assert result["diagnostic"]["value"]["observed_content_hash"] == observed
     assert _tree(workspace.root) == before
 
 
@@ -674,6 +682,9 @@ def test_service_validate_rejects_a_different_requested_review_without_reads(
 
     assert result["ok"] is False
     assert result["error"]["code"] == "PROPOSAL_MANIFEST_MISMATCH"
+    assert result["diagnostic"] == {
+        "path": str(workspace.paths.proposals / "review_other")
+    }
 
 
 def test_service_validate_reports_missing_when_no_active_proposal_without_writes(
@@ -687,6 +698,9 @@ def test_service_validate_reports_missing_when_no_active_proposal_without_writes
 
     assert result["ok"] is False
     assert result["error"]["code"] == "PROPOSAL_NOT_FOUND"
+    assert result["diagnostic"] == {
+        "path": str(workspace.paths.proposals / "review_missing")
+    }
     assert _tree(workspace.root) == before
 
 

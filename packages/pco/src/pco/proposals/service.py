@@ -87,12 +87,7 @@ class ProposalService:
                 snapshot, self.workspace, require_hashes=False
             ).as_dict()
         except MemError as exc:
-            result = exc.as_dict()
-            diagnostic = result.get("diagnostic", {})
-            # Preserve the canonical diagnostic object while supporting the
-            # proposal command's directly actionable error payload.
-            result["error"].update(diagnostic)
-            return result
+            return exc.as_dict()
 
     def _require_active(
         self, review_id: str, *, operation: str = "proposal_commit"
