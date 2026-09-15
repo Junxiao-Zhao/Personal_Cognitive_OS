@@ -40,6 +40,22 @@ def _layout(root: Path) -> set[str]:
     }
 
 
+def _private_query_entries() -> set[str]:
+    return {
+        path.name
+        for path in Path(retrieval._SYSTEM_TEMP_PARENT).iterdir()
+        if path.name.startswith("pco-query-")
+    }
+
+
+def _fixed_fallback_entries() -> set[str]:
+    return {
+        path.name
+        for path in Path("/tmp").iterdir()
+        if path.name.startswith("pco-query-")
+    }
+
+
 def _rehash_generation(root: Path, *, profile_version: str | None = None) -> None:
     previous = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     payloads = _tree(root)
@@ -154,6 +170,87 @@ def test_missing_generation_uses_bounded_canonical_fallback_without_writes(
     assert len(result["items"]) <= 3
     assert not missing.exists()
     assert _tree(committed_workspace.paths.canonical) == before
+
+
+def test_verified_generation_never_rebuilds_canonical_documents(
+    workspace_many_records, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation-no-canonical-rebuild"
+    commit = workspace_many_records.repository.head()
+    build_retrieval_generation(workspace_many_records.repository, generation, commit)
+    canonical_before = _tree(workspace_many_records.paths.canonical)
+    generation_before = _tree(generation)
+    private_before = _private_query_entries()
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("a verified generation rebuilt or streamed canonical documents")
+
+    monkeypatch.setattr(retrieval, "canonical_documents", forbidden)
+    monkeypatch.setattr(retrieval, "_bounded_canonical_documents", forbidden)
+    monkeypatch.setattr(retrieval, "_iter_exact_stream_records", forbidden)
+    monkeypatch.setattr(retrieval, "query_backends", lambda *_args: ({}, {}))
+
+    result = search(
+        repo_root=workspace_many_records.paths.canonical,
+        indexes_root=generation,
+        query="pattern",
+        mode="historical",
+        limit=10,
+    )
+
+    assert result["derivation_status"] == "current"
+    assert result["source_commit"] == commit
+    assert _tree(workspace_many_records.paths.canonical) == canonical_before
+    assert _tree(generation) == generation_before
+    assert _private_query_entries() == private_before
+
+
+@pytest.mark.parametrize("generation_state", ["missing", "corrupt"])
+def test_fallback_materializes_only_the_bounded_exact_commit_working_set(
+    workspace_many_records,
+    tmp_path: Path,
+    stub_backends,
+    monkeypatch,
+    generation_state: str,
+) -> None:
+    maximum = 5
+    generation = tmp_path / f"generation-{generation_state}"
+    commit = workspace_many_records.repository.head()
+    if generation_state == "corrupt":
+        build_retrieval_generation(
+            workspace_many_records.repository, generation, commit
+        )
+        (generation / "documents.json").write_text("[]\n", encoding="utf-8")
+    canonical_before = _tree(workspace_many_records.paths.canonical)
+    generation_before = _tree(generation)
+    private_before = _private_query_entries()
+    materialized: list[tuple[str, str, int]] = []
+    original = retrieval._document_from_record
+
+    def observe(stream, record, *, current):
+        document = original(stream, record, current=current)
+        materialized.append((document["stream"], document["id"], document["revision"]))
+        return document
+
+    monkeypatch.setattr(retrieval, "CANONICAL_FALLBACK_CANDIDATES", maximum)
+    monkeypatch.setattr(retrieval, "_document_from_record", observe)
+
+    result = search(
+        repo_root=workspace_many_records.paths.canonical,
+        indexes_root=generation,
+        query="pattern",
+        mode="historical",
+        limit=10,
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["source_commit"] == commit
+    assert result["candidate_count"] == maximum
+    assert len(materialized) == maximum
+    assert len(set(materialized)) == maximum
+    assert _tree(workspace_many_records.paths.canonical) == canonical_before
+    assert _tree(generation) == generation_before
+    assert _private_query_entries() == private_before
 
 
 def test_current_excludes_tombstones_while_historical_keeps_them(
@@ -795,7 +892,13 @@ def test_search_falls_back_when_generation_member_is_rebound_with_same_bytes(
 
 @pytest.mark.parametrize(
     "damage",
-    ["bad_text_type", "unknown_stream", "duplicate_key", "wrong_current"],
+    [
+        "bad_text_type",
+        "extra_field",
+        "unknown_stream",
+        "duplicate_key",
+        "wrong_current",
+    ],
 )
 def test_manifest_valid_noncanonical_documents_use_fallback(
     committed_workspace, tmp_path: Path, stub_backends, monkeypatch, damage: str
@@ -809,6 +912,8 @@ def test_manifest_valid_noncanonical_documents_use_fallback(
     documents = json.loads((generation / "documents.json").read_text(encoding="utf-8"))
     if damage == "bad_text_type":
         documents[0]["text"] = 7
+    elif damage == "extra_field":
+        documents[0]["unexpected"] = True
     elif damage == "unknown_stream":
         documents[0]["stream"] = "messages"
     elif damage == "duplicate_key":
@@ -834,6 +939,161 @@ def test_manifest_valid_noncanonical_documents_use_fallback(
 
     assert result["derivation_status"] == "fallback"
     assert result["items"]
+
+
+def test_manifest_valid_tombstone_cannot_claim_current(
+    workspace_with_tombstone, tmp_path: Path, stub_backends, monkeypatch
+) -> None:
+    generation = tmp_path / "generation-current-tombstone"
+    build_retrieval_generation(
+        workspace_with_tombstone.repository,
+        generation,
+        workspace_with_tombstone.repository.head(),
+    )
+    documents = json.loads((generation / "documents.json").read_text(encoding="utf-8"))
+    tombstone = next(
+        document for document in documents if document["status"] == "tombstone"
+    )
+    tombstone["current"] = True
+    (generation / "documents.json").write_text(
+        json.dumps(documents, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    _rehash_generation(generation)
+    monkeypatch.setattr(retrieval, "query_backends", lambda *_args: ({}, {}))
+
+    result = search(
+        repo_root=workspace_with_tombstone.paths.canonical,
+        indexes_root=generation,
+        query="hypothesis",
+        mode="historical",
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["items"]
+
+
+@pytest.mark.parametrize(
+    ("revision", "previous_revision"),
+    [(1, 1), (2, None)],
+)
+def test_manifest_valid_generation_requires_adjacent_previous_revision(
+    workspace_with_tombstone,
+    tmp_path: Path,
+    stub_backends,
+    monkeypatch,
+    revision: int,
+    previous_revision: int | None,
+) -> None:
+    generation = tmp_path / "generation-bad-previous-revision"
+    build_retrieval_generation(
+        workspace_with_tombstone.repository,
+        generation,
+        workspace_with_tombstone.repository.head(),
+    )
+    documents = json.loads((generation / "documents.json").read_text(encoding="utf-8"))
+    revised = next(
+        document for document in documents if document["revision"] == revision
+    )
+    revised["previous_revision"] = previous_revision
+    (generation / "documents.json").write_text(
+        json.dumps(documents, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    _rehash_generation(generation)
+    monkeypatch.setattr(retrieval, "query_backends", lambda *_args: ({}, {}))
+
+    result = search(
+        repo_root=workspace_with_tombstone.paths.canonical,
+        indexes_root=generation,
+        query="hypothesis",
+        mode="historical",
+    )
+
+    assert result["derivation_status"] == "fallback"
+    assert result["items"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "start", "end"),
+    [
+        ("current", None, None),
+        ("historical", None, None),
+        ("change", "2026-01-01T00:00:00Z", "2026-09-01T00:00:00Z"),
+        ("pattern", None, None),
+        ("continuity", None, None),
+    ],
+)
+def test_bounded_streaming_selection_matches_full_mode_semantics(
+    workspace_with_tombstone,
+    mode: str,
+    start: str | None,
+    end: str | None,
+) -> None:
+    repository = workspace_with_tombstone.repository
+    commit = repository.head()
+    profile = projections._exact_profile(repository, commit, canonical_head=commit)
+    start_at = retrieval._parse_time_bound(start, "start")
+    end_at = retrieval._parse_time_bound(end, "end")
+    full, _profile_version = retrieval.canonical_documents(
+        repository, commit, canonical_head=commit
+    )
+    expected = retrieval._bounded_recent(
+        retrieval._select_mode(full, mode, start_at, end_at), 5
+    )
+    private_before = _private_query_entries()
+
+    observed = retrieval._bounded_canonical_documents(
+        repository,
+        commit,
+        profile,
+        mode=mode,
+        maximum=5,
+        start=start_at,
+        end=end_at,
+    )
+
+    assert sorted(observed, key=retrieval._document_key) == sorted(
+        expected, key=retrieval._document_key
+    )
+    assert _private_query_entries() == private_before
+
+
+def test_bounded_continuity_selects_latest_before_applying_time_window(
+    workspace_with_handoffs,
+) -> None:
+    repository = workspace_with_handoffs.repository
+    commit = repository.head()
+    profile = projections._exact_profile(repository, commit, canonical_head=commit)
+    full, _profile_version = retrieval.canonical_documents(
+        repository, commit, canonical_head=commit
+    )
+    handoffs = [
+        document for document in full if document["stream"] == "session_handoffs"
+    ]
+    older, latest = sorted(handoffs, key=retrieval._recent_key)
+    assert retrieval._record_time(older) < retrieval._record_time(latest)
+    start_at = None
+    end_at = retrieval._record_time(older)
+    expected = retrieval._bounded_recent(
+        retrieval._select_mode(full, "continuity", start_at, end_at), 5
+    )
+    private_before = _fixed_fallback_entries()
+
+    observed = retrieval._bounded_canonical_documents(
+        repository,
+        commit,
+        profile,
+        mode="continuity",
+        maximum=5,
+        start=start_at,
+        end=end_at,
+    )
+
+    assert observed == expected == []
+    assert _fixed_fallback_entries() == private_before
 
 
 def test_manifest_valid_inconsistent_reverse_refs_use_fallback(
@@ -982,6 +1242,7 @@ def test_private_query_copy_ignores_workspace_tmpdir_and_unsafe_parent_falls_bac
     hostile_tmp = committed_workspace.paths.tmp.resolve()
     before = _tree(workspace)
     layout_before = _layout(workspace)
+    fallback_entries_before = _fixed_fallback_entries()
     observed: list[Path] = []
 
     def observe_root(query_root: Path, *_args, **_kwargs):
@@ -1023,6 +1284,7 @@ def test_private_query_copy_ignores_workspace_tmpdir_and_unsafe_parent_falls_bac
     assert observed == []
     assert _tree(workspace) == before
     assert _layout(workspace) == layout_before
+    assert _fixed_fallback_entries() == fallback_entries_before
 
 
 @pytest.mark.parametrize("backend_raises", [False, True])

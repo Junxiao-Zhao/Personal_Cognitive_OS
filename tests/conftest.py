@@ -481,6 +481,7 @@ def workspace_many_records(
                 "type": "hypothesis",
                 "id": f"hyp_many_{index:03d}",
                 "fields": {
+                    "change_summary": "Create bounded fallback fixture record",
                     "confidence": 0.4,
                     "evidence_refs": ["evidence:ev_1"],
                     "counter_evidence_refs": [],

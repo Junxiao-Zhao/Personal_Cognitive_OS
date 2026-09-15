@@ -7,17 +7,21 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import heapq
 import json
 import math
 import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import sqlite3
 import stat
+import subprocess
 from typing import Any, Iterable, Iterator, Mapping
 
 from mem_core.errors import MemError
-from mem_core.profile import Profile
+from mem_core.models import RecordEnvelope
+from mem_core.profile import Profile, ProfileConfig
 from mem_core.registry import default_registry
 from mem_core.repository import MemoryRepository
 
@@ -37,20 +41,43 @@ from .projections import (
     _stat_identity,
     _write_exclusive,
     _write_new_tree,
+    _exact_profile,
     exact_canonical_records,
 )
 from .paths import bundled_profile
-from .validation import latest_effective
+from .validation import CANONICAL_BUSINESS_STREAMS, latest_effective
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]")
 SEARCH_MODES = frozenset({"current", "historical", "change", "pattern", "continuity"})
 CANONICAL_FALLBACK_CANDIDATES = 200
 BACKEND_CANDIDATES = 200
 _SYSTEM_TEMP_PARENT = Path("/tmp")
+_FALLBACK_TEMP_PARENT = Path("/tmp")
 _DIRECTORY_OPEN_FLAGS = (
     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
 _CLEANUP_MAX_PASSES = 16
+_DOCUMENT_FIELDS = frozenset(
+    {
+        "stream",
+        "id",
+        "revision",
+        "text",
+        "recorded_at",
+        "occurred_at",
+        "status",
+        "current",
+        "previous_revision",
+        "change_summary",
+        "evidence_refs",
+        "counter_evidence_refs",
+        "promotion_refs",
+        "links",
+    }
+)
+_PATTERN_STREAMS = frozenset(
+    {"events", "psychologies", "philosophies", "archetypes", "hypotheses"}
+)
 
 
 @dataclass(frozen=True)
@@ -88,6 +115,15 @@ class _OpenedTree:
             self.identity.target_identity,
             self.identity.target,
         )
+
+
+@dataclass(frozen=True)
+class _PrivateQueryRoot:
+    root_fd: int
+
+    @property
+    def path(self) -> Path:
+        return Path(f"/proc/self/fd/{self.root_fd}")
 
 
 @contextmanager
@@ -473,32 +509,40 @@ def canonical_documents(
     documents: list[dict[str, Any]] = []
     for stream in sorted(records, key=str.encode):
         for record in records[stream]:
-            payload = record.get("payload", {})
-            if not isinstance(payload, Mapping):
-                payload = {}
             revision = record.get("revision")
             record_id = record.get("id")
             documents.append(
-                {
-                    "stream": stream,
-                    "id": record_id,
-                    "revision": revision,
-                    "text": _document_text(record),
-                    "recorded_at": record.get("recorded_at"),
-                    "occurred_at": _occurred_at(record),
-                    "status": payload.get("status"),
-                    "current": effective.get(stream, {}).get(record_id) == revision,
-                    "previous_revision": payload.get("previous_revision"),
-                    "change_summary": payload.get("change_summary"),
-                    "evidence_refs": list(payload.get("evidence_refs", [])),
-                    "counter_evidence_refs": list(
-                        payload.get("counter_evidence_refs", [])
-                    ),
-                    "promotion_refs": list(payload.get("promotion_refs", [])),
-                    "links": dict(payload.get("links", {})),
-                }
+                _document_from_record(
+                    stream,
+                    record,
+                    current=effective.get(stream, {}).get(record_id) == revision,
+                )
             )
     return sorted(documents, key=_document_key), profile.version
+
+
+def _document_from_record(
+    stream: str, record: Mapping[str, Any], *, current: bool
+) -> dict[str, Any]:
+    payload = record.get("payload", {})
+    if not isinstance(payload, Mapping):
+        payload = {}
+    return {
+        "stream": stream,
+        "id": record.get("id"),
+        "revision": record.get("revision"),
+        "text": _document_text(record),
+        "recorded_at": record.get("recorded_at"),
+        "occurred_at": _occurred_at(record),
+        "status": payload.get("status"),
+        "current": current,
+        "previous_revision": payload.get("previous_revision"),
+        "change_summary": payload.get("change_summary"),
+        "evidence_refs": list(payload.get("evidence_refs", [])),
+        "counter_evidence_refs": list(payload.get("counter_evidence_refs", [])),
+        "promotion_refs": list(payload.get("promotion_refs", [])),
+        "links": dict(payload.get("links", {})),
+    }
 
 
 def _document_key(document: Mapping[str, Any]) -> tuple[bytes, bytes, int]:
@@ -887,16 +931,11 @@ def _workspace_root(canonical_root: Path) -> Path:
 
 
 @contextmanager
-def _private_tantivy_snapshot(
-    snapshot: _TreeSnapshot, *, forbidden_roots: Iterable[Path]
-) -> Iterator[Path]:
-    payloads = {
-        relative: content
-        for relative, content in snapshot.files.items()
-        if relative.startswith("tantivy/")
-    }
-    if not payloads:
-        raise derivation_error("Retrieval snapshot has no Tantivy payload")
+def _private_query_root(
+    *, forbidden_roots: Iterable[Path], system_parent: Path
+) -> Iterator[_PrivateQueryRoot]:
+    """Yield one fixed-/tmp descriptor-bound root and erase only that identity."""
+
     system_fd: int | None = None
     parent_fd: int | None = None
     root_fd: int | None = None
@@ -904,7 +943,7 @@ def _private_tantivy_snapshot(
     parent_identity: tuple[int, int] | None = None
     root_identity: tuple[int, int] | None = None
     try:
-        system_parent = Path(_SYSTEM_TEMP_PARENT).absolute()
+        system_parent = Path(system_parent).absolute()
         observed = os.lstat(system_parent)
         if not stat.S_ISDIR(observed.st_mode):
             raise derivation_error(
@@ -953,24 +992,12 @@ def _private_tantivy_snapshot(
         root_fd = os.open("generation", _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
         if _stat_identity(os.fstat(root_fd)) != root_identity:
             raise derivation_error("Private query root identity changed")
-        for relative, content in sorted(
-            payloads.items(), key=lambda item: item[0].encode("utf-8")
-        ):
-            _write_exclusive(root_fd, relative, content)
-        before = _snapshot_directory_fd(root_fd)
-        if before.files != payloads:
-            raise derivation_error(
-                "Private Tantivy snapshot does not match verified payload"
-            )
-        yield Path(f"/proc/self/fd/{root_fd}")
-        after = _snapshot_directory_fd(root_fd)
-        if after != before:
-            raise derivation_error("Private Tantivy snapshot changed during query")
+        yield _PrivateQueryRoot(root_fd)
     except MemError:
         raise
     except (OSError, TypeError, ValueError) as exc:
         raise derivation_error(
-            "Private Tantivy snapshot could not be managed safely", value=str(exc)
+            "Private query root could not be managed safely", value=str(exc)
         ) from exc
     finally:
         cleanup_error: Exception | None = None
@@ -1006,9 +1033,38 @@ def _private_tantivy_snapshot(
             os.close(system_fd)
         if cleanup_error is not None:
             raise derivation_error(
-                "Private Tantivy snapshot could not be cleaned safely",
+                "Private query root could not be cleaned safely",
                 value=str(cleanup_error),
             ) from cleanup_error
+
+
+@contextmanager
+def _private_tantivy_snapshot(
+    snapshot: _TreeSnapshot, *, forbidden_roots: Iterable[Path]
+) -> Iterator[Path]:
+    payloads = {
+        relative: content
+        for relative, content in snapshot.files.items()
+        if relative.startswith("tantivy/")
+    }
+    if not payloads:
+        raise derivation_error("Retrieval snapshot has no Tantivy payload")
+    with _private_query_root(
+        forbidden_roots=forbidden_roots, system_parent=_SYSTEM_TEMP_PARENT
+    ) as private:
+        for relative, content in sorted(
+            payloads.items(), key=lambda item: item[0].encode("utf-8")
+        ):
+            _write_exclusive(private.root_fd, relative, content)
+        before = _snapshot_directory_fd(private.root_fd)
+        if before.files != payloads:
+            raise derivation_error(
+                "Private Tantivy snapshot does not match verified payload"
+            )
+        yield private.path
+        after = _snapshot_directory_fd(private.root_fd)
+        if after != before:
+            raise derivation_error("Private Tantivy snapshot changed during query")
 
 
 def query_backends(
@@ -1040,6 +1096,247 @@ def query_backends(
     return dense, lexical
 
 
+def _iter_exact_stream_records(
+    repository: MemoryRepository,
+    source_commit: str,
+    profile: ProfileConfig,
+) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Stream strict records from Git blobs without materializing a stream blob."""
+
+    for stream in sorted(profile.streams, key=str.encode):
+        relative = profile.streams[stream].path
+        try:
+            process = subprocess.Popen(
+                [
+                    "git",
+                    "-C",
+                    str(repository.root),
+                    "cat-file",
+                    "blob",
+                    f"{source_commit}:{relative}",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise derivation_error(
+                "Canonical Git object cannot be streamed",
+                path=relative,
+                value=str(exc),
+                retry_safe=False,
+            ) from exc
+        assert process.stdout is not None
+        assert process.stderr is not None
+        try:
+            for line_number, line in enumerate(process.stdout, 1):
+                if not line.strip():
+                    continue
+                record = strict_json_object(line, path=f"{relative}:{line_number}")
+                try:
+                    RecordEnvelope.model_validate(record, strict=True)
+                    repository.profile.validate_record_schema(stream, record)
+                except Exception as exc:
+                    raise derivation_error(
+                        "Canonical streamed record is invalid",
+                        path=f"{relative}:{line_number}",
+                        value=str(exc),
+                        retry_safe=False,
+                    ) from exc
+                yield stream, record
+            stderr = process.stderr.read()
+            returncode = process.wait()
+            if returncode:
+                raise derivation_error(
+                    "Canonical Git object cannot be streamed",
+                    path=relative,
+                    value=stderr.decode("utf-8", errors="replace").strip(),
+                    retry_safe=False,
+                )
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            raise
+        finally:
+            process.stdout.close()
+            process.stderr.close()
+
+
+@contextmanager
+def _latest_record_store(
+    repository: MemoryRepository,
+) -> Iterator[sqlite3.Connection]:
+    """Keep per-ID current-state metadata on bounded-cache, repo-external disk."""
+
+    forbidden = (_workspace_root(repository.root), repository.root)
+    with _private_query_root(
+        forbidden_roots=forbidden, system_parent=_FALLBACK_TEMP_PARENT
+    ) as private:
+        database = sqlite3.connect(private.path / "fallback.sqlite3")
+        try:
+            database.execute("PRAGMA journal_mode=OFF")
+            database.execute("PRAGMA synchronous=OFF")
+            database.execute("PRAGMA temp_store=MEMORY")
+            database.execute("PRAGMA cache_size=-64")
+            database.execute("PRAGMA locking_mode=EXCLUSIVE")
+            database.execute("""
+                CREATE TABLE latest (
+                    stream TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    status TEXT,
+                    PRIMARY KEY (stream, record_id)
+                ) WITHOUT ROWID
+                """)
+            yield database
+        finally:
+            database.close()
+
+
+def _record_selection_key(
+    stream: str, record: Mapping[str, Any]
+) -> tuple[tuple[str, int, bytes], tuple[bytes, bytes, int]]:
+    return (
+        (
+            str(record.get("recorded_at") or ""),
+            int(record.get("revision") or 0),
+            str(record.get("id") or "").encode("utf-8"),
+        ),
+        (
+            stream.encode("utf-8"),
+            str(record.get("id") or "").encode("utf-8"),
+            int(record.get("revision") or 0),
+        ),
+    )
+
+
+def _record_in_time_range(
+    record: Mapping[str, Any],
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    value = _occurred_at(record)
+    try:
+        when = _parse_time_bound(value, "record time") if value else None
+    except ValueError:
+        return False
+    if start is not None and (when is None or when < start):
+        return False
+    if end is not None and (when is None or when > end):
+        return False
+    return True
+
+
+def _bounded_canonical_documents(
+    repository: MemoryRepository,
+    source_commit: str,
+    profile: ProfileConfig,
+    *,
+    mode: str,
+    maximum: int,
+    start: datetime | None,
+    end: datetime | None,
+) -> list[dict[str, Any]]:
+    """Return at most ``maximum`` exact-commit documents with O(maximum) RAM."""
+
+    with _latest_record_store(repository) as latest:
+        latest.execute("BEGIN")
+        for stream, record in _iter_exact_stream_records(
+            repository, source_commit, profile
+        ):
+            record_id = str(record["id"])
+            revision = int(record["revision"])
+            previous = latest.execute(
+                "SELECT revision FROM latest WHERE stream = ? AND record_id = ?",
+                (stream, record_id),
+            ).fetchone()
+            expected = 1 if previous is None else int(previous[0]) + 1
+            if revision != expected:
+                raise derivation_error(
+                    "Canonical streamed revision sequence is invalid",
+                    value={
+                        "stream": stream,
+                        "record_id": record_id,
+                        "expected": expected,
+                        "observed": revision,
+                    },
+                    retry_safe=False,
+                )
+            payload = record.get("payload")
+            assert isinstance(payload, dict)
+            latest.execute(
+                """
+                INSERT INTO latest (stream, record_id, revision, status)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (stream, record_id) DO UPDATE SET
+                    revision = excluded.revision,
+                    status = excluded.status
+                """,
+                (stream, record_id, revision, payload.get("status")),
+            )
+        latest.commit()
+
+        retained: list[
+            tuple[
+                tuple[tuple[str, int, bytes], tuple[bytes, bytes, int]],
+                int,
+                str,
+                dict[str, Any],
+                bool,
+            ]
+        ] = []
+        selection_limit = 1 if mode == "continuity" else maximum
+        order = 0
+        for stream, record in _iter_exact_stream_records(
+            repository, source_commit, profile
+        ):
+            order += 1
+            record_id = str(record["id"])
+            revision = int(record["revision"])
+            observed = latest.execute(
+                "SELECT revision, status FROM latest WHERE stream = ? AND record_id = ?",
+                (stream, record_id),
+            ).fetchone()
+            if observed is None:
+                raise derivation_error(
+                    "Canonical latest-state metadata is incomplete",
+                    value={"stream": stream, "record_id": record_id},
+                    retry_safe=False,
+                )
+            current = revision == int(observed[0]) and observed[1] != "tombstone"
+            if mode in {"current", "pattern", "continuity"} and not current:
+                continue
+            if mode == "pattern" and stream not in _PATTERN_STREAMS:
+                continue
+            if mode == "continuity" and stream != "session_handoffs":
+                continue
+            if mode != "continuity" and not _record_in_time_range(record, start, end):
+                continue
+            item = (
+                _record_selection_key(stream, record),
+                order,
+                stream,
+                record,
+                current,
+            )
+            if len(retained) < selection_limit:
+                heapq.heappush(retained, item)
+            elif item[:2] > retained[0][:2]:
+                heapq.heapreplace(retained, item)
+
+    documents = [
+        _document_from_record(stream, record, current=current)
+        for _key_value, _order, stream, record, current in retained
+    ]
+    if mode == "continuity":
+        documents = [
+            document
+            for document in documents
+            if _document_in_time_range(document, start, end)
+        ]
+    return sorted(documents, key=_document_key)
+
+
 def search(
     *,
     repo_root: Path,
@@ -1063,13 +1360,7 @@ def search(
         if indexes_root is not None
         else Path(repo_root).parent / "indexes"
     )
-    canonical, profile_version = canonical_documents(
-        repository, head, canonical_head=head
-    )
-    canonical_payloads = {
-        "documents.json": _canonical_json(canonical),
-        "reverse_refs.json": _canonical_json(build_reverse_references(canonical)),
-    }
+    profile = _exact_profile(repository, head, canonical_head=head)
     status = "current"
     diagnostics: dict[str, Any] | None = None
     change_windows: dict[str, Any] | None = None
@@ -1079,11 +1370,11 @@ def search(
             _validate_generation_snapshot(
                 initial,
                 expected_commit=head,
-                expected_profile_version=profile_version,
+                expected_profile_version=profile.version,
             )
-            _require_builder_payloads(initial.files, canonical_payloads, generation)
-            documents = _read_json_list_bytes(initial.files["documents.json"])
-            reverse_refs = _read_reverse_refs_bytes(initial.files["reverse_refs.json"])
+            documents, reverse_refs = _validate_generation_payloads(
+                initial.files["documents.json"], initial.files["reverse_refs.json"]
+            )
             selected = _select_mode(documents, mode, start_at, end_at)
             with _private_tantivy_snapshot(
                 initial,
@@ -1115,10 +1406,17 @@ def search(
             "message": "retrieval generation unavailable; canonical fallback used",
             "value": str(exc),
         }
-        documents = canonical
+        documents = _bounded_canonical_documents(
+            repository,
+            head,
+            profile,
+            mode=mode,
+            maximum=CANONICAL_FALLBACK_CANDIDATES,
+            start=start_at,
+            end=end_at,
+        )
         reverse_refs = build_reverse_references(documents)
-        selected = _select_mode(documents, mode, start_at, end_at)
-        selected = _bounded_recent(selected, CANONICAL_FALLBACK_CANDIDATES)
+        selected = documents
         items = _rank(selected, reverse_refs, query, mode, limit, ({}, {}))
         if mode == "change":
             change_windows = _change_window_summary(selected)
@@ -1181,6 +1479,19 @@ def _record_time(document: Mapping[str, Any]) -> datetime | None:
         return None
 
 
+def _document_in_time_range(
+    document: Mapping[str, Any],
+    start: datetime | None,
+    end: datetime | None,
+) -> bool:
+    when = _record_time(document)
+    if start is not None and (when is None or when < start):
+        return False
+    if end is not None and (when is None or when > end):
+        return False
+    return True
+
+
 def _select_mode(
     documents: list[dict[str, Any]],
     mode: str,
@@ -1215,14 +1526,11 @@ def _select_mode(
         selected = [
             document for document in selected if document.get("status") != "tombstone"
         ]
-    result = []
-    for document in selected:
-        when = _record_time(document)
-        if start is not None and (when is None or when < start):
-            continue
-        if end is not None and (when is None or when > end):
-            continue
-        result.append(dict(document))
+    result = [
+        dict(document)
+        for document in selected
+        if _document_in_time_range(document, start, end)
+    ]
     return sorted(result, key=_document_key)
 
 
@@ -1312,6 +1620,101 @@ def _read_reverse_refs_bytes(data: bytes) -> dict[str, list[dict[str, Any]]]:
             raise ValueError("reverse_refs.json is malformed")
         result[target] = [dict(edge) for edge in edges]
     return result
+
+
+def _validate_generation_payloads(
+    documents_data: bytes, reverse_refs_data: bytes
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    documents = _read_json_list_bytes(documents_data)
+    reverse_refs = _read_reverse_refs_bytes(reverse_refs_data)
+    if documents_data != _canonical_json(documents):
+        raise ValueError("documents.json is not canonical JSON")
+    if reverse_refs_data != _canonical_json(reverse_refs):
+        raise ValueError("reverse_refs.json is not canonical JSON")
+
+    histories: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    previous_key: tuple[bytes, bytes, int] | None = None
+    for document in documents:
+        if set(document) != _DOCUMENT_FIELDS:
+            raise ValueError("retrieval document fields are not exact")
+        stream = document["stream"]
+        record_id = document["id"]
+        revision = document["revision"]
+        if stream not in CANONICAL_BUSINESS_STREAMS:
+            raise ValueError("retrieval document uses an unknown stream")
+        if not isinstance(record_id, str) or not record_id:
+            raise ValueError("retrieval document ID is invalid")
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise ValueError("retrieval document revision is invalid")
+        if not isinstance(document["text"], str):
+            raise ValueError("retrieval document text is invalid")
+        if not isinstance(document["recorded_at"], str) or not isinstance(
+            document["occurred_at"], str
+        ):
+            raise ValueError("retrieval document time is invalid")
+        _parse_time_bound(document["recorded_at"], "recorded_at")
+        _parse_time_bound(document["occurred_at"], "occurred_at")
+        if document["status"] is not None and not isinstance(document["status"], str):
+            raise ValueError("retrieval document status is invalid")
+        if not isinstance(document["current"], bool):
+            raise ValueError("retrieval document current flag is invalid")
+        previous_revision = document["previous_revision"]
+        if previous_revision is not None and (
+            not isinstance(previous_revision, int)
+            or isinstance(previous_revision, bool)
+            or previous_revision < 1
+        ):
+            raise ValueError("retrieval previous revision is invalid")
+        if document["change_summary"] is not None and not isinstance(
+            document["change_summary"], str
+        ):
+            raise ValueError("retrieval change summary is invalid")
+        for field in (
+            "evidence_refs",
+            "counter_evidence_refs",
+            "promotion_refs",
+        ):
+            if not isinstance(document[field], list) or not all(
+                isinstance(value, str) for value in document[field]
+            ):
+                raise ValueError(f"retrieval document {field} is invalid")
+        links = document["links"]
+        if not isinstance(links, dict) or any(
+            not isinstance(relation, str)
+            or not isinstance(values, list)
+            or not all(isinstance(value, str) for value in values)
+            for relation, values in links.items()
+        ):
+            raise ValueError("retrieval document links are invalid")
+        key = _document_key(document)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError("retrieval documents are unsorted or duplicated")
+        previous_key = key
+        histories.setdefault((stream, record_id), []).append(document)
+
+    for history in histories.values():
+        revisions = [int(document["revision"]) for document in history]
+        if revisions != list(range(1, revisions[-1] + 1)):
+            raise ValueError("retrieval document revision sequence is invalid")
+        for document in history:
+            expected_previous = (
+                None if document["revision"] == 1 else document["revision"] - 1
+            )
+            if document["previous_revision"] != expected_previous:
+                raise ValueError(
+                    "retrieval document previous revisions are inconsistent"
+                )
+        latest = history[-1]
+        latest_is_current = latest["status"] != "tombstone"
+        for document in history:
+            expected = latest_is_current and document is latest
+            if document["current"] is not expected:
+                raise ValueError("retrieval document current flags are inconsistent")
+
+    expected_refs = build_reverse_references(documents)
+    if reverse_refs != expected_refs:
+        raise ValueError("retrieval reverse references are inconsistent")
+    return documents, reverse_refs
 
 
 def _read_json_bytes(data: bytes) -> Any:
