@@ -16,7 +16,7 @@ import pytest
 from pco import sources as sources_module
 from pco.proposals import materials as materials_module
 from pco.proposals.materials import MAX_INPUT_MATERIAL_BYTES
-from pco.sources import SourceManager, source_diff
+from pco.sources import source_diff
 from pco.workspace import Workspace
 
 NOW = "2026-09-09T10:00:00+00:00"
@@ -175,7 +175,6 @@ def test_remote_source_does_not_use_local_or_legacy_reader(
         raise AssertionError("remote source invoked a material reader")
 
     monkeypatch.setattr(sources_module, "read_regular_file", forbidden, raising=False)
-    monkeypatch.setattr(SourceManager, "materialize", forbidden)
 
     assert source_diff(workspace)["sources"] == [
         {"source_id": "src_remote", "refresh_required": True}

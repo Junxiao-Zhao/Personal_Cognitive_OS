@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -19,6 +20,18 @@ REMOVED_MODULES = (
     "pco.harness",
     "pco.repo_loader",
     "pco.research_profile",
+)
+
+REMOVED_SOURCE_SYMBOLS = (
+    "SourceRead",
+    "SourceReader",
+    "normalize_text",
+    "content_hash",
+    "_validate_locator",
+    "read_local_file",
+    "ReaderRegistry",
+    "SourceManager",
+    "SourceReaderRegistry",
 )
 
 REMOVED_RESOURCES = {
@@ -89,6 +102,48 @@ def test_removed_runtime_modules_are_not_importable(module: str) -> None:
     assert importlib.util.find_spec(module) is None
 
 
+def test_removed_direct_source_runtime_symbols_are_absent() -> None:
+    sources = importlib.import_module("pco.sources")
+    assert not [name for name in REMOVED_SOURCE_SYMBOLS if hasattr(sources, name)]
+
+
+def test_wheel_exposes_no_removed_direct_source_runtime_symbols(
+    built_wheel: Path,
+) -> None:
+    probe = """
+import importlib
+import json
+import sys
+
+wheel = sys.argv[1]
+sys.path.insert(0, wheel)
+sources = importlib.import_module("pco.sources")
+assert sources.__file__ is not None and sources.__file__.startswith(wheel + "/")
+removed = json.loads(sys.argv[2])
+present = [name for name in removed if hasattr(sources, name)]
+print(json.dumps({"origin": sources.__file__, "present": present}, sort_keys=True))
+raise SystemExit(bool(present))
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            probe,
+            str(built_wheel),
+            json.dumps(REMOVED_SOURCE_SYMBOLS),
+        ],
+        cwd=built_wheel.parent,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["present"] == []
+    assert observed["origin"].startswith(str(built_wheel) + "/")
+
+
 def test_removed_runtime_resources_are_absent() -> None:
     assert not [
         relative for relative in sorted(REMOVED_RESOURCES) if (ROOT / relative).exists()
@@ -109,6 +164,20 @@ def test_only_v05_public_capabilities_remain() -> None:
     retrieval = importlib.import_module("pco.retrieval")
     assert not hasattr(projections, "project_markdown")
     assert not hasattr(retrieval, "build_index")
+
+
+@pytest.mark.parametrize("command", ["add", "register", "materialize"])
+def test_source_write_commands_and_capabilities_are_absent(command: str) -> None:
+    from pco.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["source", command])
+
+    project = tomllib.loads(
+        (ROOT / "packages/pco/pyproject.toml").read_text(encoding="utf-8")
+    )
+    capabilities = project["project"]["entry-points"]["mem_core.capabilities"]
+    assert not [name for name in capabilities if "source" in name and command in name]
 
 
 def test_v04_only_dependencies_are_removed() -> None:
