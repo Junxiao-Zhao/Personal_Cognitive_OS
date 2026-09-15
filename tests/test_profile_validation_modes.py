@@ -10,21 +10,26 @@ from mem_core import hook as mem_hook
 from mem_core.delta import is_fast_path, is_messages_only
 from mem_core.models import Operation
 from mem_core.repository import MemoryRepository
-from pco.paths import bundled_profile
-from mem_core.registry import default_registry
-
 
 NOW = "2026-08-16T10:00:00+00:00"
 
 
-def _logs_profile(root: Path, *, mode: str = "delta_only", run_cross_validators: bool = False) -> Path:
+def _logs_profile(
+    root: Path, *, mode: str = "delta_only", run_cross_validators: bool = False
+) -> Path:
     schema_root = root / "schemas"
     schema_root.mkdir(parents=True)
     (schema_root / "log.schema.json").write_text(
         json.dumps(
             {
                 "type": "object",
-                "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+                "required": [
+                    "id",
+                    "revision",
+                    "recorded_at",
+                    "schema_version",
+                    "payload",
+                ],
                 "properties": {
                     "id": {"type": "string"},
                     "revision": {"type": "integer", "minimum": 1},
@@ -95,21 +100,28 @@ def _stage_transaction(repository: MemoryRepository, state) -> None:
     repository._git("add", ".")
 
 
-def test_bundled_profiles_declare_independent_validation_policies() -> None:
-    pco = Profile.load(bundled_profile("pco"), default_registry())
-    research = Profile.load(bundled_profile("research"), default_registry())
+def test_generic_profiles_declare_independent_validation_policies(
+    tmp_path: Path,
+) -> None:
+    delta_profile = Profile.load(_logs_profile(tmp_path / "delta"))
+    structured_profile = Profile.load(
+        _logs_profile(tmp_path / "structured", mode="structured")
+    )
 
-    assert pco.uses_delta_fast_path("messages")
-    assert research.uses_delta_fast_path("observations")
-    assert not research.uses_delta_fast_path("claims")
+    assert delta_profile.uses_delta_fast_path("logs")
+    assert not structured_profile.uses_delta_fast_path("logs")
 
 
-def test_logs_stream_uses_profile_fast_path_for_transaction_and_hook(tmp_path: Path, monkeypatch) -> None:
+def test_logs_stream_uses_profile_fast_path_for_transaction_and_hook(
+    tmp_path: Path, monkeypatch
+) -> None:
     profile = Profile.load(_logs_profile(tmp_path / "profile"))
     repository = MemoryRepository(tmp_path / "memory", profile)
     repository.init()
     manager = TransactionManager(repository, tmp_path / "state")
-    state = manager.begin(transaction_id="txn_logs", fingerprint_context={"kind": "logs"})
+    state = manager.begin(
+        transaction_id="txn_logs", fingerprint_context={"kind": "logs"}
+    )
     operation = Operation(op="append", stream="logs", record=_log_record())
     manager.append(state.id, operation)
 
@@ -120,7 +132,9 @@ def test_logs_stream_uses_profile_fast_path_for_transaction_and_hook(tmp_path: P
     _stage_transaction(repository, manager.load(state.id))
 
     def fail_structured(*_args, **_kwargs):
-        raise AssertionError("structured validation must not run for a policy fast path")
+        raise AssertionError(
+            "structured validation must not run for a policy fast path"
+        )
 
     monkeypatch.setattr(mem_hook, "validate_structured_delta", fail_structured)
     result = mem_hook.validate_repository(repository.root)

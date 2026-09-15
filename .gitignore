@@ -5,9 +5,9 @@ __pycache__/
 .coverage
 htmlcov/
 .venv/
+.worktrees/
 dist/
 build/
 .pco/
-.opencode/node_modules/
 .agents/
 skills-lock.json

@@ -1,304 +1,712 @@
+"""Pure construction of the v0.5 current-state ``PCO_MEMORY`` projection."""
+
 from __future__ import annotations
 
-import json
+from dataclasses import dataclass
+import hashlib
 import os
-import shlex
-import subprocess
+from pathlib import Path, PurePosixPath
 import re
-from pathlib import Path
+import stat
+import subprocess
 from typing import Any
+from urllib.parse import quote
 
 from mem_core.errors import MemError
-from .backlinks import build as build_backlinks
-from .repo_loader import repository_at, resolve_derivation_source_commit
+from mem_core.profile import ProfileConfig, load_profile_yaml
+from mem_core.repository import MemoryRepository
 
+from .config import PROFILE_VERSION
+from .derivation_manifest import (
+    DerivationManifest,
+    canonical_manifest_bytes,
+    derivation_error,
+    manifest_for_files,
+    platform_path_key,
+    strict_json_object,
+)
+from .proposals.markdown import render_business_markdown
+from .validation import CANONICAL_BUSINESS_STREAMS, latest_effective
 
-STREAM_TITLES = {
-    "events": "事件",
-    "psychologies": "心理概念",
-    "philosophies": "哲学概念",
-    "archetypes": "人物投影与原型",
-    "hypotheses": "待验证认识",
-    "meta_revisions": "认识变化",
-    "checkpoints": "Checkpoint 更新记录",
+_DIRECTORY_STREAMS = (
+    "sources",
+    "evidence",
+    "events",
+    "psychologies",
+    "philosophies",
+    "archetypes",
+    "hypotheses",
+)
+_REQUIRED_STREAMS = frozenset(
+    (*_DIRECTORY_STREAMS, "meta_revisions", "session_handoffs")
+)
+_PORTABLE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_COMMIT = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+_V05_STREAMS = {
+    "evidence": (
+        "evidence/evidence.jsonl",
+        "schemas/evidence.schema.json",
+        "pco/evidence/v1",
+    ),
+    "sources": ("sources/sources.jsonl", "schemas/source.schema.json", "pco/source/v1"),
+    "events": ("events/events.jsonl", "schemas/event.schema.json", "pco/event/v1"),
+    "psychologies": (
+        "psychologies/psychologies.jsonl",
+        "schemas/concept.schema.json",
+        "pco/psychology/v1",
+    ),
+    "philosophies": (
+        "philosophies/philosophies.jsonl",
+        "schemas/concept.schema.json",
+        "pco/philosophy/v1",
+    ),
+    "archetypes": (
+        "archetypes/archetypes.jsonl",
+        "schemas/archetype.schema.json",
+        "pco/archetype/v1",
+    ),
+    "hypotheses": (
+        "hypotheses/hypotheses.jsonl",
+        "schemas/hypothesis.schema.json",
+        "pco/hypothesis/v1",
+    ),
+    "meta_revisions": (
+        "meta_revisions/meta_revisions.jsonl",
+        "schemas/meta-revision.schema.json",
+        "pco/meta-revision/v1",
+    ),
+    "session_handoffs": (
+        "session_handoffs/session_handoffs.jsonl",
+        "schemas/session-handoff.schema.json",
+        "pco/session-handoff/v1",
+    ),
 }
 
-ENTITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+def build_projection(
+    repository: MemoryRepository, target: Path, source_commit: str
+) -> DerivationManifest:
+    """Build one new projection from exact Git-object bytes at ``source_commit``."""
+
+    files, profile_version = _projection_payloads(repository, source_commit)
+    manifest = manifest_for_files(
+        files,
+        kind="pco_memory",
+        source_commit=source_commit,
+        profile_version=profile_version,
+    )
+    _write_new_tree(
+        Path(target), {**files, "manifest.json": canonical_manifest_bytes(manifest)}
+    )
+    return manifest
 
 
-def _projection_path(target_root: Path, stream: str, entity_id: str) -> Path:
-    if not ENTITY_ID_PATTERN.fullmatch(entity_id) or not ENTITY_ID_PATTERN.fullmatch(stream):
-        raise MemError("PROJECTION_ENTITY_ID_UNSAFE", "projection", entity_id)
-    root = target_root.resolve()
-    candidate = (root / stream / f"{entity_id}.md").resolve()
-    if root not in candidate.parents:
-        raise MemError("PROJECTION_PATH_ESCAPE", "projection", str(candidate))
-    return candidate
+def projection_path(stream: str, record_id: str) -> str:
+    """Map a Profile-valid record ID to one deterministic portable path."""
+
+    if not isinstance(record_id, str) or not record_id:
+        raise derivation_error(
+            "Canonical record ID cannot be mapped to a projection path",
+            value=record_id,
+            retry_safe=False,
+        )
+    try:
+        encoded = record_id.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise derivation_error(
+            "Canonical record ID is not valid UTF-8",
+            value=record_id,
+            retry_safe=False,
+        ) from exc
+    if stream == "meta_revisions":
+        if record_id != "meta_current":
+            raise derivation_error(
+                "Meta-memory must use the canonical meta_current ID",
+                value=record_id,
+                retry_safe=False,
+            )
+        return "META_MEMORY.md"
+    if stream == "session_handoffs":
+        return "SESSION_HANDOFF.md"
+    if stream not in _DIRECTORY_STREAMS:
+        raise derivation_error(
+            "Canonical record uses an unknown projection stream",
+            value=stream,
+            retry_safe=False,
+        )
+    reserved = record_id.split(".", 1)[0].upper() in _WINDOWS_RESERVED
+    if _PORTABLE_ID.fullmatch(record_id) and not reserved:
+        name = record_id
+    else:
+        name = quote(encoded, safe="")
+        if reserved or len(name.encode("ascii")) > 180:
+            name = "~" + hashlib.sha256(encoded).hexdigest()
+    return f"{stream}/{name}.md"
 
 
-def _load_mapping(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {"entities": {}, "commits": {}}
-    return json.loads(path.read_text(encoding="utf-8"))
+def _projection_payloads(
+    repository: MemoryRepository, source_commit: str
+) -> tuple[dict[str, bytes], str]:
+    profile = _exact_profile(repository, source_commit)
+    records: dict[str, list[dict[str, Any]]] = {}
+    for stream in sorted(_REQUIRED_STREAMS, key=str.encode):
+        config = profile.streams[stream]
+        records[stream] = _parse_jsonl(
+            _git_blob(repository, source_commit, config.path), config.path
+        )
+
+    files: dict[str, bytes] = {}
+    origins: dict[str, tuple[str, str]] = {}
+    collision_keys: dict[str, str] = {}
+    for stream in _DIRECTORY_STREAMS:
+        current = latest_effective(records[stream])
+        for record_id in sorted(current, key=str.encode):
+            relative = projection_path(stream, record_id)
+            _reserve_path(relative, stream, record_id, origins, collision_keys)
+            files[relative] = _render(current[record_id], relative)
+
+    meta = latest_effective(records["meta_revisions"]).get("meta_current")
+    if meta is not None:
+        relative = projection_path("meta_revisions", "meta_current")
+        _reserve_path(
+            relative, "meta_revisions", "meta_current", origins, collision_keys
+        )
+        files[relative] = _render(meta, relative)
+
+    handoffs = latest_effective(records["session_handoffs"])
+    if handoffs:
+        selected = max(handoffs.values(), key=_handoff_key)
+        relative = projection_path("session_handoffs", selected["id"])
+        _reserve_path(
+            relative, "session_handoffs", selected["id"], origins, collision_keys
+        )
+        files[relative] = _render(selected, relative)
+    return dict(sorted(files.items())), profile.version
 
 
-def _record_title(stream: str, record: dict[str, Any]) -> str:
-    payload = record["payload"]
-    return payload.get("name") or payload.get("description") or payload.get("statement") or record["id"]
+def exact_canonical_records(
+    repository: MemoryRepository,
+    source_commit: str,
+    *,
+    canonical_head: str | None = None,
+) -> tuple[ProfileConfig, dict[str, list[dict[str, Any]]]]:
+    """Read every v0.5 business stream from one verified canonical commit."""
+
+    profile = _exact_profile(repository, source_commit, canonical_head=canonical_head)
+    records = {
+        stream: _parse_jsonl(
+            _git_blob(repository, source_commit, profile.streams[stream].path),
+            profile.streams[stream].path,
+        )
+        for stream in sorted(_REQUIRED_STREAMS, key=str.encode)
+    }
+    return profile, records
 
 
-def _page(
+def _render(record: Any, relative: str) -> bytes:
+    try:
+        return render_business_markdown(dict(record))
+    except (MemError, TypeError, ValueError) as exc:
+        value = exc.as_dict() if isinstance(exc, MemError) else str(exc)
+        raise derivation_error(
+            "Canonical record cannot be rendered as v0.5 business Markdown",
+            path=relative,
+            value=value,
+            retry_safe=False,
+        ) from exc
+
+
+def _reserve_path(
+    relative: str,
     stream: str,
     record_id: str,
-    history: list[dict[str, Any]],
-    backlinks: dict[str, Any],
-    continuations: dict[int, dict[str, Any]],
-) -> dict[str, Any]:
-    latest = history[-1]
-    title = _record_title(stream, latest)
-    lines = [f"# {title}", "", f"PCO entity ID: `{record_id}`", f"Stream: `{stream}`", ""]
-    for record in history:
-        lines.extend([f"## Revision {record['revision']} · {record['recorded_at']}", ""])
-        payload = record["payload"]
-        for key, value in payload.items():
-            if key == "sections":
-                for section, entries in value.items():
-                    lines.extend([f"### {section}", ""])
-                    lines.extend([f"- {entry}" for entry in entries] or ["- 无"])
-                    lines.append("")
-            elif isinstance(value, list):
-                lines.extend([f"### {key}", ""])
-                lines.extend([f"- {json.dumps(entry, ensure_ascii=False) if isinstance(entry, dict) else entry}" for entry in value] or ["- 无"])
-                lines.append("")
-            elif key == "links" and isinstance(value, dict):
-                lines.extend(["### links", ""])
-                for relation, targets in value.items():
-                    for target in targets:
-                        lines.append(f"- {relation}: [{target}](pco://{target})")
-                if not any(value.values()):
-                    lines.append("- 无")
-                lines.append("")
-            elif isinstance(value, dict):
-                lines.extend([f"### {key}", "", "```json", json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True), "```", ""])
-            else:
-                lines.extend([f"- **{key}**: {value}", ""])
-    if stream == "checkpoints":
-        continuation_revision = latest["payload"].get("continuation_revision")
-        continuation = continuations.get(continuation_revision)
-        if continuation is not None:
-            lines.extend([f"## Continuation · revision {continuation_revision}", ""])
-            for key, value in continuation["payload"].items():
-                if isinstance(value, list):
-                    lines.extend([f"### {key}", ""])
-                    lines.extend([f"- {entry}" for entry in value] or ["- 无"])
-                    lines.append("")
-                else:
-                    lines.extend([f"- **{key}**: {json.dumps(value, ensure_ascii=False) if isinstance(value, dict) else value}", ""])
-    related = backlinks.get(record_id, [])
-    if related:
-        lines.extend(["## Backlinks", ""])
-        lines.extend(
-            [f"- [{item['source_stream']}:{item['source_id']}](pco://{item['source_id']}) · {item['relation']}" for item in related]
+    origins: dict[str, tuple[str, str]],
+    collision_keys: dict[str, str],
+) -> None:
+    if relative in origins:
+        raise derivation_error(
+            "Two canonical records map to one projection path",
+            path=relative,
+            value={"first": origins[relative], "second": (stream, record_id)},
+            retry_safe=False,
         )
-        lines.append("")
-    return {"entity_id": record_id, "stream": stream, "title": title, "content": "\n".join(lines).rstrip() + "\n"}
-
-
-def _pages(repository: MemoryRepository, backlink_map: dict[str, Any] | None = None, memory_commit: str | None = None) -> list[dict[str, Any]]:
-    records = repository.records_by_stream()
-    if backlink_map is None:
-        backlink_map = build_backlinks(repo_root=repository.root)["current_backlinks"]
-    pages: list[dict[str, Any]] = []
-    indexes: dict[str, list[tuple[str, str]]] = {}
-    continuations = {
-        record["revision"]: record
-        for record in records.get("continuations", [])
-        if record["id"] == "continuation_current"
-    }
-    for stream in STREAM_TITLES:
-        grouped: dict[str, list[dict[str, Any]]] = {}
-        for record in records.get(stream, []):
-            grouped.setdefault(record["id"], []).append(record)
-        indexes[stream] = []
-        for record_id, history in grouped.items():
-            page = _page(stream, record_id, history, backlink_map, continuations)
-            pages.append(page)
-            indexes[stream].append((page["title"], record_id))
-    for stream, label in STREAM_TITLES.items():
-        lines = [f"# {label}索引", "", f"Canonical commit: `{memory_commit or repository.head()}`", ""]
-        lines.extend(
-            [f"- [{title}](pco://{entity_id})" for title, entity_id in sorted(indexes[stream])]
-            or ["- 暂无记录"]
+    key = platform_path_key(relative)
+    previous = collision_keys.get(key)
+    if previous is not None and previous != relative:
+        raise derivation_error(
+            "Canonical record paths collide on a case-folding Host",
+            path=relative,
+            value={"first": previous, "second": relative},
+            retry_safe=False,
         )
-        pages.append(
-            {
-                "entity_id": f"index_{stream}",
-                "stream": "indexes",
-                "title": f"{label}索引",
-                "content": "\n".join(lines).rstrip() + "\n",
-            }
-        )
-    meta = repository.current_records("meta_revisions").get("meta_current")
-    home = ["# PCO 首页", "", f"Canonical commit: `{memory_commit or repository.head()}`", ""]
-    if meta:
-        home.extend([f"## 当前人格侧写 · revision {meta['revision']}", "", meta["payload"]["change_summary"], ""])
-        for section, values in meta["payload"]["sections"].items():
-            home.extend([f"### {section}", ""])
-            home.extend([f"- {value}" for value in values] or ["- 无"])
-            home.append("")
-    else:
-        home.extend(["## 当前人格侧写", "", "尚无已批准的 Meta-memory。", ""])
-    for stream, label in STREAM_TITLES.items():
-        home.extend([f"## [{label}](pco://index_{stream})", ""])
-        home.extend([f"- [{title}](pco://{entity_id})" for title, entity_id in sorted(indexes[stream])] or ["- 暂无记录"])
-        home.append("")
-    pages.insert(0, {"entity_id": "pco_home", "stream": "home", "title": "PCO 首页", "content": "\n".join(home).rstrip() + "\n"})
-    return pages
+    origins[relative] = (stream, record_id)
+    collision_keys[key] = relative
 
 
-def project_markdown(*, repo_root: Path, output_root: str | Path, source_commit: str | None = None, state_root: str | Path | None = None, **_: Any) -> dict[str, Any]:
-    source_root = Path(repo_root)
-    commit = resolve_derivation_source_commit(source_root, state_root=state_root or source_root.parent / "state", source_commit=source_commit)
-    backlink_map = build_backlinks(repo_root=source_root, source_commit=commit, state_root=state_root)["current_backlinks"]
-    with repository_at(source_root, commit) as repository:
-        return _project_markdown_repository(repository, Path(output_root), commit, backlink_map)
+def _handoff_key(record: Any) -> tuple[str, int, bytes]:
+    recorded_at = record.get("recorded_at")
+    revision = record.get("revision")
+    record_id = record.get("id")
+    return (
+        recorded_at if isinstance(recorded_at, str) else "",
+        (
+            revision
+            if isinstance(revision, int) and not isinstance(revision, bool)
+            else -1
+        ),
+        record_id.encode("utf-8") if isinstance(record_id, str) else b"",
+    )
 
 
-def _project_markdown_repository(repository: Any, target_root: Path, commit: str, backlink_map: dict[str, Any]) -> dict[str, Any]:
-    mapping_path = target_root / ".pco-projection.json"
-    mapping = _load_mapping(mapping_path)
-    if mapping.get("commits", {}).get(commit) == "complete":
-        return {"ok": True, "idempotent": True, "target": "markdown", "memory_commit": commit, "pages": 0}
-    pages = _pages(repository, backlink_map, commit)
-    paths = {page["entity_id"]: _projection_path(target_root, page["stream"], page["entity_id"]) for page in pages}
-    for page in pages:
-        directory = paths[page["entity_id"]].parent
-        directory.mkdir(parents=True, exist_ok=True)
-        path = paths[page["entity_id"]]
-        content = re.sub(
-            r"pco://([A-Za-z0-9_.-]+)",
-            lambda match: Path(os.path.relpath(paths[match.group(1)], start=path.parent)).as_posix()
-            if match.group(1) in paths
-            else match.group(0),
-            page["content"],
-        )
-        path.write_text(content, encoding="utf-8")
-        mapping["entities"][page["entity_id"]] = {"target_id": str(path), "stream": page["stream"], "last_commit": commit}
-    mapping.setdefault("commits", {})[commit] = "complete"
-    mapping_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = mapping_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(mapping, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    temporary.replace(mapping_path)
-    return {"ok": True, "idempotent": False, "target": "markdown", "memory_commit": commit, "pages": len(pages), "output_root": str(target_root)}
-
-
-def project_affine(
+def _exact_profile(
+    repository: MemoryRepository,
+    source_commit: str,
     *,
-    repo_root: Path,
-    state_root: str | Path,
-    command: str | None = None,
-    source_commit: str | None = None,
-    **_: Any,
-) -> dict[str, Any]:
-    """Project through a user-installed AFFiNE bridge CLI.
-
-    AFFiNE has no stable public content-write API. The bridge contract is one JSON
-    request on stdin and one JSON response on stdout, keeping provider-specific
-    CRDT/Yjs behavior outside canonical memory and mem-core.
-    """
-    source_root = Path(repo_root)
-    commit = resolve_derivation_source_commit(source_root, state_root=state_root, source_commit=source_commit)
-    backlink_map = build_backlinks(repo_root=source_root, source_commit=commit, state_root=state_root)["current_backlinks"]
-    with repository_at(source_root, commit) as repository:
-        return _project_affine_repository(repository, Path(state_root), command, commit, backlink_map)
-
-
-def _project_affine_repository(repository: Any, state_root: Path, command: str | None, commit: str, backlink_map: dict[str, Any]) -> dict[str, Any]:
-    state = Path(state_root) / "affine"
-    mapping_path = state / "mapping.json"
-    outbox_path = state / "outbox" / f"{commit}.json"
-    mapping = _load_mapping(mapping_path)
-    if mapping.get("commits", {}).get(commit) == "complete":
-        return {"ok": True, "idempotent": True, "target": "affine", "memory_commit": commit, "pages": 0}
-    pages = _pages(repository, backlink_map, commit)
-    request = {"operation": "upsert_pages", "memory_commit": commit, "pages": pages, "mapping": mapping.get("entities", {})}
-    outbox_path.parent.mkdir(parents=True, exist_ok=True)
-    outbox_temporary = outbox_path.with_suffix(".tmp")
-    outbox_temporary.write_text(json.dumps(request, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    outbox_temporary.replace(outbox_path)
-    bridge = command or os.getenv("PCO_AFFINE_COMMAND")
-    if not bridge:
-        return {
-            "ok": False,
-            "pending": True,
-            "target": "affine",
-            "memory_commit": commit,
-            "pages": len(pages),
-            "outbox": str(outbox_path),
-            "error": {"code": "AFFINE_BRIDGE_NOT_CONFIGURED", "retryable": True, "recovery": ["Set PCO_AFFINE_COMMAND to an AFFiNE bridge CLI", "Use the Markdown projection target"]},
-        }
+    canonical_head: str | None = None,
+) -> ProfileConfig:
+    if not isinstance(source_commit, str) or not _COMMIT.fullmatch(source_commit):
+        raise derivation_error(
+            "source_commit must be one full lowercase hexadecimal commit ID",
+            value=source_commit,
+            retry_safe=False,
+        )
+    result = _git_probe(
+        repository, "rev-parse", "--verify", f"{source_commit}^{{commit}}"
+    )
+    observed_commit = result.stdout.decode("ascii", errors="replace").strip()
+    if result.returncode or observed_commit != source_commit:
+        raise derivation_error(
+            "source_commit does not identify an exact canonical commit",
+            value=source_commit,
+            retry_safe=False,
+        )
+    if canonical_head is None:
+        head_result = _git_probe(repository, "rev-parse", "--verify", "HEAD^{commit}")
+        head_commit = head_result.stdout.decode("ascii", errors="replace").strip()
+        if (
+            head_result.returncode
+            or not _COMMIT.fullmatch(head_commit)
+            or len(head_commit) != len(source_commit)
+        ):
+            raise derivation_error(
+                "Canonical HEAD cannot be resolved to one full commit ID",
+                value=head_result.stderr.decode("utf-8", errors="replace").strip(),
+                retry_safe=False,
+            )
+    else:
+        head_commit = canonical_head
+        if (
+            not isinstance(head_commit, str)
+            or not _COMMIT.fullmatch(head_commit)
+            or len(head_commit) != len(source_commit)
+        ):
+            raise derivation_error(
+                "Captured canonical HEAD is not one full commit ID",
+                value=head_commit,
+                retry_safe=False,
+            )
+    if source_commit != head_commit:
+        ancestry = _git_probe(
+            repository,
+            "merge-base",
+            "--is-ancestor",
+            source_commit,
+            head_commit,
+        )
+        if ancestry.returncode == 1:
+            raise derivation_error(
+                "source_commit is not in canonical HEAD history",
+                value={"source_commit": source_commit, "head": head_commit},
+                retry_safe=False,
+            )
+        if ancestry.returncode != 0:
+            raise derivation_error(
+                "Canonical commit ancestry cannot be established",
+                value=ancestry.stderr.decode("utf-8", errors="replace").strip(),
+                retry_safe=False,
+            )
+    marker = strict_json_object(
+        _git_blob(repository, source_commit, ".mem-profile.json"),
+        path=".mem-profile.json",
+    )
+    profile_path = marker.get("path")
+    if not isinstance(profile_path, str):
+        raise derivation_error(
+            "Canonical Profile marker has no safe Profile path",
+            path=".mem-profile.json",
+            retry_safe=False,
+        )
+    pure_profile = PurePosixPath(profile_path)
+    if (
+        not profile_path
+        or pure_profile.is_absolute()
+        or ".." in pure_profile.parts
+        or pure_profile.as_posix() != profile_path
+    ):
+        raise derivation_error(
+            "Canonical Profile marker path is unsafe",
+            path=".mem-profile.json",
+            retry_safe=False,
+        )
+    profile_location = f"{profile_path}/profile.yaml"
     try:
-        result = subprocess.run(
-            shlex.split(bridge),
-            input=json.dumps(request, ensure_ascii=False),
-            text=True,
+        loaded = load_profile_yaml(
+            _git_blob(repository, source_commit, profile_location).decode(
+                "utf-8", errors="strict"
+            )
+        )
+        profile = ProfileConfig.model_validate(loaded, strict=True)
+    except (UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Canonical exact-commit Profile is invalid",
+            path=profile_location,
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+    exact_streams = {
+        name: (item.path, item.schema_path, item.schema_version)
+        for name, item in profile.streams.items()
+    }
+    if (
+        profile_path != "profiles/pco"
+        or marker.get("name") != profile.name
+        or marker.get("version") != profile.version
+        or profile.name != "pco"
+        or profile.version != PROFILE_VERSION
+        or profile.application_commit_policy != "pco_proposal"
+        or exact_streams != _V05_STREAMS
+        or set(profile.streams) != _REQUIRED_STREAMS
+        or set(CANONICAL_BUSINESS_STREAMS) != _REQUIRED_STREAMS
+    ):
+        raise derivation_error(
+            "source_commit Profile does not match the opened v0.5 repository",
+            path=".mem-profile.json",
+            value={
+                "marker": {
+                    "name": marker.get("name"),
+                    "version": marker.get("version"),
+                },
+                "exact": {"name": profile.name, "version": profile.version},
+                "required": {"name": "pco", "version": PROFILE_VERSION},
+            },
+            retry_safe=False,
+        )
+    return profile
+
+
+def _git_probe(
+    repository: MemoryRepository, *arguments: str
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(repository.root), *arguments],
             capture_output=True,
             check=False,
-            timeout=float(os.getenv("PCO_AFFINE_TIMEOUT_SECONDS", "120")),
         )
-    except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "pending": True,
-            "target": "affine",
-            "memory_commit": commit,
-            "outbox": str(outbox_path),
-            "error": {"code": "AFFINE_SYNC_TIMEOUT", "retryable": True},
-        }
-    if result.returncode:
-        diagnostic_path = state / "logs" / f"{commit}.log"
-        diagnostic_path.parent.mkdir(parents=True, exist_ok=True)
-        diagnostic_path.write_text(result.stderr, encoding="utf-8")
-        diagnostic_path.chmod(0o600)
-        return {
-            "ok": False,
-            "pending": True,
-            "target": "affine",
-            "memory_commit": commit,
-            "outbox": str(outbox_path),
-            "error": {
-                "code": "AFFINE_SYNC_FAILED",
-                "message": f"AFFiNE bridge exited with code {result.returncode}",
-                "diagnostic_path": str(diagnostic_path),
-                "retryable": True,
-            },
-        }
+    except OSError as exc:
+        raise derivation_error(
+            "Canonical Git boundary cannot be inspected",
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+
+
+def _git_blob(repository: MemoryRepository, commit: str, relative: str) -> bytes:
     try:
-        response = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise MemError("AFFINE_BRIDGE_INVALID_RESPONSE", "projection", str(exc), retryable=True) from exc
-    response_mapping = response.get("mapping", {})
-    expected_ids = {page["entity_id"] for page in pages}
-    valid = (
-        response.get("ok") is True
-        and response.get("memory_commit") == commit
-        and isinstance(response_mapping, dict)
-        and expected_ids.issubset(response_mapping)
-        and all(isinstance(response_mapping[entity_id], str) and response_mapping[entity_id] for entity_id in expected_ids)
-    )
-    if not valid:
-        raise MemError(
-            "AFFINE_BRIDGE_INVALID_RESPONSE",
-            "projection",
-            "Bridge must acknowledge the same memory commit and map every requested entity",
-            retryable=True,
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository.root),
+                "cat-file",
+                "blob",
+                f"{commit}:{relative}",
+            ],
+            capture_output=True,
+            check=False,
         )
-    for entity_id, target_id in response_mapping.items():
-        existing = mapping["entities"].get(entity_id, {})
-        mapping["entities"][entity_id] = {**existing, "target_id": target_id, "last_commit": commit}
-    mapping.setdefault("commits", {})[commit] = "complete"
-    mapping_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = mapping_path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(mapping, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    temporary.replace(mapping_path)
-    return {"ok": True, "idempotent": False, "target": "affine", "memory_commit": commit, "pages": len(pages)}
+    except OSError as exc:
+        raise derivation_error(
+            "Canonical Git object cannot be read", path=relative, value=str(exc)
+        ) from exc
+    if result.returncode:
+        raise derivation_error(
+            "Canonical Git object is missing",
+            path=relative,
+            value=result.stderr.decode("utf-8", errors="replace").strip(),
+            retry_safe=False,
+        )
+    return result.stdout
+
+
+def _parse_jsonl(data: bytes, relative: str) -> list[dict[str, Any]]:
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise derivation_error(
+            "Canonical stream is not UTF-8", path=relative, retry_safe=False
+        ) from exc
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        record = strict_json_object(
+            line.encode("utf-8"), path=f"{relative}:{line_number}"
+        )
+        records.append(record)
+    return records
+
+
+@dataclass(frozen=True)
+class _WrittenTreeIdentity:
+    target: Path
+    parent: Path
+    name: str
+    parent_identity: tuple[int, int]
+    target_identity: tuple[int, int]
+
+
+def _write_new_tree(target: Path, files: dict[str, bytes]) -> _WrittenTreeIdentity:
+    target = Path(target)
+    name = target.name
+    try:
+        name.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise derivation_error(
+            "Projection target name must be valid UTF-8",
+            path=target,
+            retry_safe=False,
+        ) from exc
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+        or any(ord(character) < 32 for character in name)
+    ):
+        raise derivation_error(
+            "Projection target must have one safe final path component",
+            path=target,
+            retry_safe=False,
+        )
+    target = target.absolute()
+    parent_path = target.parent
+    try:
+        parent_observed = os.lstat(parent_path)
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Projection target parent cannot be inspected safely",
+            path=parent_path,
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+    if not stat.S_ISDIR(parent_observed.st_mode):
+        raise derivation_error(
+            "Projection target parent must be a real directory",
+            path=parent_path,
+            retry_safe=False,
+        )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent_fd = os.open(parent_path, flags)
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Projection target parent cannot be opened without following links",
+            path=parent_path,
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+    root_fd: int | None = None
+    try:
+        parent_identity = (parent_observed.st_dev, parent_observed.st_ino)
+        if _stat_identity(os.fstat(parent_fd)) != parent_identity:
+            raise derivation_error(
+                "Projection target parent identity changed while it was opened",
+                path=parent_path,
+                retry_safe=False,
+            )
+        _require_path_identity(parent_path, parent_identity)
+        try:
+            observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _require_path_identity(parent_path, parent_identity)
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            except (OSError, TypeError, ValueError) as exc:
+                raise derivation_error(
+                    "Projection target cannot be created safely",
+                    path=target,
+                    value=str(exc),
+                    retry_safe=False,
+                ) from exc
+            try:
+                observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except (OSError, TypeError, ValueError) as exc:
+                raise derivation_error(
+                    "Projection target changed after creation",
+                    path=target,
+                    value=str(exc),
+                    retry_safe=False,
+                ) from exc
+        except (OSError, TypeError, ValueError) as exc:
+            raise derivation_error(
+                "Projection target cannot be inspected without following links",
+                path=target,
+                value=str(exc),
+                retry_safe=False,
+            ) from exc
+        if not stat.S_ISDIR(observed.st_mode):
+            raise derivation_error(
+                "Projection target must be absent or an empty real directory",
+                path=target,
+                retry_safe=False,
+            )
+        target_identity = _stat_identity(observed)
+        _require_named_identity(parent_fd, name, target_identity, target)
+        _require_path_identity(parent_path, parent_identity)
+        try:
+            root_fd = os.open(name, flags, dir_fd=parent_fd)
+        except (OSError, TypeError, ValueError) as exc:
+            raise derivation_error(
+                "Projection target changed while it was opened",
+                path=target,
+                value=str(exc),
+                retry_safe=False,
+            ) from exc
+        if _stat_identity(os.fstat(root_fd)) != target_identity:
+            raise derivation_error(
+                "Projection target identity changed while it was opened",
+                path=target,
+                retry_safe=False,
+            )
+        _require_named_identity(parent_fd, name, target_identity, target)
+        _require_path_identity(parent_path, parent_identity)
+        try:
+            entries = os.listdir(root_fd)
+        except OSError as exc:
+            raise derivation_error(
+                "Projection target cannot be enumerated safely",
+                path=target,
+                value=str(exc),
+                retry_safe=False,
+            ) from exc
+        if entries:
+            raise derivation_error(
+                "Projection target must be empty", path=target, retry_safe=False
+            )
+        for relative, content in sorted(
+            files.items(), key=lambda item: item[0].encode("utf-8")
+        ):
+            _write_exclusive(root_fd, relative, content)
+        _require_named_identity(parent_fd, name, target_identity, target)
+        _require_path_identity(parent_path, parent_identity)
+        return _WrittenTreeIdentity(
+            target=target,
+            parent=parent_path,
+            name=name,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+        )
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
+
+
+def _stat_identity(observed: os.stat_result) -> tuple[int, int]:
+    return observed.st_dev, observed.st_ino
+
+
+def _require_path_identity(path: Path, identity: tuple[int, int]) -> None:
+    try:
+        observed = os.lstat(path)
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Projection target parent changed during construction",
+            path=path,
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+    if not stat.S_ISDIR(observed.st_mode) or _stat_identity(observed) != identity:
+        raise derivation_error(
+            "Projection target parent identity changed during construction",
+            path=path,
+            retry_safe=False,
+        )
+
+
+def _require_named_identity(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int],
+    display_path: Path,
+) -> None:
+    try:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except (OSError, TypeError, ValueError) as exc:
+        raise derivation_error(
+            "Projection target name changed during construction",
+            path=display_path,
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+    if not stat.S_ISDIR(observed.st_mode) or _stat_identity(observed) != identity:
+        raise derivation_error(
+            "Projection target identity changed during construction",
+            path=display_path,
+            retry_safe=False,
+        )
+
+
+def _write_exclusive(root_fd: int, relative: str, content: bytes) -> None:
+    parts = PurePosixPath(relative).parts
+    current = os.dup(root_fd)
+    descriptor: int | None = None
+    try:
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=current)
+            except FileExistsError:
+                pass
+            following = os.open(
+                part,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=current,
+            )
+            os.close(current)
+            current = following
+        descriptor = os.open(
+            parts[-1],
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=current,
+        )
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short projection write")
+            view = view[written:]
+    except (OSError, ValueError) as exc:
+        raise derivation_error(
+            "Projection payload cannot be written without replacement",
+            path=relative,
+            value=str(exc),
+            retry_safe=False,
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(current)

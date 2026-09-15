@@ -1,26 +1,34 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object", "additionalProperties": false,
-  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "required": ["id", "revision", "recorded_at", "schema_version", "commit_ref", "payload"],
   "properties": {
     "id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1},
     "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/event/v1"},
+    "commit_ref": {"type": "string", "minLength": 1},
     "payload": {
       "type": "object", "additionalProperties": false,
-      "required": ["occurred_at", "description", "links", "evidence_refs", "revision_reason", "status"],
+      "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}],
+      "required": ["previous_revision", "change_summary", "body_markdown", "occurred_at", "evidence_refs", "status"],
       "properties": {
+        "previous_revision": {"type": ["integer", "null"], "minimum": 1},
+        "change_summary": {"type": "string", "minLength": 1},
+        "body_markdown": {"type": "string", "minLength": 1},
         "occurred_at": {
           "type": "object", "additionalProperties": false, "required": ["precision"],
           "properties": {"start": {"type": ["string", "null"]}, "end": {"type": ["string", "null"]}, "precision": {"enum": ["instant", "day", "month", "year", "range", "natural", "unknown"]}, "natural": {"type": "string"}}
         },
-        "description": {"type": "string", "minLength": 1},
         "links": {
           "type": "object", "additionalProperties": false, "required": ["psychologies", "philosophies", "archetypes"],
           "properties": {"psychologies": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}, "philosophies": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}, "archetypes": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}}
         },
         "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true},
-        "revision_reason": {"type": "string", "minLength": 1}, "status": {"enum": ["active", "superseded", "corrected", "tombstone"]}
+        "status": {"enum": ["active", "superseded", "corrected", "tombstone"]}
       }
     }
-  }
+  },
+  "allOf": [{
+    "if": {"properties": {"revision": {"minimum": 2}}, "required": ["revision"]},
+    "then": {"properties": {"payload": {"properties": {"previous_revision": {"type": "integer", "minimum": 1}}}}}
+  }]
 }

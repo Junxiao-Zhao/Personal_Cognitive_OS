@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "revision", "recorded_at", "schema_version", "commit_ref", "payload"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "revision": {"type": "integer", "minimum": 1},
+    "recorded_at": {"type": "string", "format": "date-time"},
+    "schema_version": {"const": "pco/session-handoff/v1"},
+    "commit_ref": {"type": "string", "minLength": 1},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}],
+      "required": ["previous_revision", "change_summary", "body_markdown", "topics", "unanswered_questions", "active_tensions", "recent_decisions", "next_directions", "status"],
+      "properties": {
+        "previous_revision": {"type": ["integer", "null"], "minimum": 1},
+        "change_summary": {"type": "string", "minLength": 1},
+        "body_markdown": {"type": "string", "minLength": 1},
+        "topics": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "unanswered_questions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "active_tensions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "recent_decisions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "next_directions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "status": {"enum": ["active", "superseded", "tombstone"]}
+      }
+    }
+  },
+  "allOf": [{
+    "if": {"properties": {"revision": {"minimum": 2}}, "required": ["revision"]},
+    "then": {"properties": {"payload": {"properties": {"previous_revision": {"type": "integer", "minimum": 1}}}}}
+  }]
+}

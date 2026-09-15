@@ -6,32 +6,53 @@ import shlex
 import shutil
 import subprocess
 import sys
+from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
 from .errors import MemError, ensure
+from .locking import canonical_lock
 from .models import RecordEnvelope, latest_by_id
 from .profile import Profile
+from .profile_identity import profile_tree_digest
+
+if TYPE_CHECKING:
+    from pco.init_safety import DirectoryAnchor
 
 
 class MemoryRepository:
-    def __init__(self, root: Path, profile: Profile) -> None:
-        self.root = root.resolve()
+    def __init__(
+        self, root: Path, profile: Profile, *, _resolve_root: bool = True
+    ) -> None:
+        self.root = root.resolve() if _resolve_root else root.absolute()
         self.profile = profile
 
     def _git(self, *args: str, cwd: Path | None = None, check: bool = True) -> str:
         command = ["git", *args]
         env = os.environ.copy()
         source_root = str(Path(__file__).resolve().parents[1])
-        env["PYTHONPATH"] = source_root + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-        result = subprocess.run(command, cwd=cwd or self.root, text=True, capture_output=True, check=False, env=env)
+        env["PYTHONPATH"] = source_root + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+        )
+        result = subprocess.run(
+            command,
+            cwd=cwd or self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
         if check and result.returncode:
             raise MemError(
                 "GIT_FAILED",
                 "git",
                 result.stderr.strip() or result.stdout.strip(),
-                retryable=True,
-                recovery=["Run mem git verify", "Resolve the reported Git repository problem"],
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=[
+                    "Run mem git verify",
+                    "Resolve the reported Git repository problem",
+                ],
             )
         return result.stdout.strip()
 
@@ -40,7 +61,14 @@ class MemoryRepository:
         return (self.root / ".git").exists()
 
     def init(self, *, copy_profile: bool = True) -> str:
-        ensure(not self.root.exists() or not any(self.root.iterdir()), "REPO_NOT_EMPTY", "init", f"Memory directory is not empty: {self.root}")
+        ensure(
+            not self.root.exists() or not any(self.root.iterdir()),
+            "REPO_NOT_EMPTY",
+            "init",
+            f"Memory directory is not empty: {self.root}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         self.root.mkdir(parents=True, exist_ok=True)
         self._git("init", "-b", "main")
         self._git("config", "user.name", "PCO Memory")
@@ -59,14 +87,22 @@ class MemoryRepository:
         (self.root / "transactions").mkdir(parents=True, exist_ok=True)
         (self.root / "transactions" / "transactions.jsonl").touch()
         (self.root / ".gitignore").write_text("*.lock\n", encoding="utf-8")
-        profile_location = f"profiles/{self.profile.name}" if copy_profile else str(self.profile.root)
-        (self.root / ".mem-profile.json").write_text(
-            json.dumps(
-                {"name": self.profile.name, "version": self.profile.version, "path": profile_location},
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
+        marker = {
+            "name": self.profile.name,
+            "version": self.profile.version,
+            "path": (
+                f"profiles/{self.profile.name}"
+                if copy_profile
+                else str(self.profile.root)
+            ),
+        }
+        if not copy_profile:
+            marker["policy_hash"] = self.profile.policy_hash
+            marker["profile_tree_digest"] = profile_tree_digest(
+                self.profile.root, phase="init"
             )
+        (self.root / ".mem-profile.json").write_text(
+            json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True)
             + "\n",
             encoding="utf-8",
         )
@@ -78,10 +114,87 @@ class MemoryRepository:
         self.install_pre_commit_hook()
         return self.head()
 
+    def init_anchored(
+        self,
+        root: "DirectoryAnchor",
+        *,
+        copy_profile: bool = True,
+        initial_files: Mapping[str, bytes] | None = None,
+    ) -> str:
+        """Initialize through a caller-supplied descriptor-backed directory.
+
+        The path-based ``init`` remains the generic trusted-repository API.
+        PCO imports are intentionally local so mem-core does not acquire a
+        package import dependency merely by being imported.
+        """
+
+        from pco.init_safety import (
+            AnchoredGit,
+            canonical_json_bytes,
+            copy_profile_tree_anchored,
+            install_pre_commit_hook_anchored,
+        )
+
+        with AnchoredGit(root.git_cwd(".")) as git:
+            git.run("init", "-b", "main")
+            git.run("config", "user.name", "PCO Memory")
+            git.run("config", "user.email", "pco-memory@local")
+
+            for stream in self.profile.config.streams.values():
+                root.touch(
+                    self.profile._safe_relative(stream.path, phase="init"),
+                    parents=True,
+                )
+            for artifact_root in self.profile.config.artifact_roots:
+                relative = self.profile._safe_relative(artifact_root, phase="init")
+                if relative.suffix:
+                    root.touch(relative, parents=True)
+                else:
+                    root.mkdir(relative, parents=True)
+                    root.touch(relative / ".gitkeep")
+            root.touch("transactions/transactions.jsonl", parents=True)
+            root.write_bytes(".gitignore", b"*.lock\n")
+            root.write_bytes(
+                ".mem-profile.json",
+                canonical_json_bytes(
+                    {
+                        "name": self.profile.name,
+                        "version": self.profile.version,
+                        "path": (
+                            f"profiles/{self.profile.name}"
+                            if copy_profile
+                            else str(self.profile.root)
+                        ),
+                    }
+                ),
+            )
+            if copy_profile:
+                profile_relative = f"profiles/{self.profile.name}"
+                root.mkdir(profile_relative, parents=True)
+                with root.open_directory(profile_relative) as profile_root:
+                    copy_profile_tree_anchored(profile_root, self.profile)
+            for relative, content in sorted((initial_files or {}).items()):
+                root.write_bytes(
+                    self.profile._safe_relative(relative, phase="init"), content
+                )
+
+            git.run("add", ".")
+            git.run(
+                "commit", "-m", f"Initialize {self.profile.name} canonical memory"
+            )
+            install_pre_commit_hook_anchored(root, git)
+            return git.run("rev-parse", "HEAD")
+
     def _common_git_dir(self) -> Path:
         raw = self._git("rev-parse", "--git-common-dir")
         path = Path(raw)
         return path.resolve() if path.is_absolute() else (self.root / path).resolve()
+
+    def lock(self, *, blocking: bool = True) -> AbstractContextManager[None]:
+        self.assert_initialized()
+        return canonical_lock(
+            self._common_git_dir() / "pco-canonical.lock", blocking=blocking
+        )
 
     def install_pre_commit_hook(self) -> Path:
         """Install the repository-owned final schema/semantic validation gate."""
@@ -93,15 +206,20 @@ class MemoryRepository:
         content = (
             "#!/bin/sh\n"
             "# managed-by: mem-core\n"
-            f"exec {executable} -m mem_core.hook --repo \"$(git rev-parse --show-toplevel)\"\n"
+            f'exec {executable} -m mem_core.hook --repo "$(git rev-parse --show-toplevel)"\n'
         )
-        if hook.exists() and "managed-by: mem-core" not in hook.read_text(encoding="utf-8", errors="replace"):
+        if hook.exists() and "managed-by: mem-core" not in hook.read_text(
+            encoding="utf-8", errors="replace"
+        ):
             raise MemError(
                 "PRE_COMMIT_HOOK_CONFLICT",
                 "repository",
                 f"An unmanaged pre-commit hook already exists: {hook}",
-                retryable=False,
-                recovery=["Chain the existing hook to `python -m mem_core.hook`, then retry"],
+                canonical_changed=False,
+                retry_safe=False,
+                recovery=[
+                    "Chain the existing hook to `python -m mem_core.hook`, then retry"
+                ],
             )
         hook.write_text(content, encoding="utf-8", newline="\n")
         hook.chmod(0o755)
@@ -109,11 +227,20 @@ class MemoryRepository:
 
     def pre_commit_hook_status(self) -> dict[str, Any]:
         hook = self._common_git_dir() / "hooks" / "pre-commit"
-        installed = hook.is_file() and "managed-by: mem-core" in hook.read_text(encoding="utf-8", errors="replace")
+        installed = hook.is_file() and "managed-by: mem-core" in hook.read_text(
+            encoding="utf-8", errors="replace"
+        )
         return {"installed": installed, "path": str(hook)}
 
     def assert_initialized(self) -> None:
-        ensure(self.is_initialized, "REPO_NOT_INITIALIZED", "repository", f"Not a Git memory repository: {self.root}")
+        ensure(
+            self.is_initialized,
+            "REPO_NOT_INITIALIZED",
+            "repository",
+            f"Not a Git memory repository: {self.root}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
 
     def head(self) -> str:
         self.assert_initialized()
@@ -129,11 +256,14 @@ class MemoryRepository:
             "CANONICAL_DIRTY",
             "repository",
             "Canonical memory has uncommitted changes",
-            retryable=False,
+            canonical_changed=False,
+            retry_safe=False,
             recovery=["Inspect and commit or move manual changes before retrying"],
         )
 
-    def iter_records(self, stream_name: str, *, root: Path | None = None) -> Iterable[dict[str, Any]]:
+    def iter_records(
+        self, stream_name: str, *, root: Path | None = None
+    ) -> Iterable[dict[str, Any]]:
         path = self.profile.stream_path(root or self.root, stream_name)
         if not path.exists():
             return
@@ -150,18 +280,33 @@ class MemoryRepository:
                         str(exc),
                         stream=stream_name,
                         path=f"{path}:{line_number}",
+                        canonical_changed=False,
+                        retry_safe=False,
                     ) from exc
 
-    def records_by_stream(self, *, root: Path | None = None) -> dict[str, list[dict[str, Any]]]:
-        return {name: list(self.iter_records(name, root=root)) for name in self.profile.config.streams}
+    def records_by_stream(
+        self, *, root: Path | None = None
+    ) -> dict[str, list[dict[str, Any]]]:
+        return {
+            name: list(self.iter_records(name, root=root))
+            for name in self.profile.config.streams
+        }
 
-    def current_records(self, stream_name: str, *, root: Path | None = None) -> dict[str, dict[str, Any]]:
+    def current_records(
+        self, stream_name: str, *, root: Path | None = None
+    ) -> dict[str, dict[str, Any]]:
         return latest_by_id(self.iter_records(stream_name, root=root))
 
     def record_history(self, stream_name: str, record_id: str) -> list[dict[str, Any]]:
-        return [record for record in self.iter_records(stream_name) if record.get("id") == record_id]
+        return [
+            record
+            for record in self.iter_records(stream_name)
+            if record.get("id") == record_id
+        ]
 
-    def append_record(self, root: Path, stream_name: str, record: dict[str, Any]) -> None:
+    def append_record(
+        self, root: Path, stream_name: str, record: dict[str, Any]
+    ) -> None:
         path = self.profile.stream_path(root, stream_name)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8", newline="\n") as handle:
@@ -185,6 +330,8 @@ class MemoryRepository:
                         str(exc),
                         stream=stream_name,
                         record_id=record.get("id"),
+                        canonical_changed=False,
+                        retry_safe=False,
                     ) from exc
                 expected = revisions.get(envelope.id, 0) + 1
                 ensure(
@@ -196,12 +343,18 @@ class MemoryRepository:
                     record_id=envelope.id,
                     path="/revision",
                     value=envelope.revision,
+                    canonical_changed=False,
+                    retry_safe=False,
                 )
                 revisions[envelope.id] = envelope.revision
                 self.profile.validate_record_schema(stream_name, record)
                 record_count += 1
         self.profile.run_validators(target, all_records)
-        return {"ok": True, "profile": f"{self.profile.name}@{self.profile.version}", "records": record_count}
+        return {
+            "ok": True,
+            "profile": f"{self.profile.name}@{self.profile.version}",
+            "records": record_count,
+        }
 
     def add_worktree(self, path: Path, base_commit: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

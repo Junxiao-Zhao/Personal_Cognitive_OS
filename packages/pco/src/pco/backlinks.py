@@ -1,122 +1,58 @@
+"""Pure internal reverse-reference construction for retrieval generations."""
+
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any
-
-from mem_core.repository import MemoryRepository
-
-from .repo_loader import repository_at, resolve_derivation_source_commit
+from typing import Any, Iterable, Mapping
 
 
-_BACKLINK_STREAMS = ("events", "archetypes", "hypotheses", "meta_revisions")
-_REFERENCE_FIELDS = ("evidence_refs", "counter_evidence_refs")
-_RETIRED_STATUSES = {"disputed", "inactive", "rejected", "superseded", "tombstone"}
+def build_reverse_references(
+    documents: Iterable[Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return deterministic target-to-source edges without mutating documents."""
 
-
-def _edges(record: dict[str, Any], stream: str) -> list[tuple[str, str]]:
-    payload = record["payload"]
-    result: list[tuple[str, str]] = []
-    if stream == "events":
-        for relation, targets in payload.get("links", {}).items():
-            result.extend((target, relation) for target in targets)
-    for relation in _REFERENCE_FIELDS:
-        result.extend((target, relation) for target in payload.get(relation, []))
-    if stream == "meta_revisions":
-        result.extend((target, "promotion") for target in payload.get("promotion_refs", []))
-    return result
-
-
-def _is_current(record: dict[str, Any]) -> bool:
-    return record["payload"].get("status") not in _RETIRED_STATUSES
-
-
-def build(
-    *,
-    repo_root: Path,
-    output_path: str | Path | None = None,
-    source_commit: str | None = None,
-    memory_commit: str | None = None,
-    state_root: str | Path | None = None,
-    **_: Any,
-) -> dict[str, Any]:
-    repo_root = Path(repo_root)
-    source_commit = resolve_derivation_source_commit(
-        Path(repo_root),
-        state_root=Path(state_root) if state_root is not None else (Path(output_path).parent.parent if output_path else None),
-        source_commit=source_commit or memory_commit,
-    )
-    with repository_at(repo_root, source_commit) as repository:
-        records = repository.records_by_stream()
-        current_backlinks: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = {}
-        historical_backlinks: dict[str, list[dict[str, Any]]] = {}
-        latest = {
-            stream: repository.current_records(stream)
-            for stream in _BACKLINK_STREAMS
-        }
-
-        def add(
-            target: str,
-            source_stream: str,
-            source_id: str,
-            relation: str,
-            record: dict[str, Any],
-            *,
-            current: bool,
-        ) -> None:
-            item = {
-                "source_stream": source_stream,
-                "source_id": source_id,
-                "relation": relation,
-            }
-            if current:
-                current_backlinks.setdefault(target, {})[(source_stream, source_id, relation)] = item
-            else:
-                historical_backlinks.setdefault(target, []).append(
-                    {
-                        **item,
-                        "source_revision": record["revision"],
-                        "status": record["payload"].get("status"),
-                        "recorded_at": record["recorded_at"],
-                    }
+    edges: dict[str, list[dict[str, Any]]] = {}
+    for document in documents:
+        source_stream = document.get("stream")
+        source_id = document.get("id")
+        revision = document.get("revision")
+        if not isinstance(source_stream, str) or not isinstance(source_id, str):
+            continue
+        if not isinstance(revision, int) or isinstance(revision, bool):
+            continue
+        relations: list[tuple[str, str]] = []
+        for field in ("evidence_refs", "counter_evidence_refs", "promotion_refs"):
+            values = document.get(field, [])
+            if isinstance(values, list):
+                relations.extend(
+                    (value, field) for value in values if isinstance(value, str)
                 )
-
-        for stream in _BACKLINK_STREAMS:
-            for record in records.get(stream, []):
-                latest_record = latest.get(stream, {}).get(record["id"])
-                is_latest = latest_record is not None and latest_record["revision"] == record["revision"]
-                is_current = is_latest and _is_current(record)
-                for target, relation in _edges(record, stream):
-                    if is_current:
-                        add(target, stream, record["id"], relation, record, current=True)
-                    add(target, stream, record["id"], relation, record, current=False)
-
-        current = {
-            target: sorted(values.values(), key=lambda item: (item["source_stream"], item["source_id"], item["relation"]))
-            for target, values in current_backlinks.items()
-        }
-        historical = {
-            target: sorted(
-                values,
-                key=lambda item: (
-                    item["source_stream"],
-                    item["source_id"],
-                    item["source_revision"],
-                    item["relation"],
-                ),
+        links = document.get("links", {})
+        if isinstance(links, Mapping):
+            for relation, values in links.items():
+                if isinstance(relation, str) and isinstance(values, list):
+                    relations.extend(
+                        (value, relation) for value in values if isinstance(value, str)
+                    )
+        for target, relation in relations:
+            edges.setdefault(target, []).append(
+                {
+                    "source_id": source_id,
+                    "source_revision": revision,
+                    "source_stream": source_stream,
+                    "relation": relation,
+                }
             )
-            for target, values in historical_backlinks.items()
-        }
-        result = {
-            "memory_commit": source_commit,
-            "derivation_source_commit": source_commit,
-            "profile": f"{repository.profile.name}@{repository.profile.version}",
-            "backlinks": dict(sorted(current.items())),
-            "current_backlinks": dict(sorted(current.items())),
-            "historical_backlinks": dict(sorted(historical.items())),
-        }
-    if output_path is not None:
-        target = Path(output_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-    return {"ok": True, **result, "output_path": str(output_path) if output_path else None}
+    return {
+        target: sorted(
+            values,
+            key=lambda item: (
+                item["source_stream"].encode("utf-8"),
+                item["source_id"].encode("utf-8"),
+                item["source_revision"],
+                item["relation"].encode("utf-8"),
+            ),
+        )
+        for target, values in sorted(
+            edges.items(), key=lambda item: item[0].encode("utf-8")
+        )
+    }

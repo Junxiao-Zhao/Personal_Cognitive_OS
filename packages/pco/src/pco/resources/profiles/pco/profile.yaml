@@ -1,103 +1,53 @@
 name: pco
-version: 0.4.0
+version: 0.5.0
+application_commit_policy: pco_proposal
 streams:
-  messages:
-    path: raw/conversations/messages.jsonl
-    schema: schemas/conversation-message.schema.json
-    schema_version: conversation-message/v1
+  evidence:
+    path: evidence/evidence.jsonl
+    schema: schemas/evidence.schema.json
+    schema_version: pco/evidence/v1
     write_policy: auto
-    validation:
-      transaction_mode: delta_only
-      run_cross_validators: false
   sources:
-    path: sources/registry.jsonl
+    path: sources/sources.jsonl
     schema: schemas/source.schema.json
     schema_version: pco/source/v1
     write_policy: auto
-  search_receipts:
-    path: sources/search-receipts.jsonl
-    schema: schemas/search-receipt.schema.json
-    schema_version: pco/search-receipt/v1
-    write_policy: auto
   events:
-    path: structured/events.jsonl
+    path: events/events.jsonl
     schema: schemas/event.schema.json
     schema_version: pco/event/v1
     write_policy: auto
   psychologies:
-    path: structured/psychologies.jsonl
+    path: psychologies/psychologies.jsonl
     schema: schemas/concept.schema.json
     schema_version: pco/psychology/v1
     write_policy: auto
   philosophies:
-    path: structured/philosophies.jsonl
+    path: philosophies/philosophies.jsonl
     schema: schemas/concept.schema.json
     schema_version: pco/philosophy/v1
     write_policy: auto
   archetypes:
-    path: structured/archetypes.jsonl
+    path: archetypes/archetypes.jsonl
     schema: schemas/archetype.schema.json
     schema_version: pco/archetype/v1
     write_policy: auto
   hypotheses:
-    path: structured/hypotheses.jsonl
+    path: hypotheses/hypotheses.jsonl
     schema: schemas/hypothesis.schema.json
     schema_version: pco/hypothesis/v1
     write_policy: auto
   meta_revisions:
-    path: meta/revisions.jsonl
+    path: meta_revisions/meta_revisions.jsonl
     schema: schemas/meta-revision.schema.json
     schema_version: pco/meta-revision/v1
-    write_policy: user_approval
-    approval_ref_pointer: /payload/approval_ref
-  continuations:
-    path: checkpoints/continuations.jsonl
-    schema: schemas/continuation.schema.json
-    schema_version: pco/continuation/v1
     write_policy: auto
-  checkpoints:
-    path: checkpoints/checkpoints.jsonl
-    schema: schemas/checkpoint.schema.json
-    schema_version: pco/checkpoint/v1
+  session_handoffs:
+    path: session_handoffs/session_handoffs.jsonl
+    schema: schemas/session-handoff.schema.json
+    schema_version: pco/session-handoff/v1
     write_policy: auto
 artifact_roots:
-  - sources/snapshots
+  - source_blobs
 validators:
   - pco.validate
-capabilities:
-  retrieval:
-    search: pco.retrieval.search
-  index:
-    build: pco.index.build
-  backlinks:
-    build: pco.backlinks.build
-  context_renderer:
-    render: pco.context.render
-  projections:
-    affine: pco.projection.affine
-    markdown: pco.projection.markdown
-checkpoint:
-  auto_consolidate:
-    enabled: true
-    new_public_tokens: 32768
-  auto_compact:
-    enabled: true
-    context_ratio: 0.90
-conversation_archive:
-  reasoning:
-    archive_if_available: true
-    index: false
-    inject_on_recall: false
-    use_as_user_evidence: false
-continuation:
-  max_tokens: 1200
-retrieval:
-  rrf_k: 60
-  candidate_count: 200
-  candidate_overfetch_factor: 4
-  chunk_turns: 2
-  overlap_turns: 1
-  chunk_token_budget: 800
-  recency_half_life_days: 180
-projection:
-  target: affine

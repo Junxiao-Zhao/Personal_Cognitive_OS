@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pco.dev/schemas/proposal-manifest.schema.json",
+  "title": "PCO Proposal Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "$comment": "x-pco-disjoint-by declares cross-collection property sets that PCO requires to be disjoint; generic JSON Schema validators do not enforce this extension.",
+  "x-pco-disjoint-by": [
+    {
+      "left": {"collection": "files", "property": "path"},
+      "right": {
+        "collection": "input_material",
+        "property": "path",
+        "where": {"kind": "proposal_artifact"}
+      }
+    }
+  ],
+  "required": [
+    "review_id",
+    "base_commit",
+    "workspace_version",
+    "profile_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "default": "0.5.0",
+      "pattern": "^[vV]?(?:0+!)?0+\\.0*5(?:\\.0*[0-9]+)*(?:[-_.]?(?:[Pp][Oo][Ss][Tt]|[Rr][Ee][Vv]|[Rr])(?:[-_.]?0*[0-9]+)?|-0*[0-9]+)?(?:\\+[A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*)?(?![\\s\\S])",
+      "$comment": "The pattern covers compatible final/post PEP 440 v0.5 spellings without surrounding whitespace; runtime consumers enforce the authoritative range extension with packaging.SpecifierSet.",
+      "x-pco-supported-range": ">=0.5.0,<0.6.0"
+    },
+    "review_id": {
+      "type": "string",
+      "pattern": "^review_[A-Za-z0-9._-]+$"
+    },
+    "base_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "workspace_version": {"type": "string", "minLength": 1},
+    "profile_version": {"type": "string", "minLength": 1},
+    "input_material": {
+      "type": "array",
+      "default": [],
+      "uniqueItems": true,
+      "$comment": "uniqueItems handles exact duplicates. x-pco-unique-by additionally requires unique material_id values and unique path values among proposal artifacts; generic JSON Schema validators do not enforce this extension.",
+      "x-pco-unique-by": ["material_id", "path"],
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/local_file"},
+          {"$ref": "#/$defs/proposal_artifact"}
+        ]
+      }
+    },
+    "files": {
+      "type": "array",
+      "default": [],
+      "uniqueItems": true,
+      "$comment": "uniqueItems handles exact duplicates. x-pco-unique-by additionally requires unique path values; generic JSON Schema validators do not enforce this extension.",
+      "x-pco-unique-by": ["path"],
+      "items": {"$ref": "#/$defs/business_file"}
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": ["string", "null"],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "material_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "fidelity": {
+      "enum": ["full_source", "selected_excerpt"]
+    },
+    "business_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "operation"],
+      "properties": {
+        "path": {"$ref": "#/$defs/relative_path"},
+        "operation": {"enum": ["create", "revise", "retire"]}
+      }
+    },
+    "local_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["material_id", "kind", "locator", "fidelity"],
+      "properties": {
+        "material_id": {"$ref": "#/$defs/material_id"},
+        "kind": {"const": "local_file"},
+        "locator": {"type": "string", "pattern": "^[Ff][Ii][Ll][Ee]:"},
+        "expected_content_hash": {"$ref": "#/$defs/hash"},
+        "fidelity": {"const": "full_source"}
+      }
+    },
+    "proposal_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["material_id", "kind", "path", "fidelity"],
+      "properties": {
+        "material_id": {"$ref": "#/$defs/material_id"},
+        "kind": {"const": "proposal_artifact"},
+        "path": {
+          "allOf": [
+            {"$ref": "#/$defs/relative_path"},
+            {"pattern": "^inputs/.+"}
+          ]
+        },
+        "expected_content_hash": {"$ref": "#/$defs/hash"},
+        "fidelity": {"$ref": "#/$defs/fidelity"}
+      }
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\).+$"
+    }
+  }
+}

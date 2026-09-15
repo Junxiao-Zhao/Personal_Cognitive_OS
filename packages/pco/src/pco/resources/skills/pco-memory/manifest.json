@@ -1,0 +1,9 @@
+{
+  "files": {
+    "PERMISSIONS.md": "db77d1356d954d75cb7e020c7306ddd78851e63d41d0e7f7813369829bb4720c",
+    "SKILL.md": "05ab733c3c22e9aac99d79cc74190cab674c1d7bcd4ea61367cdc52057ec7f63"
+  },
+  "name": "pco-memory",
+  "requires_pco": ">=0.5.0,<0.6.0",
+  "skill_set_version": "0.5.0"
+}

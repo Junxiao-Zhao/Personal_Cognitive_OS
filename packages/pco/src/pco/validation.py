@@ -1,12 +1,41 @@
 from __future__ import annotations
 
+import re
+import json
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterable
-from urllib.parse import urlparse
+from typing import Any, Iterable, Mapping
 
-from mem_core.models import latest_by_id
-
-from .harness import normalize_external_url
+APPROVED_FIDELITIES = frozenset(
+    {"selected_excerpt", "full_user_provided_transcript", "registered_source_excerpt"}
+)
+CANONICAL_BUSINESS_STREAMS = frozenset(
+    {
+        "evidence",
+        "sources",
+        "events",
+        "psychologies",
+        "philosophies",
+        "archetypes",
+        "hypotheses",
+        "meta_revisions",
+        "session_handoffs",
+    }
+)
+PERSONAL_FACT_STREAMS = frozenset(
+    {"events", "archetypes", "hypotheses", "meta_revisions"}
+)
+CONCEPT_STREAMS = frozenset({"psychologies", "philosophies"})
+EVIDENCE_FIELDS: Mapping[str, tuple[str, ...]] = {
+    "events": ("evidence_refs",),
+    "psychologies": ("evidence_refs",),
+    "philosophies": ("evidence_refs",),
+    "archetypes": ("evidence_refs",),
+    "hypotheses": ("evidence_refs", "counter_evidence_refs"),
+    "meta_revisions": ("evidence_refs",),
+}
+EVENT_LINK_STREAMS = frozenset({"psychologies", "philosophies", "archetypes"})
+COMMIT_REF_PATTERN = re.compile(r"^commit_[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _problem(
@@ -14,7 +43,7 @@ def _problem(
     message: str,
     *,
     stream: str,
-    record_id: str,
+    record_id: Any,
     path: str,
     value: Any = None,
     recovery: list[str] | None = None,
@@ -27,177 +56,371 @@ def _problem(
         "record_id": record_id,
         "path": path,
         "value": value,
-        "retryable": True,
-        "recovery": recovery or [],
+        "canonical_changed": False,
+        "retry_safe": True,
+        "recovery": recovery
+        or ["Correct the record at the reported JSON Pointer and validate again"],
     }
+
+
+def _payload(record: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = record.get("payload")
+    return value if isinstance(value, Mapping) else {}
+
+
+def _record_key(record: Mapping[str, Any]) -> tuple[str, int, str]:
+    revision = record.get("revision")
+    return (
+        str(record.get("id")),
+        (
+            revision
+            if isinstance(revision, int) and not isinstance(revision, bool)
+            else -1
+        ),
+        json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
+    )
+
+
+def _history_by_revision(
+    items: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[int, list[Mapping[str, Any]]]]:
+    history: dict[str, dict[int, list[Mapping[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for record in sorted(items, key=_record_key):
+        record_id, revision = record.get("id"), record.get("revision")
+        if (
+            isinstance(record_id, str)
+            and isinstance(revision, int)
+            and not isinstance(revision, bool)
+        ):
+            history[record_id][revision].append(record)
+    return history
+
+
+def latest_effective(
+    items: Iterable[Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """Return latest current records, excluding IDs retired by a tombstone."""
+    latest: dict[str, Mapping[str, Any]] = {}
+    for record in sorted(items, key=_record_key):
+        record_id, revision = record.get("id"), record.get("revision")
+        if (
+            not isinstance(record_id, str)
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+        ):
+            continue
+        previous = latest.get(record_id)
+        if previous is None or revision > previous.get("revision", -1):
+            latest[record_id] = record
+    return {
+        record_id: record
+        for record_id, record in latest.items()
+        if _payload(record).get("status") != "tombstone"
+    }
+
+
+def validate_revision_chain(
+    stream: str,
+    record: Mapping[str, Any],
+    history: Mapping[str, Mapping[int, list[Mapping[str, Any]]]],
+) -> Iterable[dict[str, Any]]:
+    record_id, revision, payload = (
+        record.get("id"),
+        record.get("revision"),
+        _payload(record),
+    )
+    if (
+        not isinstance(record_id, str)
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        yield _problem(
+            "PROPOSAL_REVISION_CONFLICT",
+            "A canonical revision must have a positive integer revision number",
+            stream=stream,
+            record_id=record_id,
+            path="/revision",
+            value=revision,
+        )
+        return
+    revisions = history.get(record_id, {})
+    if len(revisions.get(revision, [])) != 1:
+        yield _problem(
+            "PROPOSAL_REVISION_CONFLICT",
+            "A record ID may have exactly one entry for each revision",
+            stream=stream,
+            record_id=record_id,
+            path="/revision",
+            value=revision,
+            recovery=[
+                "Append one complete next revision; do not duplicate a historical revision"
+            ],
+        )
+    expected_previous = None if revision == 1 else revision - 1
+    if payload.get("previous_revision") != expected_previous:
+        yield _problem(
+            "PROPOSAL_REVISION_CONFLICT",
+            f"Revision {revision} must declare previous_revision {expected_previous!r}",
+            stream=stream,
+            record_id=record_id,
+            path="/payload/previous_revision",
+            value=payload.get("previous_revision"),
+            recovery=[
+                "Set previous_revision to the immediately preceding canonical revision"
+            ],
+        )
+    if revision > 1 and len(revisions.get(revision - 1, [])) != 1:
+        yield _problem(
+            "PROPOSAL_REVISION_CONFLICT",
+            "A revision may only follow an existing immediately preceding revision",
+            stream=stream,
+            record_id=record_id,
+            path="/revision",
+            value=revision,
+            recovery=["Append the missing preceding revision before this record"],
+        )
+
+
+def validate_commit_ref(
+    stream: str, record: Mapping[str, Any]
+) -> Iterable[dict[str, Any]]:
+    commit_ref = record.get("commit_ref")
+    if (
+        not isinstance(commit_ref, str)
+        or COMMIT_REF_PATTERN.fullmatch(commit_ref) is None
+    ):
+        yield _problem(
+            "PROPOSAL_REFERENCE_INVALID",
+            "commit_ref must identify a proposal commit receipt",
+            stream=stream,
+            record_id=record.get("id"),
+            path="/commit_ref",
+            value=commit_ref,
+            recovery=[
+                "Use the generated commit_<receipt> reference from the proposal receipt"
+            ],
+        )
+
+
+def _reference_problem(
+    stream: str, record: Mapping[str, Any], path: str, value: Any, message: str
+) -> dict[str, Any]:
+    return _problem(
+        "PROPOSAL_REFERENCE_INVALID",
+        message,
+        stream=stream,
+        record_id=record.get("id"),
+        path=path,
+        value=value,
+        recovery=["Reference an existing current record or remove the reference"],
+    )
+
+
+def validate_references(
+    stream: str,
+    record: Mapping[str, Any],
+    current: Mapping[str, Mapping[str, Mapping[str, Any]]],
+) -> Iterable[dict[str, Any]]:
+    payload = _payload(record)
+    for field in EVIDENCE_FIELDS.get(stream, ()):
+        refs = payload.get(field, [])
+        if not isinstance(refs, list):
+            continue
+        for index, reference in enumerate(refs):
+            prefix, separator, evidence_id = (
+                reference.partition(":") if isinstance(reference, str) else ("", "", "")
+            )
+            if (
+                prefix != "evidence"
+                or not separator
+                or evidence_id not in current.get("evidence", {})
+            ):
+                yield _reference_problem(
+                    stream,
+                    record,
+                    f"/payload/{field}/{index}",
+                    reference,
+                    "Evidence references must identify a current evidence record",
+                )
+    if stream == "events":
+        links = payload.get("links", {})
+        if isinstance(links, Mapping):
+            for target_stream in sorted(links):
+                target_ids = links[target_stream]
+                if target_stream not in EVENT_LINK_STREAMS:
+                    yield _reference_problem(
+                        stream,
+                        record,
+                        f"/payload/links/{target_stream}",
+                        target_ids,
+                        "Event links may only target canonical concept or archetype streams",
+                    )
+                    continue
+                if not isinstance(target_ids, list):
+                    yield _reference_problem(
+                        stream,
+                        record,
+                        f"/payload/links/{target_stream}",
+                        target_ids,
+                        "Event link targets must be an array of current record IDs",
+                    )
+                    continue
+                for index, target_id in enumerate(target_ids):
+                    if target_id not in current.get(target_stream, {}):
+                        yield _reference_problem(
+                            stream,
+                            record,
+                            f"/payload/links/{target_stream}/{index}",
+                            target_id,
+                            f"Event links must identify current {target_stream} records",
+                        )
+    if stream == "meta_revisions":
+        promotion_refs = payload.get("promotion_refs", [])
+        if isinstance(promotion_refs, list):
+            for index, reference in enumerate(promotion_refs):
+                prefix, separator, hypothesis_id = (
+                    reference.partition(":")
+                    if isinstance(reference, str)
+                    else ("", "", "")
+                )
+                if (
+                    prefix != "hypothesis"
+                    or not separator
+                    or hypothesis_id not in current.get("hypotheses", {})
+                ):
+                    yield _reference_problem(
+                        stream,
+                        record,
+                        f"/payload/promotion_refs/{index}",
+                        reference,
+                        "Promotion references must identify a current hypothesis record",
+                    )
+
+
+def _evidence_supports(stream: str, evidence: Mapping[str, Any]) -> bool:
+    payload = _payload(evidence)
+    source_kind, speaker = payload.get("source_kind"), payload.get("speaker")
+    if speaker == "assistant":
+        return False
+    user_authored = payload.get("user_authored") is True
+    user_conversation = (
+        source_kind == "conversation" and speaker == "user" and user_authored
+    )
+    user_registered_material = (
+        source_kind == "registered" and user_authored and speaker != "assistant"
+    )
+    if stream in PERSONAL_FACT_STREAMS:
+        return user_conversation or user_registered_material
+    if stream in CONCEPT_STREAMS:
+        return (
+            source_kind == "external"
+            or user_conversation
+            or source_kind == "registered"
+        )
+    return True
+
+
+def validate_evidence_eligibility(
+    stream: str,
+    record: Mapping[str, Any],
+    evidence_current: Mapping[str, Mapping[str, Any]],
+) -> Iterable[dict[str, Any]]:
+    payload = _payload(record)
+    if stream in {"evidence", "sources"}:
+        fidelity = payload.get("fidelity")
+        if fidelity not in APPROVED_FIDELITIES:
+            yield _problem(
+                "EVIDENCE_FIDELITY_INVALID",
+                "Evidence fidelity must use one approved v0.5 value",
+                stream=stream,
+                record_id=record.get("id"),
+                path="/payload/fidelity",
+                value=fidelity,
+                recovery=[
+                    "Use selected_excerpt, full_user_provided_transcript, or registered_source_excerpt"
+                ],
+            )
+        elif (
+            fidelity == "full_user_provided_transcript"
+            and payload.get("user_authored") is not True
+        ):
+            yield _problem(
+                "EVIDENCE_FIDELITY_INVALID",
+                "Only explicitly user-authored material may claim full transcript fidelity",
+                stream=stream,
+                record_id=record.get("id"),
+                path="/payload/user_authored",
+                value=payload.get("user_authored"),
+                recovery=[
+                    "Use excerpt fidelity or mark only actually user-authored transcript material"
+                ],
+            )
+        return
+    for field in EVIDENCE_FIELDS.get(stream, ()):
+        refs = payload.get(field, [])
+        if not isinstance(refs, list):
+            continue
+        for index, reference in enumerate(refs):
+            if not isinstance(reference, str) or not reference.startswith("evidence:"):
+                continue
+            evidence = evidence_current.get(reference.removeprefix("evidence:"))
+            if evidence is not None and not _evidence_supports(stream, evidence):
+                yield _problem(
+                    "EVIDENCE_INELIGIBLE",
+                    "This evidence cannot independently support the target record under the v0.5 epistemic policy",
+                    stream=stream,
+                    record_id=record.get("id"),
+                    path=f"/payload/{field}/{index}",
+                    value=reference,
+                    recovery=[
+                        "Cite explicitly user-authored personal evidence or use external evidence only for psychology/philosophy concepts"
+                    ],
+                )
 
 
 def validate_profile(
-    _repo_root: Path,
-    records: dict[str, list[dict[str, Any]]],
+    _repo_root: Path, records: dict[str, list[dict[str, Any]]]
 ) -> Iterable[dict[str, Any]]:
-    current = {stream: latest_by_id(items) for stream, items in records.items()}
-    messages = current.get("messages", {})
-    sources = current.get("sources", {})
-    search_receipts = current.get("search_receipts", {})
-    link_targets = {
-        "psychologies": current.get("psychologies", {}),
-        "philosophies": current.get("philosophies", {}),
-        "archetypes": current.get("archetypes", {}),
-    }
-    structured_evidence = {
-        stream: current.get(stream, {})
-        for stream in ("events", "psychologies", "philosophies", "archetypes", "hypotheses")
-    }
-    evidence_prefixes = {
-        "event": "events",
-        "events": "events",
-        "psychology": "psychologies",
-        "psychologies": "psychologies",
-        "philosophy": "philosophies",
-        "philosophies": "philosophies",
-        "archetype": "archetypes",
-        "archetypes": "archetypes",
-        "hypothesis": "hypotheses",
-        "hypotheses": "hypotheses",
-    }
-
-    for concept_stream in ("psychologies", "philosophies"):
-        for record in records.get(concept_stream, []):
-            refs = record["payload"].get("external_refs", [])
-            if not refs:
-                yield _problem(
-                    "EXTERNAL_REFERENCE_REQUIRED",
-                    "Psychology and philosophy concepts require an external reference",
-                    stream=concept_stream,
-                    record_id=record["id"],
-                    path="/payload/external_refs",
-                    recovery=["Search a reliable external source and save its search receipt"],
-                )
-            for index, ref in enumerate(refs):
-                parsed = urlparse(ref.get("url", ""))
-                receipt_id = ref.get("search_receipt")
-                receipt = search_receipts.get(receipt_id) if isinstance(receipt_id, str) else None
-                receipt_payload = receipt.get("payload", {}) if receipt else {}
-                result_urls = receipt_payload.get("result_urls") if isinstance(receipt_payload, dict) else None
-                normalized_result_urls = {
-                    normalized
-                    for item in result_urls or []
-                    if (normalized := normalize_external_url(item))
-                } if isinstance(result_urls, list) else set()
-                normalized_ref = normalize_external_url(ref.get("url", ""))
-                if (
-                    parsed.scheme not in {"http", "https"}
-                    or not parsed.netloc
-                    or receipt is None
-                    or receipt_payload.get("status") != "completed"
-                    or normalized_ref is None
-                    or normalized_ref not in normalized_result_urls
-                ):
-                    yield _problem(
-                        "EXTERNAL_REFERENCE_INVALID",
-                        "External references require an HTTP(S) URL bound to a completed wrapper-captured search receipt",
-                        stream=concept_stream,
-                        record_id=record["id"],
-                        path=f"/payload/external_refs/{index}",
-                        value=ref,
-                    )
-
-    for record in records.get("events", []):
-        for target_stream, ids in record["payload"].get("links", {}).items():
-            for index, target_id in enumerate(ids):
-                if target_id not in link_targets.get(target_stream, {}):
-                    yield _problem(
-                        "REFERENCE_NOT_FOUND",
-                        f"Referenced {target_stream} record does not exist: {target_id}",
-                        stream="events",
-                        record_id=record["id"],
-                        path=f"/payload/links/{target_stream}/{index}",
-                        value=target_id,
-                        recovery=[f"Create {target_id}", "Remove the reference", "Replace it with an existing ID"],
-                    )
-
-    evidence_streams = ("events", "archetypes", "hypotheses", "meta_revisions")
-    for stream in evidence_streams:
-        for record in records.get(stream, []):
-            fields = ["evidence_refs"]
-            if stream == "hypotheses":
-                fields.append("counter_evidence_refs")
-            for field in fields:
-                for index, ref in enumerate(record["payload"].get(field, [])):
-                    if ref.startswith("message:"):
-                        message_id = ref.split(":", 1)[1]
-                        message = messages.get(message_id)
-                        if message is None:
-                            yield _problem(
-                                "EVIDENCE_NOT_FOUND",
-                                f"Message evidence does not exist: {message_id}",
-                                stream=stream,
-                                record_id=record["id"],
-                                path=f"/payload/{field}/{index}",
-                                value=ref,
-                            )
-                        elif message["payload"]["role"] != "user":
-                            yield _problem(
-                                "EVIDENCE_INELIGIBLE",
-                                "Assistant messages cannot serve as direct user evidence",
-                                stream=stream,
-                                record_id=record["id"],
-                                path=f"/payload/{field}/{index}",
-                                value=ref,
-                                recovery=["Cite a user message, event, or registered source instead"],
-                            )
-                    elif ref.startswith("source:"):
-                        source_locator = ref.split(":", 1)[1]
-                        source_id = source_locator.split("#", 1)[0]
-                        if source_id not in sources:
-                            yield _problem(
-                                "EVIDENCE_NOT_FOUND",
-                                f"Source evidence does not exist: {source_id}",
-                                stream=stream,
-                                record_id=record["id"],
-                                path=f"/payload/{field}/{index}",
-                                value=ref,
-                            )
-                    else:
-                        prefix, separator, candidate_id = ref.partition(":")
-                        if separator:
-                            target_stream = evidence_prefixes.get(prefix)
-                            matches = [target_stream] if target_stream and candidate_id in structured_evidence[target_stream] else []
-                        else:
-                            candidate_id = ref
-                            matches = [name for name, items in structured_evidence.items() if candidate_id in items]
-                        if len(matches) != 1:
-                            code = "EVIDENCE_REFERENCE_INVALID" if not matches else "EVIDENCE_REFERENCE_AMBIGUOUS"
-                            yield _problem(
-                                code,
-                                f"Structured evidence reference must resolve to exactly one record: {ref}",
-                                stream=stream,
-                                record_id=record["id"],
-                                path=f"/payload/{field}/{index}",
-                                value=ref,
-                                recovery=["Use an existing entity ID or a supported qualified reference"],
-                            )
-
-    for record in records.get("meta_revisions", []):
-        previous = record["payload"].get("previous_revision")
-        expected = None if record["revision"] == 1 else f"meta_current@{record['revision'] - 1}"
-        if previous != expected:
+    """Yield deterministic v0.5 cross-record problems without raising domain exceptions."""
+    for stream in sorted(records):
+        if stream not in CANONICAL_BUSINESS_STREAMS:
             yield _problem(
-                "META_PREVIOUS_REVISION_INVALID",
-                f"Expected previous_revision {expected!r}",
-                stream="meta_revisions",
-                record_id=record["id"],
-                path="/payload/previous_revision",
-                value=previous,
+                "STREAM_NOT_FOUND",
+                "Record input contains a non-canonical business stream",
+                stream=stream,
+                record_id=None,
+                path=f"/{stream}",
+                value=records[stream],
+                recovery=[
+                    "Remove the legacy/internal stream from the Profile validator input"
+                ],
             )
-        for index, hypothesis_id in enumerate(record["payload"].get("promotion_refs", [])):
-            if hypothesis_id not in current.get("hypotheses", {}):
-                yield _problem(
-                    "REFERENCE_NOT_FOUND",
-                    f"Promotion hypothesis does not exist: {hypothesis_id}",
-                    stream="meta_revisions",
-                    record_id=record["id"],
-                    path=f"/payload/promotion_refs/{index}",
-                    value=hypothesis_id,
+    normalized = {
+        stream: [
+            record for record in records.get(stream, []) if isinstance(record, Mapping)
+        ]
+        for stream in CANONICAL_BUSINESS_STREAMS
+        if isinstance(records.get(stream, []), list)
+    }
+    current = {stream: latest_effective(items) for stream, items in normalized.items()}
+    histories = {
+        stream: _history_by_revision(items) for stream, items in normalized.items()
+    }
+    for stream in sorted(normalized):
+        for record in sorted(normalized[stream], key=_record_key):
+            yield from validate_revision_chain(stream, record, histories[stream])
+            yield from validate_commit_ref(stream, record)
+            if current.get(stream, {}).get(record.get("id")) is record:
+                yield from validate_references(stream, record, current)
+                yield from validate_evidence_eligibility(
+                    stream, record, current.get("evidence", {})
                 )

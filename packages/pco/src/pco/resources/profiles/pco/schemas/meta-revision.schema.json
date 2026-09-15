@@ -1,31 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object", "additionalProperties": false,
-  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "required": ["id", "revision", "recorded_at", "schema_version", "commit_ref", "payload"],
   "properties": {
-    "id": {"const": "meta_current"}, "revision": {"type": "integer", "minimum": 1}, "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/meta-revision/v1"},
+    "id": {"const": "meta_current"}, "revision": {"type": "integer", "minimum": 1}, "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/meta-revision/v1"}, "commit_ref": {"type": "string", "minLength": 1},
     "payload": {
       "type": "object", "additionalProperties": false,
-      "required": ["previous_revision", "sections", "change_summary", "evidence_refs", "promotion_refs", "approval_ref", "policy_version", "status"],
+      "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}],
+      "required": ["previous_revision", "change_summary", "body_markdown", "evidence_refs", "promotion_refs", "status"],
       "properties": {
-        "previous_revision": {"type": ["string", "null"]},
-        "sections": {
-          "type": "object", "additionalProperties": false,
-          "required": ["deep_impressions", "stable_preferences_and_values", "active_patterns", "important_tensions", "recent_changes", "open_questions", "boundaries"],
-          "properties": {
-            "deep_impressions": {"type": "array", "items": {"type": "string"}},
-            "stable_preferences_and_values": {"type": "array", "items": {"type": "string"}},
-            "active_patterns": {"type": "array", "items": {"type": "string"}},
-            "important_tensions": {"type": "array", "items": {"type": "string"}},
-            "recent_changes": {"type": "array", "items": {"type": "string"}},
-            "open_questions": {"type": "array", "items": {"type": "string"}},
-            "boundaries": {"type": "array", "items": {"type": "string"}}
-          }
-        },
-        "change_summary": {"type": "string", "minLength": 1}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true},
-        "promotion_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}, "approval_ref": {"type": "string", "minLength": 1},
-        "policy_version": {"type": "string", "minLength": 1}, "status": {"const": "active"}
+        "previous_revision": {"type": ["integer", "null"], "minimum": 1},
+        "change_summary": {"type": "string", "minLength": 1}, "body_markdown": {"type": "string", "minLength": 1},
+        "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}, "uniqueItems": true},
+        "promotion_refs": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}, "status": {"enum": ["active", "superseded", "tombstone"]}
       }
     }
-  }
+  },
+  "allOf": [{
+    "if": {"properties": {"revision": {"minimum": 2}}, "required": ["revision"]},
+    "then": {"properties": {"payload": {"properties": {"previous_revision": {"type": "integer", "minimum": 1}}}}}
+  }]
 }

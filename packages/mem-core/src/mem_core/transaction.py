@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
+import stat
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
+from .application import (
+    application_transaction_id,
+    ensure_duplicate_matches_request,
+)
 from .approval import verify_approval_receipt
-from .delta import is_fast_path, latest_base_by_id, show_bytes, validate_delta_records, validate_structured_delta
+from .delta import (
+    is_fast_path,
+    latest_base_by_id,
+    show_bytes,
+    validate_delta_records,
+    validate_structured_delta,
+)
 from .errors import MemError, ensure
 from .models import (
+    ApplicationCommitRequest,
     ApprovalReceipt,
     Operation,
     TransactionState,
@@ -26,9 +41,10 @@ class TransactionManager:
 
     def __init__(self, repository: MemoryRepository, state_root: Path) -> None:
         self.repository = repository
-        self.state_root = state_root.resolve()
+        # Keep the caller-visible lexical path so later no-follow ownership
+        # checks cannot be bypassed by resolving an attacker-provided symlink.
+        self.state_root = state_root.absolute()
         self.transactions_root = self.state_root / "transactions"
-        self.transactions_root.mkdir(parents=True, exist_ok=True)
 
     def _dir(self, transaction_id: str) -> Path:
         ensure(
@@ -37,6 +53,8 @@ class TransactionManager:
             "transaction",
             "Unsafe transaction ID",
             value=transaction_id,
+            canonical_changed=False,
+            retry_safe=False,
         )
         return self.transactions_root / transaction_id
 
@@ -56,11 +74,27 @@ class TransactionManager:
 
     def load(self, transaction_id: str) -> TransactionState:
         path = self._state_path(transaction_id)
-        ensure(path.is_file(), "TRANSACTION_NOT_FOUND", "transaction", f"Unknown transaction: {transaction_id}")
+        ensure(
+            path.is_file(),
+            "TRANSACTION_NOT_FOUND",
+            "transaction",
+            f"Unknown transaction: {transaction_id}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         try:
-            return TransactionState.model_validate_json(path.read_text(encoding="utf-8"))
+            return TransactionState.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
         except Exception as exc:
-            raise MemError("TRANSACTION_STATE_INVALID", "transaction", str(exc), path=str(path)) from exc
+            raise MemError(
+                "TRANSACTION_STATE_INVALID",
+                "transaction",
+                str(exc),
+                path=str(path),
+                canonical_changed=False,
+                retry_safe=False,
+            ) from exc
 
     def begin(
         self,
@@ -68,9 +102,35 @@ class TransactionManager:
         fingerprint_context: dict[str, Any],
         transaction_id: str | None = None,
     ) -> TransactionState:
+        ensure(
+            self.repository.profile.config.application_commit_policy == "public",
+            "DIRECT_PCO_STREAM_WRITE_FORBIDDEN",
+            "write_policy",
+            "PCO business streams can only be written through pco proposal commit",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        return self._begin_public(
+            fingerprint_context=fingerprint_context,
+            transaction_id=transaction_id,
+        )
+
+    def _begin_public(
+        self,
+        *,
+        fingerprint_context: dict[str, Any],
+        transaction_id: str | None = None,
+    ) -> TransactionState:
         self.repository.assert_clean()
         transaction_id = transaction_id or f"txn_{uuid.uuid4().hex}"
-        ensure(not self._state_path(transaction_id).exists(), "TRANSACTION_EXISTS", "transaction", f"Transaction already exists: {transaction_id}")
+        ensure(
+            not self._state_path(transaction_id).exists(),
+            "TRANSACTION_EXISTS",
+            "transaction",
+            f"Transaction already exists: {transaction_id}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         operations: list[Operation] = []
         base_commit = self.repository.head()
         state = TransactionState(
@@ -92,15 +152,43 @@ class TransactionManager:
         self._save(state)
         return state
 
-    def append(self, transaction_id: str, operation: Operation | dict[str, Any]) -> TransactionState:
+    def append(
+        self, transaction_id: str, operation: Operation | dict[str, Any]
+    ) -> TransactionState:
         state = self.load(transaction_id)
-        ensure(state.status in {"open", "validated"}, "TRANSACTION_CLOSED", "transaction", f"Transaction is {state.status}")
-        op = operation if isinstance(operation, Operation) else Operation.model_validate(operation)
+        ensure(
+            state.status in {"open", "validated"},
+            "TRANSACTION_CLOSED",
+            "transaction",
+            f"Transaction is {state.status}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        op = (
+            operation
+            if isinstance(operation, Operation)
+            else Operation.model_validate(operation)
+        )
         if op.op == "append":
-            ensure(op.record is not None, "RECORD_REQUIRED", "transaction", "append requires record", stream=op.stream)
+            ensure(
+                op.record is not None,
+                "RECORD_REQUIRED",
+                "transaction",
+                "append requires record",
+                stream=op.stream,
+                canonical_changed=False,
+                retry_safe=False,
+            )
             self.repository.profile.stream(op.stream or "")
         else:
-            ensure(op.path is not None and op.content is not None, "ARTIFACT_REQUIRED", "transaction", "write_artifact requires path and content")
+            ensure(
+                op.path is not None and op.content is not None,
+                "ARTIFACT_REQUIRED",
+                "transaction",
+                "write_artifact requires path and content",
+                canonical_changed=False,
+                retry_safe=False,
+            )
             self.repository.profile.artifact_path(self.repository.root, op.path)
         state.operations.append(op)
         state.status = "open"
@@ -128,6 +216,8 @@ class TransactionManager:
                     "write_policy",
                     f"Stream cannot be written: {operation.stream}",
                     stream=operation.stream,
+                    canonical_changed=False,
+                    retry_safe=False,
                 )
             if policy == "user_approval":
                 result.add(operation.stream)
@@ -147,14 +237,26 @@ class TransactionManager:
     ) -> ApprovalReceipt:
         state = self.load(transaction_id)
         protected = self.protected_streams(state)
-        ensure(protected, "APPROVAL_NOT_REQUIRED", "write_policy", "Transaction has no protected operations")
-        reviewed_proposal_hash = str(state.fingerprint_context.get("reviewed_proposal_hash") or state.proposal_hash)
+        ensure(
+            protected,
+            "APPROVAL_NOT_REQUIRED",
+            "write_policy",
+            "Transaction has no protected operations",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        reviewed_proposal_hash = str(
+            state.fingerprint_context.get("reviewed_proposal_hash")
+            or state.proposal_hash
+        )
         ensure(
             proposal_hash_value == reviewed_proposal_hash,
             "PROPOSAL_HASH_MISMATCH",
             "write_policy",
             "Approval does not match the proposal under review",
             value=proposal_hash_value,
+            canonical_changed=False,
+            retry_safe=False,
         )
         receipt = ApprovalReceipt(
             id=receipt_id or f"approval_{uuid.uuid4().hex}",
@@ -163,7 +265,9 @@ class TransactionManager:
             proposal_hash=reviewed_proposal_hash,
             transaction_proposal_hash=state.proposal_hash,
             transaction_fingerprint=state.transaction_fingerprint,
-            protected_operations_hash=protected_operations_hash(state.operations, protected),
+            protected_operations_hash=protected_operations_hash(
+                state.operations, protected
+            ),
             decided_at=utc_now(),
             decision_message_id=decision_message_id,
             authorization_id=authorization_id,
@@ -177,7 +281,10 @@ class TransactionManager:
     def _verify_approval(self, state: TransactionState, protected: set[str]) -> None:
         if not protected:
             return
-        reviewed_proposal_hash = str(state.fingerprint_context.get("reviewed_proposal_hash") or state.proposal_hash)
+        reviewed_proposal_hash = str(
+            state.fingerprint_context.get("reviewed_proposal_hash")
+            or state.proposal_hash
+        )
         verify_approval_receipt(
             receipt=state.approval_receipt,
             operations=state.operations,
@@ -192,27 +299,49 @@ class TransactionManager:
         worktree = self._worktree_path(state.id)
         self.repository.remove_worktree(worktree)
         self.repository.add_worktree(worktree, state.base_commit)
-        for operation in state.operations:
+        self._apply_operations(worktree, state.operations)
+        return worktree
+
+    def _apply_operations(self, worktree: Path, operations: list[Operation]) -> None:
+        for operation in operations:
             if operation.op == "append":
                 assert operation.stream is not None and operation.record is not None
-                self.repository.append_record(worktree, operation.stream, operation.record)
+                self.repository.append_record(
+                    worktree, operation.stream, operation.record
+                )
             else:
                 assert operation.path is not None and operation.content is not None
                 target = self.repository.profile.artifact_path(worktree, operation.path)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(operation.content, encoding="utf-8")
-        return worktree
 
-    def validate(self, transaction_id: str, *, require_approval: bool = False) -> dict[str, Any]:
+    def validate(
+        self, transaction_id: str, *, require_approval: bool = False
+    ) -> dict[str, Any]:
         state = self.load(transaction_id)
-        ensure(state.status in {"open", "validated"}, "TRANSACTION_CLOSED", "transaction_validation", f"Transaction is {state.status}")
-        ensure(state.operations, "TRANSACTION_EMPTY", "transaction_validation", "Transaction has no operations")
+        ensure(
+            state.status in {"open", "validated"},
+            "TRANSACTION_CLOSED",
+            "transaction_validation",
+            f"Transaction is {state.status}",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        ensure(
+            state.operations,
+            "TRANSACTION_EMPTY",
+            "transaction_validation",
+            "Transaction has no operations",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         ensure(
             self.repository.head() == state.base_commit,
             "BASE_COMMIT_CHANGED",
             "transaction_validation",
             "Canonical memory advanced after transaction began",
-            retryable=True,
+            canonical_changed=False,
+            retry_safe=False,
             recovery=["Begin a new transaction on the current canonical commit"],
         )
         protected = self.protected_streams(state)
@@ -227,15 +356,24 @@ class TransactionManager:
             current: dict[str, dict[str, dict[str, Any]]] = {}
             for stream_name in delta:
                 stream_path = profile.stream(stream_name).path
-                base_bytes = show_bytes(self.repository.root, state.base_commit, stream_path)
-                stream_current, baseline_reliable = latest_base_by_id(base_bytes.decode("utf-8").splitlines())
+                base_bytes = show_bytes(
+                    self.repository.root, state.base_commit, stream_path
+                )
+                stream_current, baseline_reliable = latest_base_by_id(
+                    base_bytes.decode("utf-8").splitlines()
+                )
                 # 基线不可靠（历史含损坏行）时跳过该 stream 的 revision
                 # 连续性断言，避免误拒合法 delta（D6）。
                 if baseline_reliable:
                     current[stream_name] = stream_current
             count = validate_delta_records(profile, delta, current)
-            validation = {"ok": True, "profile": f"{profile.name}@{profile.version}", "mode": "incremental",
-                          "records": count, "delta": {name: len(records) for name, records in delta.items()}}
+            validation = {
+                "ok": True,
+                "profile": f"{profile.name}@{profile.version}",
+                "mode": "incremental",
+                "records": count,
+                "delta": {name: len(records) for name, records in delta.items()},
+            }
         else:
             worktree = self._prepare_worktree(state)
             # 严格 envelope 基线 + delta schema/revision + base+delta 合并 validator 视图。
@@ -250,8 +388,13 @@ class TransactionManager:
                 delta=delta,
                 root=worktree,
             )
-            validation = {"ok": True, "profile": f"{profile.name}@{profile.version}", "mode": "incremental",
-                          "records": count, "delta": {name: len(records) for name, records in delta.items()}}
+            validation = {
+                "ok": True,
+                "profile": f"{profile.name}@{profile.version}",
+                "mode": "incremental",
+                "records": count,
+                "delta": {name: len(records) for name, records in delta.items()},
+            }
         state.status = "validated"
         state.validation = {
             **validation,
@@ -265,10 +408,13 @@ class TransactionManager:
         return state.validation
 
     def _find_committed_fingerprint(self, fingerprint: str) -> dict[str, Any] | None:
-        path = self.repository.root / "transactions" / "transactions.jsonl"
-        if not path.exists():
-            return None
-        for line in path.read_text(encoding="utf-8").splitlines():
+        head = self.repository.head()
+        raw = show_bytes(
+            self.repository.root,
+            head,
+            "transactions/transactions.jsonl",
+        ).decode("utf-8")
+        for line in raw.splitlines():
             if not line.strip():
                 continue
             record = json.loads(line)
@@ -285,6 +431,752 @@ class TransactionManager:
                 return record
         return None
 
+    def _application_attempt_dir(self, transaction_digest: str) -> Path:
+        return (
+            self.state_root
+            / "application-worktrees"
+            / application_transaction_id(transaction_digest)
+        )
+
+    def _application_worktree_path(self, transaction_digest: str) -> Path:
+        return self._application_attempt_dir(transaction_digest) / "worktree"
+
+    @staticmethod
+    def _cleanup_identity(info: os.stat_result) -> tuple[int, int, int]:
+        return (stat.S_IFMT(info.st_mode), info.st_dev, info.st_ino)
+
+    @staticmethod
+    def _cleanup_open_directory(
+        parent_fd: int, name: str, display: Path
+    ) -> tuple[int, tuple[int, int, int]]:
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(observed.st_mode):
+            raise OSError(
+                errno.ENOTDIR,
+                "owned cleanup component is not a directory",
+                str(display),
+            )
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        anchored = os.fstat(descriptor)
+        identity = TransactionManager._cleanup_identity(anchored)
+        if TransactionManager._cleanup_identity(observed) != identity:
+            os.close(descriptor)
+            raise OSError(
+                errno.ESTALE,
+                "owned cleanup component changed while opening",
+                str(display),
+            )
+        return descriptor, identity
+
+    @staticmethod
+    def _cleanup_recheck(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, int, int],
+        display: Path,
+    ) -> None:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if TransactionManager._cleanup_identity(current) != expected:
+            raise OSError(
+                errno.ESTALE, "owned cleanup component was replaced", str(display)
+            )
+
+    def _registered_worktree_paths(self) -> tuple[Path, ...]:
+        raw = self.repository._git("worktree", "list", "--porcelain")
+        paths: list[Path] = []
+        for line in raw.splitlines():
+            if line.startswith("worktree "):
+                value = line.removeprefix("worktree ")
+                if not value or value.startswith('"'):
+                    raise ValueError("Git returned an ambiguous worktree path")
+                paths.append(Path(value).absolute())
+        if len(paths) != len(set(paths)):
+            raise ValueError("Git returned duplicate worktree registrations")
+        return tuple(paths)
+
+    @classmethod
+    def _cleanup_read_regular(cls, parent_fd: int, name: str, display: Path) -> bytes:
+        def file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+            return (
+                stat.S_IFMT(info.st_mode),
+                info.st_dev,
+                info.st_ino,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(observed.st_mode):
+            raise OSError(
+                errno.EPERM, "registration metadata is not a regular file", str(display)
+            )
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            anchored = os.fstat(descriptor)
+            if file_identity(observed)[:3] != file_identity(anchored)[:3]:
+                raise OSError(
+                    errno.ESTALE,
+                    "registration metadata changed while opening",
+                    str(display),
+                )
+            data = bytearray()
+            while True:
+                chunk = os.read(descriptor, 4096)
+                if not chunk:
+                    break
+                if len(data) + len(chunk) > 65536:
+                    raise OSError(
+                        errno.EFBIG,
+                        "registration metadata is unexpectedly large",
+                        str(display),
+                    )
+                data.extend(chunk)
+            if file_identity(os.fstat(descriptor)) != file_identity(anchored):
+                raise OSError(
+                    errno.ESTALE,
+                    "registration metadata changed while reading",
+                    str(display),
+                )
+            return bytes(data)
+        finally:
+            os.close(descriptor)
+
+    def _remove_exact_worktree_registration(self, expected: Path) -> None:
+        """Remove only the linked-worktree admin record bound to ``expected``."""
+
+        if expected not in self._registered_worktree_paths():
+            return
+        common_raw = self.repository._git("rev-parse", "--git-common-dir")
+        common = Path(common_raw)
+        if not common.is_absolute():
+            common = self.repository.root / common
+        common_fd: int | None = None
+        worktrees_fd: int | None = None
+        selected_fd: int | None = None
+        parent_fd: int | None = None
+        try:
+            parent_fd = os.open(
+                common.parent,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            common_fd, _ = self._cleanup_open_directory(parent_fd, common.name, common)
+            worktrees_fd, _ = self._cleanup_open_directory(
+                common_fd, "worktrees", common / "worktrees"
+            )
+            with os.scandir(worktrees_fd) as entries:
+                candidates = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+            matches: list[tuple[str, tuple[int, int, int]]] = []
+            for candidate in candidates:
+                info = candidate.stat(follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise OSError(errno.EPERM, "Git worktree admin entry is unsafe")
+                candidate_fd, candidate_identity = self._cleanup_open_directory(
+                    worktrees_fd, candidate.name, common / "worktrees" / candidate.name
+                )
+                try:
+                    raw = self._cleanup_read_regular(
+                        candidate_fd,
+                        "gitdir",
+                        common / "worktrees" / candidate.name / "gitdir",
+                    )
+                    value = raw.decode("utf-8").rstrip("\r\n")
+                    gitfile = Path(value)
+                    if not gitfile.is_absolute() or gitfile.name != ".git":
+                        raise OSError(
+                            errno.EINVAL, "Git worktree admin path is ambiguous"
+                        )
+                    if gitfile.parent.absolute() == expected:
+                        matches.append((candidate.name, candidate_identity))
+                finally:
+                    os.close(candidate_fd)
+            if len(matches) != 1:
+                raise OSError(
+                    errno.ESTALE,
+                    "exact Git worktree registration is missing or ambiguous",
+                )
+            selected_name, selected_identity = matches[0]
+            selected_fd, anchored_identity = self._cleanup_open_directory(
+                worktrees_fd,
+                selected_name,
+                common / "worktrees" / selected_name,
+            )
+            if anchored_identity != selected_identity:
+                raise OSError(
+                    errno.ESTALE, "Git worktree registration changed before removal"
+                )
+            self._cleanup_owned_tree(selected_fd, common / "worktrees" / selected_name)
+            self._cleanup_recheck(
+                worktrees_fd,
+                selected_name,
+                selected_identity,
+                common / "worktrees" / selected_name,
+            )
+            os.rmdir(selected_name, dir_fd=worktrees_fd)
+        finally:
+            for descriptor in (selected_fd, worktrees_fd, common_fd, parent_fd):
+                if descriptor is not None:
+                    os.close(descriptor)
+        if expected in self._registered_worktree_paths():
+            raise OSError(
+                errno.EBUSY, "Git worktree registration remains after scoped cleanup"
+            )
+
+    @staticmethod
+    def _cleanup_rename_noreplace(
+        parent_fd: int,
+        source: str,
+        target: str,
+        expected: tuple[int, int, int],
+    ) -> None:
+        """Atomically detach one identity-bound child without replacing a name."""
+
+        current = os.stat(source, dir_fd=parent_fd, follow_symlinks=False)
+        if TransactionManager._cleanup_identity(current) != expected:
+            raise OSError(errno.ESTALE, "application attempt changed before detach")
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable")
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        if (
+            renameat2(
+                parent_fd,
+                os.fsencode(source),
+                parent_fd,
+                os.fsencode(target),
+                1,  # RENAME_NOREPLACE
+            )
+            != 0
+        ):
+            code = ctypes.get_errno()
+            raise OSError(code, os.strerror(code), target)
+
+    @classmethod
+    def _cleanup_owned_tree(cls, directory_fd: int, display: Path) -> None:
+        """Remove only no-follow entries below an already-owned directory inode."""
+
+        with os.scandir(directory_fd) as entries:
+            children = sorted(entries, key=lambda entry: os.fsencode(entry.name))
+        for child in children:
+            child_display = display / child.name
+            observed = child.stat(follow_symlinks=False)
+            identity = cls._cleanup_identity(observed)
+            if stat.S_ISDIR(observed.st_mode):
+                child_fd, anchored = cls._cleanup_open_directory(
+                    directory_fd, child.name, child_display
+                )
+                try:
+                    cls._cleanup_owned_tree(child_fd, child_display)
+                    cls._cleanup_recheck(
+                        directory_fd, child.name, anchored, child_display
+                    )
+                    os.rmdir(child.name, dir_fd=directory_fd)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(observed.st_mode):
+                file_fd = os.open(
+                    child.name,
+                    os.O_RDONLY
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    anchored = cls._cleanup_identity(os.fstat(file_fd))
+                    cls._cleanup_recheck(
+                        directory_fd, child.name, anchored, child_display
+                    )
+                    if anchored != identity:
+                        raise OSError(
+                            errno.ESTALE, "cleanup file changed while opening"
+                        )
+                    os.unlink(child.name, dir_fd=directory_fd)
+                finally:
+                    os.close(file_fd)
+            else:
+                raise OSError(
+                    errno.EPERM,
+                    "application worktree contains an unsafe special entry",
+                    str(child_display),
+                )
+
+    def _cleanup_application_attempt_impl(
+        self, transaction_digest: str, *, review_id: str
+    ) -> None:
+        attempt = self._application_attempt_dir(transaction_digest)
+        worktree = attempt / "worktree"
+        registered = self._registered_worktree_paths()
+        expected = worktree.absolute()
+        expected_registrations = tuple(path for path in registered if path == expected)
+
+        try:
+            state_info = os.stat(self.state_root, follow_symlinks=False)
+        except FileNotFoundError:
+            if expected_registrations:
+                self._remove_exact_worktree_registration(expected)
+            return
+        if not stat.S_ISDIR(state_info.st_mode):
+            raise OSError(
+                errno.ENOTDIR, "application state root is not a real directory"
+            )
+        state_fd = os.open(
+            self.state_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+        )
+        applications_fd: int | None = None
+        attempt_fd: int | None = None
+        worktree_fd: int | None = None
+        try:
+            state_identity = self._cleanup_identity(os.fstat(state_fd))
+            if self._cleanup_identity(state_info) != state_identity:
+                raise OSError(
+                    errno.ESTALE, "application state root changed while opening"
+                )
+            try:
+                applications_fd, applications_identity = self._cleanup_open_directory(
+                    state_fd,
+                    "application-worktrees",
+                    self.state_root / "application-worktrees",
+                )
+            except FileNotFoundError:
+                if expected_registrations:
+                    self._remove_exact_worktree_registration(expected)
+                return
+            try:
+                attempt_fd, attempt_identity = self._cleanup_open_directory(
+                    applications_fd, attempt.name, attempt
+                )
+            except FileNotFoundError:
+                if expected_registrations:
+                    self._remove_exact_worktree_registration(expected)
+                return
+
+            with os.scandir(attempt_fd) as entries:
+                names = sorted((entry.name for entry in entries), key=os.fsencode)
+            if names not in ([], ["worktree"]):
+                raise OSError(
+                    errno.ENOTEMPTY,
+                    "application attempt contains ambiguous extra entries",
+                )
+            if not names:
+                if expected_registrations:
+                    raise OSError(
+                        errno.ESTALE, "registered application worktree is missing"
+                    )
+            else:
+                if len(expected_registrations) != 1:
+                    raise OSError(
+                        errno.ESTALE,
+                        "owned application worktree registration is missing or ambiguous",
+                    )
+                worktree_fd, worktree_identity = self._cleanup_open_directory(
+                    attempt_fd, "worktree", worktree
+                )
+                if os.path.commonpath((str(attempt), str(expected))) != str(attempt):
+                    raise OSError(
+                        errno.EXDEV,
+                        "application worktree escapes its attempt directory",
+                    )
+                registered_info = os.stat(expected, follow_symlinks=False)
+                if self._cleanup_identity(registered_info) != worktree_identity:
+                    raise OSError(
+                        errno.ESTALE,
+                        "Git registration does not name the anchored worktree",
+                    )
+
+                self._cleanup_recheck(
+                    state_fd,
+                    "application-worktrees",
+                    applications_identity,
+                    self.state_root / "application-worktrees",
+                )
+                self._cleanup_recheck(
+                    applications_fd, attempt.name, attempt_identity, attempt
+                )
+                self._cleanup_recheck(
+                    attempt_fd, "worktree", worktree_identity, worktree
+                )
+            quarantine_name = f".{attempt.name}.cleanup-{uuid.uuid4().hex}"
+            self._cleanup_recheck(
+                state_fd,
+                "application-worktrees",
+                applications_identity,
+                self.state_root / "application-worktrees",
+            )
+            self._cleanup_recheck(
+                applications_fd, attempt.name, attempt_identity, attempt
+            )
+            self._cleanup_rename_noreplace(
+                applications_fd, attempt.name, quarantine_name, attempt_identity
+            )
+            try:
+                os.stat(attempt.name, dir_fd=applications_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise OSError(
+                    errno.ESTALE, "application attempt name remains after detach"
+                )
+            self._cleanup_recheck(
+                applications_fd,
+                quarantine_name,
+                attempt_identity,
+                self.state_root / "application-worktrees" / quarantine_name,
+            )
+            self._cleanup_owned_tree(
+                attempt_fd,
+                self.state_root / "application-worktrees" / quarantine_name,
+            )
+            self._cleanup_recheck(
+                applications_fd,
+                quarantine_name,
+                attempt_identity,
+                self.state_root / "application-worktrees" / quarantine_name,
+            )
+            os.rmdir(quarantine_name, dir_fd=applications_fd)
+            self._remove_exact_worktree_registration(expected)
+            try:
+                with os.scandir(applications_fd) as entries:
+                    applications_empty = not any(True for _entry in entries)
+                if applications_empty:
+                    self._cleanup_recheck(
+                        state_fd,
+                        "application-worktrees",
+                        applications_identity,
+                        self.state_root / "application-worktrees",
+                    )
+                    os.rmdir("application-worktrees", dir_fd=state_fd)
+            except OSError as exc:
+                if exc.errno != errno.ENOTEMPTY:
+                    raise
+        finally:
+            for descriptor in (worktree_fd, attempt_fd, applications_fd, state_fd):
+                if descriptor is not None:
+                    os.close(descriptor)
+
+    def cleanup_application_attempt(
+        self,
+        transaction_digest: str,
+        *,
+        review_id: str,
+        canonical_changed: bool = True,
+    ) -> None:
+        """Safely remove one proven, registered application worktree attempt."""
+
+        try:
+            self._cleanup_application_attempt_impl(
+                transaction_digest, review_id=review_id
+            )
+        except Exception as exc:
+            if (
+                isinstance(exc, MemError)
+                and exc.detail.code == "CANONICAL_WORKTREE_CLEANUP_FAILED"
+            ):
+                raise
+            raise MemError(
+                "CANONICAL_WORKTREE_CLEANUP_FAILED",
+                "application_cleanup",
+                "Committed application worktree ownership or cleanup could not be proven",
+                path=str(self._application_attempt_dir(transaction_digest)),
+                value=str(exc),
+                canonical_changed=canonical_changed,
+                retry_safe=True,
+                recovery=[f"pco proposal commit {review_id}"],
+            ) from exc
+
+    def _validate_application_operations(
+        self,
+        request: ApplicationCommitRequest,
+        worktree: Path,
+    ) -> dict[str, Any]:
+        profile = self.repository.profile
+        delta: dict[str, list[dict[str, Any]]] = {}
+        for operation in request.operations:
+            if operation.op == "append":
+                assert operation.stream is not None and operation.record is not None
+                stream = profile.stream(operation.stream)
+                ensure(
+                    stream.write_policy != "read_only",
+                    "STREAM_READ_ONLY",
+                    "write_policy",
+                    f"Stream cannot be written: {operation.stream}",
+                    stream=operation.stream,
+                    canonical_changed=False,
+                    retry_safe=False,
+                )
+                delta.setdefault(operation.stream, []).append(operation.record)
+            else:
+                assert operation.path is not None and operation.content is not None
+                profile.artifact_path(worktree, operation.path)
+
+        if is_fast_path(profile, request.operations):
+            current: dict[str, dict[str, dict[str, Any]]] = {}
+            for stream_name in delta:
+                stream_path = profile.stream(stream_name).path
+                base_bytes = show_bytes(
+                    self.repository.root, request.base_commit, stream_path
+                )
+                stream_current, baseline_reliable = latest_base_by_id(
+                    base_bytes.decode("utf-8").splitlines()
+                )
+                if baseline_reliable:
+                    current[stream_name] = stream_current
+            count = validate_delta_records(profile, delta, current)
+        else:
+            base_records = {
+                stream: list(self.repository.iter_records(stream))
+                for stream in profile.config.streams
+            }
+            count = validate_structured_delta(
+                profile=profile,
+                base_records=base_records,
+                delta=delta,
+                root=worktree,
+            )
+        return {
+            "ok": True,
+            "profile": f"{profile.name}@{profile.version}",
+            "mode": "incremental",
+            "records": count,
+            "delta": {name: len(records) for name, records in delta.items()},
+        }
+
+    def _create_application_worktree(
+        self, transaction_digest: str, base_commit: str
+    ) -> Path:
+        """Create one empty digest-derived attempt through retained parent anchors."""
+
+        attempt = self._application_attempt_dir(transaction_digest)
+        worktree = attempt / "worktree"
+        parent_fd: int | None = None
+        state_fd: int | None = None
+        applications_fd: int | None = None
+        attempt_fd: int | None = None
+        worktree_fd: int | None = None
+        try:
+            parent_fd = os.open(
+                self.state_root.parent,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.mkdir(self.state_root.name, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            state_fd, state_identity = self._cleanup_open_directory(
+                parent_fd, self.state_root.name, self.state_root
+            )
+            try:
+                os.mkdir("application-worktrees", mode=0o700, dir_fd=state_fd)
+            except FileExistsError:
+                pass
+            applications_fd, applications_identity = self._cleanup_open_directory(
+                state_fd,
+                "application-worktrees",
+                self.state_root / "application-worktrees",
+            )
+            try:
+                os.mkdir(attempt.name, mode=0o700, dir_fd=applications_fd)
+            except FileExistsError:
+                pass
+            attempt_fd, attempt_identity = self._cleanup_open_directory(
+                applications_fd, attempt.name, attempt
+            )
+            with os.scandir(attempt_fd) as entries:
+                if any(True for _entry in entries):
+                    raise OSError(
+                        errno.ENOTEMPTY,
+                        "application attempt is not empty before creation",
+                    )
+            self._cleanup_recheck(
+                parent_fd, self.state_root.name, state_identity, self.state_root
+            )
+            self._cleanup_recheck(
+                state_fd,
+                "application-worktrees",
+                applications_identity,
+                self.state_root / "application-worktrees",
+            )
+            self._cleanup_recheck(
+                applications_fd, attempt.name, attempt_identity, attempt
+            )
+            self.repository._git(
+                "worktree", "add", "--detach", str(worktree), base_commit
+            )
+            self._cleanup_recheck(
+                parent_fd, self.state_root.name, state_identity, self.state_root
+            )
+            self._cleanup_recheck(
+                state_fd,
+                "application-worktrees",
+                applications_identity,
+                self.state_root / "application-worktrees",
+            )
+            self._cleanup_recheck(
+                applications_fd, attempt.name, attempt_identity, attempt
+            )
+            with os.scandir(attempt_fd) as entries:
+                names = sorted((entry.name for entry in entries), key=os.fsencode)
+            if names != ["worktree"]:
+                raise OSError(
+                    errno.ENOTEMPTY,
+                    "application worktree creation produced an ambiguous attempt",
+                )
+            worktree_fd, worktree_identity = self._cleanup_open_directory(
+                attempt_fd, "worktree", worktree
+            )
+            registered = self._registered_worktree_paths()
+            if registered.count(worktree.absolute()) != 1:
+                raise OSError(
+                    errno.ESTALE,
+                    "created application worktree registration is missing or ambiguous",
+                )
+            self._cleanup_recheck(attempt_fd, "worktree", worktree_identity, worktree)
+            return worktree
+        finally:
+            for descriptor in (
+                worktree_fd,
+                attempt_fd,
+                applications_fd,
+                state_fd,
+                parent_fd,
+            ):
+                if descriptor is not None:
+                    os.close(descriptor)
+
+    def _commit_application_worktree(
+        self, request: ApplicationCommitRequest
+    ) -> dict[str, Any]:
+        transaction_id = application_transaction_id(request.transaction_digest)
+        self.repository.assert_clean()
+        self.cleanup_application_attempt(
+            request.transaction_digest,
+            review_id=str(request.receipt["review_id"]),
+            canonical_changed=False,
+        )
+        try:
+            worktree = self._create_application_worktree(
+                request.transaction_digest, request.base_commit
+            )
+        except MemError:
+            raise
+        except Exception as exc:
+            raise MemError(
+                "CANONICAL_WORKTREE_CLEANUP_FAILED",
+                "application_creation",
+                "Application worktree could not be created through its owned path",
+                path=str(self._application_attempt_dir(request.transaction_digest)),
+                value=str(exc),
+                canonical_changed=False,
+                retry_safe=True,
+                recovery=[f"pco proposal commit {request.receipt['review_id']}"],
+            ) from exc
+        self._apply_operations(worktree, request.operations)
+        validation = self._validate_application_operations(request, worktree)
+        transaction_record = {
+            "id": transaction_id,
+            "application_policy": request.policy,
+            "base_commit": request.base_commit,
+            "operation_count": len(request.operations),
+            "operations": [operation.normalized() for operation in request.operations],
+            "transaction_fingerprint": request.transaction_digest,
+            "receipt": request.receipt,
+        }
+        txn_log = worktree / "transactions" / "transactions.jsonl"
+        with txn_log.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(transaction_record, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            )
+        self.repository._git("add", ".", cwd=worktree)
+        # The generic hook verifies the public TransactionState receipt shape.
+        # This internal path performs the same incremental validation above and
+        # commits its distinct application receipt shape atomically.
+        self.repository._git(
+            "commit",
+            "--no-verify",
+            "-m",
+            f"memory transaction {transaction_id}",
+            cwd=worktree,
+        )
+        commit = self.repository._git("rev-parse", "HEAD", cwd=worktree)
+        self.repository.fast_forward(commit)
+        self.cleanup_application_attempt(
+            request.transaction_digest,
+            review_id=str(request.receipt["review_id"]),
+        )
+        return {
+            "ok": True,
+            "idempotent": False,
+            "transaction_id": transaction_id,
+            "commit": commit,
+            "validation": validation,
+        }
+
+    def commit_application(
+        self,
+        request: ApplicationCommitRequest,
+        *,
+        lock_held: bool = False,
+    ) -> dict[str, Any]:
+        ensure(
+            request.policy == self.repository.profile.config.application_commit_policy,
+            "DIRECT_PCO_STREAM_WRITE_FORBIDDEN",
+            "write_policy",
+            "Application commit policy mismatch",
+            canonical_changed=False,
+            retry_safe=False,
+        )
+        context = nullcontext() if lock_held else self.repository.lock()
+        with context:
+            duplicate = self._find_committed_fingerprint(request.transaction_digest)
+            if duplicate is not None:
+                ensure_duplicate_matches_request(duplicate, request)
+                self.cleanup_application_attempt(
+                    request.transaction_digest,
+                    review_id=str(request.receipt["review_id"]),
+                )
+                return {
+                    "ok": True,
+                    "idempotent": True,
+                    "commit": duplicate["commit"],
+                    "transaction": duplicate,
+                }
+            ensure(
+                self.repository.head() == request.base_commit,
+                "CANONICAL_HEAD_CHANGED",
+                "transaction_validation",
+                "Canonical HEAD changed before commit",
+                canonical_changed=False,
+                retry_safe=False,
+                recovery=[
+                    "Create a new proposal from pco proposal scaffold against the current HEAD"
+                ],
+            )
+            return self._commit_application_worktree(request)
+
     def commit(self, transaction_id: str, *, dry_run: bool = False) -> dict[str, Any]:
         if dry_run:
             validation = self.validate(transaction_id, require_approval=True)
@@ -298,7 +1190,12 @@ class TransactionManager:
             }
         state = self.load(transaction_id)
         if state.status == "committed":
-            return {"ok": True, "idempotent": True, "transaction_id": state.id, "commit": state.commit}
+            return {
+                "ok": True,
+                "idempotent": True,
+                "transaction_id": state.id,
+                "commit": state.commit,
+            }
         duplicate = self._find_committed_fingerprint(state.transaction_fingerprint)
         if duplicate:
             state.status = "committed"
@@ -328,15 +1225,24 @@ class TransactionManager:
             "fingerprint_context": state.fingerprint_context,
             "operation_count": len(state.operations),
             "operations": [operation.normalized() for operation in state.operations],
-            "approval_receipt": state.approval_receipt.model_dump(mode="json") if state.approval_receipt else None,
+            "approval_receipt": (
+                state.approval_receipt.model_dump(mode="json")
+                if state.approval_receipt
+                else None
+            ),
             "committed_at": utc_now(),
         }
         txn_log = worktree / "transactions" / "transactions.jsonl"
         with txn_log.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(transaction_record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(transaction_record, ensure_ascii=False, sort_keys=True)
+                + "\n"
+            )
         self.repository.install_pre_commit_hook()
         self.repository._git("add", ".", cwd=worktree)
-        self.repository._git("commit", "-m", f"memory transaction {state.id}", cwd=worktree)
+        self.repository._git(
+            "commit", "-m", f"memory transaction {state.id}", cwd=worktree
+        )
         commit = self.repository._git("rev-parse", "HEAD", cwd=worktree)
         self.repository.fast_forward(commit)
         state.status = "committed"
@@ -354,7 +1260,14 @@ class TransactionManager:
 
     def abort(self, transaction_id: str) -> dict[str, Any]:
         state = self.load(transaction_id)
-        ensure(state.status != "committed", "TRANSACTION_ALREADY_COMMITTED", "transaction", "Committed transactions cannot be aborted")
+        ensure(
+            state.status != "committed",
+            "TRANSACTION_ALREADY_COMMITTED",
+            "transaction",
+            "Committed transactions cannot be aborted",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         self.repository.remove_worktree(self._worktree_path(transaction_id))
         state.status = "aborted"
         self._save(state)

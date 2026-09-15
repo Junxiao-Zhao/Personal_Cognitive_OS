@@ -1,21 +1,38 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object", "additionalProperties": false,
-  "required": ["id", "revision", "recorded_at", "schema_version", "payload"],
+  "required": ["id", "revision", "recorded_at", "schema_version", "commit_ref", "payload"],
   "properties": {
     "id": {"type": "string", "minLength": 1}, "revision": {"type": "integer", "minimum": 1},
     "recorded_at": {"type": "string", "format": "date-time"}, "schema_version": {"const": "pco/source/v1"},
+    "commit_ref": {"type": "string", "minLength": 1},
     "payload": {
       "type": "object", "additionalProperties": false,
-      "required": ["source_id", "role", "provider", "locator", "display_name", "reader_skill", "snapshot_path", "registered_at", "status"],
+      "allOf": [{"$ref": "pco/common-revision/v1#/$defs/revision_payload"}],
+      "required": ["previous_revision", "change_summary", "body_markdown", "locator", "title", "retrieved_at", "provider_label", "content_hash", "snapshot_ref", "fidelity", "used_excerpts", "status"],
       "properties": {
-        "source_id": {"type": "string", "minLength": 1}, "role": {"const": "input"},
-        "provider": {"type": "string", "minLength": 1}, "locator": {"type": "string", "minLength": 1},
-        "display_name": {"type": "string", "minLength": 1}, "reader_skill": {"type": "string", "minLength": 1},
-        "snapshot_path": {"type": "string", "pattern": "^sources/snapshots/"},
-        "content_hash": {"type": ["string", "null"], "pattern": "^sha256:"},
-        "registered_at": {"type": "string", "format": "date-time"}, "status": {"enum": ["active", "inactive"]}
+        "previous_revision": {"type": ["integer", "null"], "minimum": 1},
+        "change_summary": {"type": "string", "minLength": 1},
+        "body_markdown": {"type": "string", "minLength": 1},
+        "locator": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "retrieved_at": {"type": "string", "format": "date-time"},
+        "provider_label": {"type": "string", "minLength": 1},
+        "query_context": {"type": ["string", "null"]},
+        "content_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "snapshot_ref": {"type": "string", "pattern": "^source_blobs/[0-9a-f]{64}$"},
+        "fidelity": {"enum": ["selected_excerpt", "full_user_provided_transcript", "registered_source_excerpt"]},
+        "user_authored": {"type": "boolean"},
+        "used_excerpts": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "status": {"enum": ["active", "superseded", "tombstone"]}
       }
     }
-  }
+  },
+  "allOf": [{
+    "if": {"properties": {"revision": {"minimum": 2}}, "required": ["revision"]},
+    "then": {"properties": {"payload": {"properties": {"previous_revision": {"type": "integer", "minimum": 1}}}}}
+  }, {
+    "if": {"properties": {"payload": {"properties": {"fidelity": {"const": "full_user_provided_transcript"}}, "required": ["fidelity"]}}},
+    "then": {"properties": {"payload": {"required": ["user_authored"], "properties": {"user_authored": {"const": true}}}}}
+  }]
 }

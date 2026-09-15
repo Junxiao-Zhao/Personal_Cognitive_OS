@@ -51,13 +51,24 @@ def is_messages_only(
     transaction or hook paths.
     """
     if isinstance(profile_or_operations, Profile):
-        ensure(isinstance(operations, Iterable), "VALIDATION_POLICY_REQUIRED", "transaction_validation", "Profile operations are required")
+        ensure(
+            isinstance(operations, Iterable),
+            "VALIDATION_POLICY_REQUIRED",
+            "transaction_validation",
+            "Profile operations are required",
+            canonical_changed=False,
+            retry_safe=False,
+        )
         return is_fast_path(profile_or_operations, operations)
     if isinstance(operations, Profile):
         return is_fast_path(operations, profile_or_operations)
     if operations is not None:
-        raise TypeError("is_messages_only expects (profile, operations) or (operations, profile)")
-    return bool(profile_or_operations) and all(operation.op == "append" for operation in profile_or_operations)
+        raise TypeError(
+            "is_messages_only expects (profile, operations) or (operations, profile)"
+        )
+    return bool(profile_or_operations) and all(
+        operation.op == "append" for operation in profile_or_operations
+    )
 
 
 def latest_base_by_id(lines: Iterable[str]) -> tuple[dict[str, dict[str, Any]], bool]:
@@ -83,7 +94,11 @@ def latest_base_by_id(lines: Iterable[str]) -> tuple[dict[str, dict[str, Any]], 
         except (json.JSONDecodeError, KeyError, TypeError):
             reliable = False
             continue
-        if not isinstance(record_id, str) or not isinstance(revision, int) or isinstance(revision, bool):
+        if (
+            not isinstance(record_id, str)
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+        ):
             reliable = False
             continue
         previous = current.get(record_id)
@@ -103,17 +118,36 @@ def validate_delta_records(
         # A missing stream entry means its tolerant historical baseline was
         # unreliable; validate its delta without making a possibly false
         # revision-continuity assertion.  Full validation remains strict.
-        stream_current = current.get(stream) if current is not None and stream in current else None
+        stream_current = (
+            current.get(stream) if current is not None and stream in current else None
+        )
         for record in records:
             try:
                 envelope = RecordEnvelope.model_validate(record)
             except Exception as exc:
-                raise MemError("ENVELOPE_INVALID", "envelope_validation", str(exc), stream=stream, record_id=record.get("id")) from exc
+                raise MemError(
+                    "ENVELOPE_INVALID",
+                    "envelope_validation",
+                    str(exc),
+                    stream=stream,
+                    record_id=record.get("id"),
+                    canonical_changed=False,
+                    retry_safe=False,
+                ) from exc
             if stream_current is not None:
                 expected = stream_current.get(envelope.id, {}).get("revision", 0) + 1
-                ensure(envelope.revision == expected, "REVISION_SEQUENCE_INVALID", "revision_validation",
-                       f"Expected revision {expected}, got {envelope.revision}", stream=stream,
-                       record_id=envelope.id, path="/revision", value=envelope.revision)
+                ensure(
+                    envelope.revision == expected,
+                    "REVISION_SEQUENCE_INVALID",
+                    "revision_validation",
+                    f"Expected revision {expected}, got {envelope.revision}",
+                    stream=stream,
+                    record_id=envelope.id,
+                    path="/revision",
+                    value=envelope.revision,
+                    canonical_changed=False,
+                    retry_safe=False,
+                )
                 stream_current[envelope.id] = record
             profile.validate_record_schema(stream, record)
             count += 1
@@ -147,6 +181,8 @@ def validate_structured_delta(
                     str(exc),
                     stream=stream,
                     record_id=record.get("id"),
+                    canonical_changed=False,
+                    retry_safe=False,
                 ) from exc
         base_current[stream] = latest_by_id(records)
     count = validate_delta_records(profile, delta, base_current)
